@@ -1,0 +1,123 @@
+@tailwind base;
+@tailwind components;
+@tailwind utilities;
+
+:root {
+  color-scheme: light;
+}
+
+html, body {
+  background-color: #F7F7F5;
+  color: #0A0A0A;
+  font-family: 'DM Sans', system-ui, sans-serif;
+  font-weight: 400;
+  -webkit-font-smoothing: antialiased;
+}
+
+*::-webkit-scrollbar { width: 6px; height: 6px; }
+*::-webkit-scrollbar-track { background: transparent; }
+*::-webkit-scrollbar-thumb { background: #E5E5E3; border-radius: 3px; }
+*::-webkit-scrollbar-thumb:hover { background: #C9C9C5; }
+
+.font-num {
+  font-family: 'IBM Plex Mono', ui-monospace, monospace;
+  font-variant-numeric: tabular-nums;
+}
+
+/* Hero dot-grid background — 24px spacing, blue dots at 12% */
+.dot-grid-bg {
+  background-image: radial-gradient(circle, rgba(26, 86, 219, 0.12) 1px, transparent 1px);
+  background-size: 24px 24px;
+}
+
+/* Vertical marquee — kept for back-compat with old LiveTradeFeed. */
+@keyframes feed-scroll {
+  0%   { transform: translateY(0); }
+  100% { transform: translateY(-50%); }
+}
+.feed-scroll { animation: feed-scroll 60s linear infinite; }
+.feed-scroll:hover { animation-play-state: paused; }
+
+/* Hero floating-pill drift. Pills span the full hero now and are
+ * masked on the left by a gradient overlay; the keyframe just controls
+ * the visible drift + soft fade at the tail end. Visible for ~75% of
+ * the cycle so the lane spends most of its time populated.
+ */
+@keyframes pill-drift {
+  0%   { transform: translateX(0);     opacity: 0;    }
+  4%   {                               opacity: 0.95; }
+  75%  {                               opacity: 0.95; }
+  85%  {                               opacity: 0;    }
+  100% { transform: translateX(calc(-100vw - 480px)); opacity: 0; }
+}
+
+/* Horizontal infinite ticker — used by the rebuilt TickerMarquee. */
+@keyframes ticker-scroll {
+  0%   { transform: translateX(0); }
+  100% { transform: translateX(-50%); }
+}
+.ticker-scroll { animation: ticker-scroll 50s linear infinite; }
+.ticker-scroll:hover { animation-play-state: paused; }
+
+/* Entrance animations for sections / cards. */
+@keyframes fade-up {
+  from { opacity: 0; transform: translateY(20px); }
+  to   { opacity: 1; transform: translateY(0);     }
+}
+.in-view { animation: fade-up 500ms ease-out forwards; }
+
+@keyframes pulse-pop {
+  0%   { transform: scale(1); }
+  50%  { transform: scale(1.05); }
+  100% { transform: scale(1); }
+}
+.pulse-pop { animation: pulse-pop 600ms ease-out 1; }
+
+@keyframes skeleton-pulse {
+  0%, 100% { opacity: 0.55; }
+  50%      { opacity: 0.95; }
+}
+.skeleton { animation: skeleton-pulse 1.2s ease-in-out infinite; background: #F0F0EE; }
+
+@keyframes donut-draw {
+  from { stroke-dashoffset: var(--donut-len, 440); }
+  to   { stroke-dashoffset: var(--donut-final, 0); }
+}
+
+/* Subtle pill drift for the Why It Works section — slower, fainter
+ * than the hero pills so they read as ambient texture, not foreground.
+ */
+/* Subtle pill drift — slower than hero pills, fully gone before
+ * reaching 30% from the left edge of the viewport. Calibrated for
+ * a 35s drift across the full section width. */
+@keyframes subtle-pill-drift {
+  0%   { transform: translateX(0);     opacity: 0;    }
+  8%   {                               opacity: 0.18; }
+  60%  {                               opacity: 0.18; }
+  68%  {                               opacity: 0;    }
+  100% { transform: translateX(calc(-100vw - 480px)); opacity: 0; }
+}
+
+/* Slide-in arrow used by CTA button hover. */
+@keyframes slide-in-left {
+  from { opacity: 0; transform: translateX(-6px); }
+  to   { opacity: 1; transform: translateX(0);     }
+}
+.slide-in-left { animation: slide-in-left 180ms ease-out forwards; }
+
+/* Wallet adapter button overrides — match CONTRA accent. */
+.wallet-adapter-button-trigger {
+  background-color: #1A56DB !important;
+  color: #FFFFFF !important;
+  font-family: 'DM Sans', system-ui, sans-serif !important;
+  font-size: 11px !important;
+  height: 32px !important;
+  padding: 0 14px !important;
+  border-radius: 3px !important;
+  font-weight: 500 !important;
+  letter-spacing: 0.04em !important;
+  text-transform: uppercase !important;
+}
+.wallet-adapter-button-trigger:not([disabled]):hover {
+  background-color: #1748B8 !important;
+}

@@ -1,0 +1,56 @@
+# =====================================================================
+# CONTRA — git ignore. NEVER commit secrets, keypairs, or build output.
+# =====================================================================
+
+# --- secrets (NEVER commit) ------------------------------------------
+.env
+.env.local
+.env.*.local
+authority.json
+*.keypair.json
+*-keypair.json
+target/deploy/*-keypair.json
+kalshi_private_key.pem
+*.pem
+*.p8
+*.key
+
+# --- node ------------------------------------------------------------
+node_modules/
+npm-debug.log*
+yarn-debug.log*
+yarn-error.log*
+.pnpm-debug.log*
+
+# --- next.js ---------------------------------------------------------
+.next/
+out/
+.vercel/
+
+# --- anchor / solana / rust -----------------------------------------
+target/
+**/*.rs.bk
+.anchor/
+test-ledger/
+
+# --- ml artifacts (regenerated from training) ------------------------
+ml/artifacts/*.json
+ml/__pycache__/
+ml/*.pyc
+*.pkl
+*.tar.bz2
+
+# --- editor / OS -----------------------------------------------------
+.DS_Store
+Thumbs.db
+.idea/
+.vscode/
+*.swp
+*.swo
+.claude/settings.local.json
+
+# --- build / coverage ------------------------------------------------
+dist/
+build/
+coverage/
+*.log
