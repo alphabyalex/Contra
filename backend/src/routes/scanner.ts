@@ -22,6 +22,13 @@ import {
   getLastKalshiError,
   getLastKalshiThrottled,
 } from '../services/kalshi';
+import {
+  getScreenedByConditionIds,
+  getScoredByConditionIds,
+  getScreenedMarket,
+  getScoredMarket,
+  listRecentlyExcluded,
+} from '../db/queries';
 
 export const scannerRouter: Router = Router();
 
@@ -35,6 +42,71 @@ interface SnapshotRow {
   endDateIso?: string;
   daysToClose?: number | null;
   category?: string;
+}
+
+interface EnrichedRow extends SnapshotRow {
+  screened: boolean;
+  excluded: boolean;
+  impossible: boolean;
+  exclusion_reason: string | null;
+  p_model: number | null;
+  edge: number | null;
+  adjusted_edge: number | null;
+  time_factor: number | null;
+  category_factor: number | null;
+  volume_factor: number | null;
+  include_in_basket: boolean | null;
+}
+
+// Polymarket condition_ids are 66-char hex strings; PostgREST .in() puts
+// every id in the URL, so a single 200+ id call easily exceeds the 8KB
+// upstream limit and silently 400s. Chunk to keep each request well under.
+const ID_CHUNK_SIZE = 50;
+
+async function fetchManyChunked<T>(
+  ids: string[],
+  fetcher: (chunk: string[]) => Promise<Map<string, T>>,
+): Promise<Map<string, T>> {
+  const out = new Map<string, T>();
+  for (let i = 0; i < ids.length; i += ID_CHUNK_SIZE) {
+    const chunk = ids.slice(i, i + ID_CHUNK_SIZE);
+    try {
+      const m = await fetcher(chunk);
+      m.forEach((v, k) => out.set(k, v));
+    } catch (e) {
+      console.warn('[scanner] enrich chunk failed:', (e as Error).message);
+    }
+  }
+  return out;
+}
+
+async function enrichRows(rows: SnapshotRow[]): Promise<EnrichedRow[]> {
+  const ids = [...new Set(rows.map((r) => r.marketId))];
+  const [screenedMap, scoredMap] = await Promise.all([
+    fetchManyChunked(ids, getScreenedByConditionIds),
+    fetchManyChunked(ids, getScoredByConditionIds),
+  ]);
+  return rows.map((r) => {
+    const sc = screenedMap.get(r.marketId);
+    const sd = scoredMap.get(r.marketId);
+    return {
+      ...r,
+      // Prefer category from scored row (computed via classifyCategory) over snapshot.
+      category: sd?.category ?? r.category,
+      daysToClose: sd?.days_to_close ?? r.daysToClose,
+      screened: Boolean(sc),
+      excluded: sc?.excluded ?? false,
+      impossible: sc?.impossible ?? false,
+      exclusion_reason: sc?.exclusion_reason ?? null,
+      p_model: sd?.p_model ?? null,
+      edge: sd?.edge ?? null,
+      adjusted_edge: sd?.adjusted_edge ?? null,
+      time_factor: sd?.time_factor ?? null,
+      category_factor: sd?.category_factor ?? null,
+      volume_factor: sd?.volume_factor ?? null,
+      include_in_basket: sd ? sd.include_in_basket : null,
+    };
+  });
 }
 
 let snapshotCache: { at: number; rows: SnapshotRow[] } | null = null;
@@ -110,6 +182,10 @@ scannerRouter.get('/markets', async (req, res) => {
   try {
     const min = req.query.min ? Number(req.query.min) : 0.02;
     const max = req.query.max ? Number(req.query.max) : 0.15;
+    const sortParam = String(req.query.sort ?? 'volume').toLowerCase();
+    const search = (req.query.search ?? '').toString().trim().toLowerCase();
+    const limitParam = req.query.limit != null ? Math.max(1, Math.min(500, Number(req.query.limit))) : null;
+
     const fresh = snapshotCache && Date.now() - snapshotCache.at < SNAPSHOT_TTL_MS;
     if (!fresh) {
       const rows = await fetchSnapshot(min, max);
@@ -118,13 +194,49 @@ scannerRouter.get('/markets', async (req, res) => {
     const rows = snapshotCache!.rows;
     const polymarket = rows.filter((r) => r.source === 'polymarket').length;
     const kalshi = rows.filter((r) => r.source === 'kalshi').length;
+
+    // Enrich the full set first so search hits ALL markets, not just the
+    // top-25 view. enrichRows is bounded by the 500-row cap on the source
+    // array — and chunks Supabase calls — so the cost stays reasonable.
+    let enriched = await enrichRows(rows.slice(0, 500));
+
+    if (search) {
+      enriched = enriched.filter((r) => r.question?.toLowerCase().includes(search));
+    }
+
+    // Sort
+    const cmp = (a: EnrichedRow, b: EnrichedRow): number => {
+      switch (sortParam) {
+        case 'edge':
+          return (b.adjusted_edge ?? b.edge ?? 0) - (a.adjusted_edge ?? a.edge ?? 0);
+        case 'days':
+          return (a.daysToClose ?? Number.POSITIVE_INFINITY) - (b.daysToClose ?? Number.POSITIVE_INFINITY);
+        case 'p_market':
+          return a.p_market - b.p_market;
+        case 'volume':
+        default:
+          return (b.volume ?? 0) - (a.volume ?? 0);
+      }
+    };
+    enriched.sort(cmp);
+
+    // Limit semantics:
+    //   - search set → no limit (return all matches)
+    //   - explicit limit → that
+    //   - default → 25
+    const limit = search ? enriched.length : (limitParam ?? 25);
+    const sliced = enriched.slice(0, limit);
+
     res.json({
       at: snapshotCache!.at,
       count: rows.length,
       counts: { polymarket, kalshi },
       kalshi_error: getLastKalshiError(),
       kalshi_throttled: getLastKalshiThrottled(),
-      rows: rows.slice(0, 500),
+      sort: sortParam,
+      search: search || null,
+      total_after_filter: enriched.length,
+      rows: sliced,
     });
   } catch (e) {
     res.status(500).json({
@@ -134,6 +246,86 @@ scannerRouter.get('/markets', async (req, res) => {
       kalshi_error: getLastKalshiError(),
       kalshi_throttled: getLastKalshiThrottled(),
     });
+  }
+});
+
+/**
+ * GET /api/scanner/market/:condition_id
+ *
+ * Full detail for a single market. Looks up the most recent live snapshot
+ * (so the user gets current p_market / volume / category), then joins on
+ * screened_markets and scored_markets for the model verdict.
+ *
+ * status legend:
+ *   "impossible"          — screen verdict marked the outcome impossible
+ *   "excluded_resolved"   — already resolved
+ *   "excluded_ambiguous"  — vague resolution criteria
+ *   "excluded"            — excluded for some other reason
+ *   "eligible"            — screened, not excluded
+ *   "unscreened"          — never screened yet
+ */
+scannerRouter.get('/market/:condition_id', async (req, res) => {
+  const id = req.params.condition_id;
+  try {
+    // Refresh snapshot if stale, then look the row up by marketId.
+    const fresh = snapshotCache && Date.now() - snapshotCache.at < SNAPSHOT_TTL_MS;
+    if (!fresh) {
+      const rows = await fetchSnapshot(0.0, 1.0);
+      snapshotCache = { at: Date.now(), rows };
+    }
+    const market = snapshotCache!.rows.find((r) => r.marketId === id) ?? null;
+
+    const [screened, scored] = await Promise.all([
+      getScreenedMarket(id).catch(() => null),
+      getScoredMarket(id).catch(() => null),
+    ]);
+
+    let status: 'impossible' | 'excluded_resolved' | 'excluded_ambiguous' | 'excluded' | 'eligible' | 'unscreened';
+    if (!screened) status = 'unscreened';
+    else if (screened.impossible) status = 'impossible';
+    else if (screened.already_resolved) status = 'excluded_resolved';
+    else if (screened.ambiguous) status = 'excluded_ambiguous';
+    else if (screened.excluded) status = 'excluded';
+    else status = 'eligible';
+
+    if (!market && !screened && !scored) {
+      return res.status(404).json({ error: 'market_not_found', condition_id: id });
+    }
+
+    res.json({
+      condition_id: id,
+      market,
+      screened,
+      scored,
+      status,
+    });
+  } catch (e) {
+    res.status(500).json({ error: (e as Error).message });
+  }
+});
+
+/**
+ * Recently excluded screened markets. Used by the admin dashboard to
+ * surface what Claude has been kicking out and why.
+ */
+scannerRouter.get('/recent-excluded', async (req, res) => {
+  try {
+    const limit = Math.min(50, Math.max(1, Number(req.query.limit ?? 10)));
+    const rows = await listRecentlyExcluded(limit);
+    res.json({
+      rows: rows.map((r) => ({
+        condition_id: r.condition_id,
+        question: r.question,
+        p_market: r.p_market,
+        impossible: r.impossible,
+        already_resolved: r.already_resolved,
+        ambiguous: r.ambiguous,
+        exclusion_reason: r.exclusion_reason,
+        screened_at: r.screened_at,
+      })),
+    });
+  } catch (e) {
+    res.status(500).json({ error: (e as Error).message });
   }
 });
 

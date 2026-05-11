@@ -17,8 +17,10 @@ export interface RawPolymarketMarket {
   active?: boolean;
   closed?: boolean;
   archived?: boolean;
+  resolved?: boolean;
   outcomes?: string | string[];
   outcomePrices?: string | string[];
+  clobTokenIds?: string | string[];
   volume?: string | number;
   volumeNum?: number;
   liquidity?: string | number;
@@ -26,6 +28,7 @@ export interface RawPolymarketMarket {
   endDateIso?: string;
   category?: string;
   tags?: string[];
+  resolutionOutcome?: string;
 }
 
 export interface PolymarketOutcome {
@@ -36,6 +39,7 @@ export interface PolymarketOutcome {
   volumeUsd: number;
   endDateIso?: string;
   category?: string;
+  tokenId?: string;         // Polymarket CLOB token id for the outcome
 }
 
 const BASE = (): string =>
@@ -106,6 +110,7 @@ export async function getAllActiveMarkets(maxPages = 20): Promise<RawPolymarketM
 export function flattenOutcomes(m: RawPolymarketMarket): PolymarketOutcome[] {
   const outcomes = parseStringArray(m.outcomes);
   const prices = parseOutcomePrices(m.outcomePrices);
+  const tokens = parseStringArray(m.clobTokenIds);
   if (outcomes.length === 0 || prices.length === 0) return [];
   const vol = Number(m.volumeNum ?? m.volume ?? 0) || 0;
   return outcomes.map((label, i) => ({
@@ -116,7 +121,22 @@ export function flattenOutcomes(m: RawPolymarketMarket): PolymarketOutcome[] {
     volumeUsd: vol,
     endDateIso: m.endDateIso ?? m.endDate,
     category: m.category,
+    tokenId: tokens[i] ?? undefined,
   }));
+}
+
+/**
+ * Fetch a single market by conditionId. Used by the resolution monitor
+ * (cheap, ~1 request per market we expect to settle soon).
+ */
+export async function getMarketByConditionId(conditionId: string): Promise<RawPolymarketMarket | null> {
+  const params = new URLSearchParams({ condition_ids: conditionId, limit: '1' });
+  try {
+    const arr = await getJson<RawPolymarketMarket[]>(`${BASE()}/markets?${params}`);
+    return arr?.[0] ?? null;
+  } catch {
+    return null;
+  }
 }
 
 /**

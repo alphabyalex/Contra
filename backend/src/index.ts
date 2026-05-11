@@ -13,7 +13,10 @@ import * as path from 'path';
 import { config as loadDotenv } from 'dotenv';
 // Load .env from the repo root (one dir above backend/) so `npm run dev`
 // from backend/ picks up the same secrets as scripts that cd into backend/.
-loadDotenv({ path: path.resolve(__dirname, '..', '..', '.env') });
+// override:true lets the repo .env take precedence over any stale value
+// already exported in the operator's shell — yes this happened in dev,
+// shell had an old ANTHROPIC_API_KEY that masked the good one in .env.
+loadDotenv({ path: path.resolve(__dirname, '..', '..', '.env'), override: true });
 
 import express from 'express';
 import cors from 'cors';
@@ -30,6 +33,7 @@ import { scannerRouter } from './routes/scanner';
 import { leverageRouter } from './routes/leverage';
 import { portfolioRouter } from './routes/portfolio';
 import { adminRouter } from './routes/admin';
+import analyticsRouter from './routes/analytics';
 
 const PORT = Number(process.env.PORT ?? 3001);
 const FRONTEND_URL = process.env.FRONTEND_URL ?? 'http://localhost:3000';
@@ -70,6 +74,7 @@ app.use('/api/scanner', scannerRouter);
 app.use('/api/leverage', leverageRouter);
 app.use('/api/portfolio', portfolioRouter);
 app.use('/api/admin', adminRouter);
+app.use('/api/analytics', analyticsRouter);
 
 app.use((_req, res) => res.status(404).json({ error: 'not_found' }));
 app.use((err: Error, _req: express.Request, res: express.Response, _next: express.NextFunction) => {
@@ -78,6 +83,10 @@ app.use((err: Error, _req: express.Request, res: express.Response, _next: expres
 });
 
 loadArtifacts();
+
+if (!process.env.ANTHROPIC_API_KEY?.trim()) {
+  console.warn('[screener] ANTHROPIC_API_KEY not set — weekly screener will be disabled');
+}
 
 app.listen(PORT, () => {
   console.log(`╔══════════════════════════════════════════╗`);

@@ -138,3 +138,150 @@ drop trigger if exists positions_set_updated_at on positions;
 create trigger positions_set_updated_at
     before update on positions
     for each row execute function set_updated_at();
+
+-- =====================================================================
+-- Run these in Supabase SQL editor manually.
+-- Screening + scoring tables for the weekly mispricing pipeline.
+-- =====================================================================
+
+-- ---------- screened_markets -----------------------------------------
+-- One row per condition_id ever passed through the Anthropic screener.
+-- Cached so we never re-screen the same market twice.
+CREATE TABLE IF NOT EXISTS screened_markets (
+  id uuid primary key default gen_random_uuid(),
+  condition_id text not null unique,
+  source text not null check (source in ('polymarket','kalshi')),
+  question text not null,
+  p_market numeric(10,8),
+  impossible boolean not null default false,
+  already_resolved boolean not null default false,
+  ambiguous boolean not null default false,
+  excluded boolean not null default false,
+  exclusion_reason text,
+  screened_at timestamptz not null default now(),
+  screening_model text default 'claude-sonnet-4-20250514'
+);
+
+CREATE INDEX IF NOT EXISTS idx_screened_condition ON screened_markets (condition_id);
+CREATE INDEX IF NOT EXISTS idx_screened_excluded ON screened_markets (excluded);
+
+-- ---------- scored_markets -------------------------------------------
+-- One row per scored market (post-screening). Refreshed every weekly run.
+CREATE TABLE IF NOT EXISTS scored_markets (
+  id uuid primary key default gen_random_uuid(),
+  condition_id text not null unique references screened_markets(condition_id),
+  source text not null,
+  question text not null,
+  p_market numeric(10,8) not null,
+  p_model numeric(10,8),
+  edge numeric(10,8),
+  volume numeric(20,2),
+  days_to_close integer,
+  category text,
+  include_in_basket boolean not null default false,
+  scored_at timestamptz not null default now(),
+  model_version text default 'stub_v1'
+);
+
+CREATE INDEX IF NOT EXISTS idx_scored_edge ON scored_markets (edge desc);
+CREATE INDEX IF NOT EXISTS idx_scored_include ON scored_markets (include_in_basket);
+
+-- ---------- prediction_log -------------------------------------------
+-- Append-only log of every leg added to a basket, plus its eventual
+-- resolution. Drives the analytics service (hit rate, Brier score,
+-- calibration, edge realization). One row per (condition_id, basket_id)
+-- pair; updated when the leg resolves.
+CREATE TABLE IF NOT EXISTS prediction_log (
+  id uuid primary key default gen_random_uuid(),
+  condition_id text not null,
+  source text not null,
+  question text not null,
+  p_market_at_entry numeric(10,8) not null,
+  p_model_at_entry numeric(10,8),
+  edge_at_entry numeric(10,8),
+  basket_id uuid references baskets(id),
+  outcome smallint check (outcome in (0,1)),
+  days_held integer,
+  resolved_at timestamptz,
+  logged_at timestamptz not null default now(),
+  model_version text default 'stub_v1'
+);
+
+CREATE INDEX IF NOT EXISTS idx_predlog_condition ON prediction_log (condition_id);
+CREATE INDEX IF NOT EXISTS idx_predlog_basket ON prediction_log (basket_id);
+CREATE INDEX IF NOT EXISTS idx_predlog_outcome ON prediction_log (outcome);
+CREATE INDEX IF NOT EXISTS idx_predlog_logged ON prediction_log (logged_at desc);
+
+-- =====================================================================
+-- Run these in Supabase SQL editor manually.
+-- Tables for the price collector + resolution monitor + tracked-market
+-- pipeline (added with calibration_v1).
+-- =====================================================================
+
+-- New column on scored_markets for impossible-flagged markets.
+ALTER TABLE scored_markets
+  ADD COLUMN IF NOT EXISTS impossible_edge boolean NOT NULL DEFAULT false;
+
+-- ---------- tracked_markets -----------------------------------------
+-- One row per market we've decided to follow. Created when the screener
+-- accepts a market; updated when the price collector or resolution
+-- monitor learns more. The price collector tier is derived from
+-- (resolution_date - now()).
+CREATE TABLE IF NOT EXISTS tracked_markets (
+  id uuid primary key default gen_random_uuid(),
+  condition_id text not null unique,
+  source text not null,
+  question text not null,
+  token_id text,
+  category text,
+  p_market_initial numeric(10,8),
+  p_model_initial numeric(10,8),
+  edge_initial numeric(10,8),
+  resolution_date timestamptz,
+  in_basket boolean not null default false,
+  outcome smallint check (outcome in (0,1)),
+  resolved_at timestamptz,
+  created_at timestamptz not null default now(),
+  updated_at timestamptz not null default now()
+);
+
+CREATE INDEX IF NOT EXISTS idx_tracked_condition ON tracked_markets (condition_id);
+CREATE INDEX IF NOT EXISTS idx_tracked_open ON tracked_markets (resolved_at) WHERE resolved_at IS NULL;
+CREATE INDEX IF NOT EXISTS idx_tracked_resolution ON tracked_markets (resolution_date);
+
+DROP TRIGGER IF EXISTS tracked_set_updated_at ON tracked_markets;
+CREATE TRIGGER tracked_set_updated_at
+    BEFORE UPDATE ON tracked_markets
+    FOR EACH ROW EXECUTE FUNCTION set_updated_at();
+
+-- ---------- market_price_history ------------------------------------
+-- Append-only price stream from Polymarket CLOB. Rows are deleted in
+-- bulk when a market resolves (history is moved to a CSV in
+-- market_data/resolved/).
+CREATE TABLE IF NOT EXISTS market_price_history (
+  id uuid primary key default gen_random_uuid(),
+  condition_id text not null,
+  price numeric(10,8) not null,
+  days_to_close integer,
+  recorded_at timestamptz not null default now()
+);
+
+CREATE INDEX IF NOT EXISTS idx_price_condition_time ON market_price_history (condition_id, recorded_at desc);
+
+-- =====================================================================
+-- Run these in Supabase SQL editor manually.
+-- calibration_v2 layered edge model + momentum prep.
+-- =====================================================================
+
+ALTER TABLE scored_markets
+  ADD COLUMN IF NOT EXISTS impossible_edge   boolean       NOT NULL DEFAULT false,
+  ADD COLUMN IF NOT EXISTS adjusted_edge     numeric(10,8),
+  ADD COLUMN IF NOT EXISTS time_factor       numeric(6,4),
+  ADD COLUMN IF NOT EXISTS category_factor   numeric(6,4),
+  ADD COLUMN IF NOT EXISTS volume_factor     numeric(6,4),
+  ADD COLUMN IF NOT EXISTS p_market_7d_ago   numeric(10,8),
+  ADD COLUMN IF NOT EXISTS momentum          numeric(10,8),
+  ADD COLUMN IF NOT EXISTS momentum_factor   numeric(6,4) NOT NULL DEFAULT 1.0;
+
+CREATE INDEX IF NOT EXISTS idx_scored_adjusted_edge ON scored_markets (adjusted_edge desc);
+CREATE INDEX IF NOT EXISTS idx_scored_category ON scored_markets (category);

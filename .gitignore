@@ -40,6 +40,10 @@ ml/*.pyc
 *.pkl
 *.tar.bz2
 
+# --- price collector ------------------------------------------------
+# Active CSVs churn constantly; resolved CSVs are permanent training data.
+market_data/active/*.csv
+
 # --- editor / OS -----------------------------------------------------
 .DS_Store
 Thumbs.db

@@ -218,9 +218,9 @@ function ProblemSection() {
           Longshots lose. We built the short side.
         </h2>
         <p style={{ ...bodyParagraph, maxWidth: 780, margin: '24px auto 0' }}>
-          Humans are wired to overpay for unlikely outcomes. A 3% chance feels like a lottery ticket.
-          People buy it anyway. That mispricing is systematic, documented, and until now nobody built
-          infrastructure to profit from it at scale.
+          The longshot bias is one of the most replicated findings in behavioral economics. It holds
+          across elections, sports, crypto, and macro markets. Sophisticated traders know it exists.
+          Until now, nobody built the infrastructure to systematically sit on the other side of it at scale.
         </p>
 
         {/* Pill row — wider container so all three sit on one line. */}
@@ -512,8 +512,14 @@ function LiveRightNowSection({ count, onCount }: { count: number | null; onCount
 
 /** Inline pill-style counter — green tinted, sits before the live table. */
 function LiveCounter() {
-  const [value, setValue] = useState<number>(() => 1200 + Math.floor(Math.random() * 200));
+  // Deterministic initial value so SSR and first client render match.
+  // Real starting value is jittered after mount to avoid hydration mismatch.
+  const [value, setValue] = useState<number>(1300);
   const [ref, inView] = useInView<HTMLDivElement>(0.1);
+
+  useEffect(() => {
+    setValue(1200 + Math.floor(Math.random() * 200));
+  }, []);
 
   useEffect(() => {
     if (!inView) return;

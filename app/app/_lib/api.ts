@@ -64,13 +64,30 @@ export const api = {
       jsonRequest<{ at: number; count: number; rows: any[] }>(
         `/api/scanner/snapshot?min=${min}&max=${max}`,
       ),
-    markets: (min = 0.02, max = 0.15) =>
-      jsonRequest<{
+    markets: (
+      opts: {
+        min?: number;
+        max?: number;
+        sort?: 'volume' | 'edge' | 'days' | 'p_market';
+        search?: string;
+        limit?: number;
+      } = {},
+    ) => {
+      const p = new URLSearchParams();
+      p.set('min', String(opts.min ?? 0.02));
+      p.set('max', String(opts.max ?? 0.15));
+      p.set('sort', opts.sort ?? 'volume');
+      if (opts.search) p.set('search', opts.search);
+      if (opts.limit != null) p.set('limit', String(opts.limit));
+      return jsonRequest<{
         at: number;
         count: number;
         counts: { polymarket: number; kalshi: number };
         kalshi_error?: string | null;
         kalshi_throttled?: boolean;
+        sort?: string;
+        search?: string | null;
+        total_after_filter?: number;
         rows: Array<{
           question: string;
           source: 'kalshi' | 'polymarket';
@@ -80,8 +97,21 @@ export const api = {
           volume?: number;
           daysToClose?: number | null;
           endDateIso?: string;
+          category?: string;
+          screened?: boolean;
+          excluded?: boolean;
+          impossible?: boolean;
+          exclusion_reason?: string | null;
+          p_model?: number | null;
+          edge?: number | null;
+          adjusted_edge?: number | null;
+          time_factor?: number | null;
+          category_factor?: number | null;
+          volume_factor?: number | null;
+          include_in_basket?: boolean | null;
         }>;
-      }>(`/api/scanner/markets?min=${min}&max=${max}`),
+      }>(`/api/scanner/markets?${p.toString()}`);
+    },
     /** Returns the EventSource — caller must close it on unmount. */
     live: (onMessage: (rows: any[]) => void): EventSource => {
       const es = new EventSource(`${BACKEND_URL}/api/scanner/live`);

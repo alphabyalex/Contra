@@ -107,6 +107,99 @@ export interface Transaction {
   created_at: string;
 }
 
+export interface ScreenedMarket {
+  id: string;
+  condition_id: string;
+  source: LegSource;
+  question: string;
+  p_market: number | null;
+  impossible: boolean;
+  already_resolved: boolean;
+  ambiguous: boolean;
+  excluded: boolean;
+  exclusion_reason: string | null;
+  screened_at: string;
+  screening_model: string | null;
+}
+
+export interface ScoredMarket {
+  id: string;
+  condition_id: string;
+  source: string;
+  question: string;
+  p_market: number;
+  p_model: number | null;
+  edge: number | null;
+  volume: number | null;
+  days_to_close: number | null;
+  category: string | null;
+  include_in_basket: boolean;
+  scored_at: string;
+  model_version: string | null;
+  impossible_edge: boolean;
+  // calibration_v2 layered fields
+  adjusted_edge: number | null;
+  time_factor: number | null;
+  category_factor: number | null;
+  volume_factor: number | null;
+  // momentum prep (populated by daily 8am job once history exists)
+  p_market_7d_ago: number | null;
+  momentum: number | null;
+  momentum_factor: number;
+}
+
+export interface TrackedMarket {
+  id: string;
+  condition_id: string;
+  source: string;
+  question: string;
+  token_id: string | null;
+  category: string | null;
+  p_market_initial: number | null;
+  p_model_initial: number | null;
+  edge_initial: number | null;
+  resolution_date: string | null;
+  in_basket: boolean;
+  outcome: 0 | 1 | null;
+  resolved_at: string | null;
+  created_at: string;
+  updated_at: string;
+}
+
+export interface MarketPricePoint {
+  id: string;
+  condition_id: string;
+  price: number;
+  days_to_close: number | null;
+  recorded_at: string;
+}
+
+export interface PredictionLogEntry {
+  id: string;
+  condition_id: string;
+  source: string;
+  question: string;
+  p_market_at_entry: number;
+  p_model_at_entry: number | null;
+  edge_at_entry: number | null;
+  basket_id: string | null;
+  outcome: 0 | 1 | null;
+  days_held: number | null;
+  resolved_at: string | null;
+  logged_at: string;
+  model_version: string | null;
+}
+
+export interface PredictionLogStats {
+  total: number;
+  resolved: number;
+  no_count: number;
+  yes_count: number;
+  hit_rate: number | null;
+  avg_edge_winners: number | null;
+  avg_edge_losers: number | null;
+}
+
 // ---------- in-memory store ------------------------------------------
 
 const mem = {
@@ -116,6 +209,11 @@ const mem = {
   leveraged: new Map<string, LeveragedPosition>(),
   nav: new Map<string, NavSnapshot>(),
   txs: new Map<string, Transaction>(),
+  screened: new Map<string, ScreenedMarket>(),         // key: condition_id
+  scored: new Map<string, ScoredMarket>(),             // key: condition_id
+  predictions: new Map<string, PredictionLogEntry>(),  // key: id
+  tracked: new Map<string, TrackedMarket>(),           // key: condition_id
+  prices: new Map<string, MarketPricePoint[]>(),       // key: condition_id (newest last)
 };
 
 const nowIso = () => new Date().toISOString();
@@ -447,6 +545,561 @@ export async function listTransactionsByWallet(wallet: string, limit = 100): Pro
     .slice(0, limit);
 }
 
+// ---------- screened_markets -----------------------------------------
+
+export async function getScreenedMarket(conditionId: string): Promise<ScreenedMarket | null> {
+  const sb = getSupabase();
+  if (sb) {
+    const { data, error } = await sb
+      .from('screened_markets')
+      .select('*')
+      .eq('condition_id', conditionId)
+      .maybeSingle();
+    if (error) throw error;
+    return (data ?? null) as ScreenedMarket | null;
+  }
+  return mem.screened.get(conditionId) ?? null;
+}
+
+export async function getScreenedByConditionIds(ids: string[]): Promise<Map<string, ScreenedMarket>> {
+  const out = new Map<string, ScreenedMarket>();
+  if (ids.length === 0) return out;
+  const sb = getSupabase();
+  if (sb) {
+    const { data, error } = await sb.from('screened_markets').select('*').in('condition_id', ids);
+    if (error) throw error;
+    for (const row of (data ?? []) as ScreenedMarket[]) out.set(row.condition_id, row);
+    return out;
+  }
+  for (const id of ids) {
+    const r = mem.screened.get(id);
+    if (r) out.set(id, r);
+  }
+  return out;
+}
+
+export async function upsertScreenedMarket(
+  row: Omit<ScreenedMarket, 'id' | 'screened_at' | 'screening_model'> & {
+    id?: string;
+    screened_at?: string;
+    screening_model?: string | null;
+  },
+): Promise<ScreenedMarket> {
+  const full: ScreenedMarket = {
+    id: row.id ?? randomUUID(),
+    condition_id: row.condition_id,
+    source: row.source,
+    question: row.question,
+    p_market: row.p_market,
+    impossible: row.impossible,
+    already_resolved: row.already_resolved,
+    ambiguous: row.ambiguous,
+    excluded: row.excluded,
+    exclusion_reason: row.exclusion_reason,
+    screened_at: row.screened_at ?? nowIso(),
+    screening_model: row.screening_model ?? 'claude-sonnet-4-20250514',
+  };
+  const sb = getSupabase();
+  if (sb) {
+    const { data, error } = await sb
+      .from('screened_markets')
+      .upsert(full, { onConflict: 'condition_id' })
+      .select()
+      .single();
+    if (error) throw error;
+    return data as ScreenedMarket;
+  }
+  mem.screened.set(full.condition_id, full);
+  return full;
+}
+
+// ---------- scored_markets -------------------------------------------
+
+export async function getScoredMarket(conditionId: string): Promise<ScoredMarket | null> {
+  const sb = getSupabase();
+  if (sb) {
+    const { data, error } = await sb
+      .from('scored_markets')
+      .select('*')
+      .eq('condition_id', conditionId)
+      .maybeSingle();
+    if (error) throw error;
+    return (data ?? null) as ScoredMarket | null;
+  }
+  return mem.scored.get(conditionId) ?? null;
+}
+
+export async function getScoredByConditionIds(ids: string[]): Promise<Map<string, ScoredMarket>> {
+  const out = new Map<string, ScoredMarket>();
+  if (ids.length === 0) return out;
+  const sb = getSupabase();
+  if (sb) {
+    const { data, error } = await sb.from('scored_markets').select('*').in('condition_id', ids);
+    if (error) throw error;
+    for (const row of (data ?? []) as ScoredMarket[]) out.set(row.condition_id, row);
+    return out;
+  }
+  for (const id of ids) {
+    const r = mem.scored.get(id);
+    if (r) out.set(id, r);
+  }
+  return out;
+}
+
+export async function upsertScoredMarket(
+  row: Partial<ScoredMarket> & {
+    condition_id: string;
+    source: string;
+    question: string;
+    p_market: number;
+    include_in_basket: boolean;
+  },
+): Promise<ScoredMarket> {
+  const full: ScoredMarket = {
+    id: row.id ?? randomUUID(),
+    condition_id: row.condition_id,
+    source: row.source,
+    question: row.question,
+    p_market: row.p_market,
+    p_model: row.p_model ?? null,
+    edge: row.edge ?? null,
+    volume: row.volume ?? null,
+    days_to_close: row.days_to_close ?? null,
+    category: row.category ?? null,
+    include_in_basket: row.include_in_basket,
+    scored_at: row.scored_at ?? nowIso(),
+    model_version: row.model_version ?? 'calibration_v2',
+    impossible_edge: row.impossible_edge ?? false,
+    adjusted_edge: row.adjusted_edge ?? null,
+    time_factor: row.time_factor ?? null,
+    category_factor: row.category_factor ?? null,
+    volume_factor: row.volume_factor ?? null,
+    p_market_7d_ago: row.p_market_7d_ago ?? null,
+    momentum: row.momentum ?? null,
+    momentum_factor: row.momentum_factor ?? 1.0,
+  };
+  const sb = getSupabase();
+  if (sb) {
+    // Adaptive payload — keep stripping rejected columns and retry until
+    // either the upsert succeeds or we run out of trim candidates. This
+    // matters when calibration_v2 ALTER hasn't been run yet on Supabase.
+    let payload: Record<string, unknown> = { ...full };
+    let attempts = 0;
+    while (attempts++ < 12) {
+      const { data, error } = await sb
+        .from('scored_markets')
+        .upsert(payload, { onConflict: 'condition_id' })
+        .select()
+        .maybeSingle();
+      if (!error) {
+        return ({ ...full, ...(data ?? {}) }) as ScoredMarket;
+      }
+      const m = error.message?.match(/Could not find the '(\w+)' column/);
+      if (m && m[1] in payload) {
+        delete payload[m[1]];
+        continue;
+      }
+      throw error;
+    }
+    throw new Error('upsertScoredMarket: too many schema mismatches');
+  }
+  mem.scored.set(full.condition_id, full);
+  return full;
+}
+
+// ---------- prediction_log -------------------------------------------
+
+export async function insertPredictionLog(
+  entry: Omit<PredictionLogEntry, 'id' | 'logged_at' | 'model_version'> & {
+    id?: string;
+    logged_at?: string;
+    model_version?: string | null;
+  },
+): Promise<PredictionLogEntry> {
+  const row: PredictionLogEntry = {
+    id: entry.id ?? randomUUID(),
+    condition_id: entry.condition_id,
+    source: entry.source,
+    question: entry.question,
+    p_market_at_entry: entry.p_market_at_entry,
+    p_model_at_entry: entry.p_model_at_entry,
+    edge_at_entry: entry.edge_at_entry,
+    basket_id: entry.basket_id,
+    outcome: entry.outcome,
+    days_held: entry.days_held,
+    resolved_at: entry.resolved_at,
+    logged_at: entry.logged_at ?? nowIso(),
+    model_version: entry.model_version ?? 'stub_v1',
+  };
+  const sb = getSupabase();
+  if (sb) {
+    const { data, error } = await sb.from('prediction_log').insert(row).select().single();
+    if (error) throw error;
+    return data as PredictionLogEntry;
+  }
+  mem.predictions.set(row.id, row);
+  return row;
+}
+
+export async function getPredictionLogByBasket(basketId: string): Promise<PredictionLogEntry[]> {
+  const sb = getSupabase();
+  if (sb) {
+    const { data, error } = await sb
+      .from('prediction_log')
+      .select('*')
+      .eq('basket_id', basketId)
+      .order('logged_at', { ascending: false });
+    if (error) throw error;
+    return (data ?? []) as PredictionLogEntry[];
+  }
+  return [...mem.predictions.values()]
+    .filter((p) => p.basket_id === basketId)
+    .sort((a, b) => b.logged_at.localeCompare(a.logged_at));
+}
+
+export async function getPredictionLogByConditionId(conditionId: string): Promise<PredictionLogEntry[]> {
+  const sb = getSupabase();
+  if (sb) {
+    const { data, error } = await sb
+      .from('prediction_log')
+      .select('*')
+      .eq('condition_id', conditionId)
+      .order('logged_at', { ascending: false });
+    if (error) throw error;
+    return (data ?? []) as PredictionLogEntry[];
+  }
+  return [...mem.predictions.values()]
+    .filter((p) => p.condition_id === conditionId)
+    .sort((a, b) => b.logged_at.localeCompare(a.logged_at));
+}
+
+/**
+ * Patch the outcome + resolved_at for every open prediction_log row that
+ * shares a condition_id. Multiple rows may exist when the same market sits
+ * in several baskets, so this updates all matching rows in one call.
+ */
+export async function updatePredictionOutcome(
+  conditionId: string,
+  outcome: 0 | 1,
+  resolvedAt?: string,
+): Promise<PredictionLogEntry[]> {
+  const ts = resolvedAt ?? nowIso();
+  const sb = getSupabase();
+  if (sb) {
+    const { data, error } = await sb
+      .from('prediction_log')
+      .update({ outcome, resolved_at: ts })
+      .eq('condition_id', conditionId)
+      .is('outcome', null)
+      .select();
+    if (error) throw error;
+    return (data ?? []) as PredictionLogEntry[];
+  }
+  const updated: PredictionLogEntry[] = [];
+  for (const row of mem.predictions.values()) {
+    if (row.condition_id === conditionId && row.outcome == null) {
+      row.outcome = outcome;
+      row.resolved_at = ts;
+      updated.push(row);
+    }
+  }
+  return updated;
+}
+
+/**
+ * Return every prediction_log row (resolved or open). Used by analytics
+ * services that need per-row data — `getPredictionLogStats` aggregates,
+ * this is the underlying list.
+ */
+export async function listPredictionLog(): Promise<PredictionLogEntry[]> {
+  const sb = getSupabase();
+  if (sb) {
+    const { data, error } = await sb.from('prediction_log').select('*');
+    if (error) throw error;
+    return (data ?? []) as PredictionLogEntry[];
+  }
+  return [...mem.predictions.values()];
+}
+
+export async function getPredictionLogStats(): Promise<PredictionLogStats> {
+  const sb = getSupabase();
+  let rows: PredictionLogEntry[];
+  if (sb) {
+    const { data, error } = await sb.from('prediction_log').select('*');
+    if (error) throw error;
+    rows = (data ?? []) as PredictionLogEntry[];
+  } else {
+    rows = [...mem.predictions.values()];
+  }
+
+  const total = rows.length;
+  const resolvedRows = rows.filter((r) => r.outcome === 0 || r.outcome === 1);
+  const resolved = resolvedRows.length;
+  const winners = resolvedRows.filter((r) => r.outcome === 0);   // NO = we win
+  const losers = resolvedRows.filter((r) => r.outcome === 1);    // YES = we lose
+  const no_count = winners.length;
+  const yes_count = losers.length;
+  const hit_rate = resolved > 0 ? no_count / resolved : null;
+
+  const avg = (rs: PredictionLogEntry[]): number | null => {
+    const vals = rs.map((r) => r.edge_at_entry).filter((v): v is number => v != null);
+    if (vals.length === 0) return null;
+    return vals.reduce((s, v) => s + v, 0) / vals.length;
+  };
+
+  return {
+    total,
+    resolved,
+    no_count,
+    yes_count,
+    hit_rate,
+    avg_edge_winners: avg(winners),
+    avg_edge_losers: avg(losers),
+  };
+}
+
+// ---------- listing helpers (used by analytics + admin) -------------
+
+export async function listScreenedMarkets(): Promise<ScreenedMarket[]> {
+  const sb = getSupabase();
+  if (sb) {
+    const { data, error } = await sb.from('screened_markets').select('*');
+    if (error) throw error;
+    return (data ?? []) as ScreenedMarket[];
+  }
+  return [...mem.screened.values()];
+}
+
+export async function listScoredMarkets(): Promise<ScoredMarket[]> {
+  const sb = getSupabase();
+  if (sb) {
+    const { data, error } = await sb.from('scored_markets').select('*');
+    if (error) throw error;
+    return (data ?? []) as ScoredMarket[];
+  }
+  return [...mem.scored.values()];
+}
+
+export async function listRecentlyExcluded(limit = 10): Promise<ScreenedMarket[]> {
+  const sb = getSupabase();
+  if (sb) {
+    const { data, error } = await sb
+      .from('screened_markets')
+      .select('*')
+      .eq('excluded', true)
+      .order('screened_at', { ascending: false })
+      .limit(limit);
+    if (error) throw error;
+    return (data ?? []) as ScreenedMarket[];
+  }
+  return [...mem.screened.values()]
+    .filter((s) => s.excluded)
+    .sort((a, b) => b.screened_at.localeCompare(a.screened_at))
+    .slice(0, limit);
+}
+
+// ---------- tracked_markets -----------------------------------------
+
+export async function getTrackedMarket(conditionId: string): Promise<TrackedMarket | null> {
+  const sb = getSupabase();
+  if (sb) {
+    const { data, error } = await sb
+      .from('tracked_markets')
+      .select('*')
+      .eq('condition_id', conditionId)
+      .maybeSingle();
+    if (error) throw error;
+    return (data ?? null) as TrackedMarket | null;
+  }
+  return mem.tracked.get(conditionId) ?? null;
+}
+
+export async function listTrackedMarkets(opts: { onlyOpen?: boolean } = {}): Promise<TrackedMarket[]> {
+  const sb = getSupabase();
+  if (sb) {
+    let q = sb.from('tracked_markets').select('*');
+    if (opts.onlyOpen) q = q.is('outcome', null);
+    const { data, error } = await q;
+    if (error) throw error;
+    return (data ?? []) as TrackedMarket[];
+  }
+  let arr = [...mem.tracked.values()];
+  if (opts.onlyOpen) arr = arr.filter((t) => t.outcome == null);
+  return arr;
+}
+
+export async function listTrackedMarketsResolvingSoon(daysAhead = 7): Promise<TrackedMarket[]> {
+  const cutoff = new Date(Date.now() + daysAhead * 24 * 60 * 60 * 1000).toISOString();
+  const sb = getSupabase();
+  if (sb) {
+    const { data, error } = await sb
+      .from('tracked_markets')
+      .select('*')
+      .is('outcome', null)
+      .not('resolution_date', 'is', null)
+      .lt('resolution_date', cutoff);
+    if (error) throw error;
+    return (data ?? []) as TrackedMarket[];
+  }
+  return [...mem.tracked.values()].filter(
+    (t) => t.outcome == null && t.resolution_date != null && t.resolution_date < cutoff,
+  );
+}
+
+export async function upsertTrackedMarket(
+  row: Omit<TrackedMarket, 'id' | 'created_at' | 'updated_at'> & {
+    id?: string;
+    created_at?: string;
+    updated_at?: string;
+  },
+): Promise<TrackedMarket> {
+  const full: TrackedMarket = {
+    id: row.id ?? randomUUID(),
+    condition_id: row.condition_id,
+    source: row.source,
+    question: row.question,
+    token_id: row.token_id,
+    category: row.category,
+    p_market_initial: row.p_market_initial,
+    p_model_initial: row.p_model_initial,
+    edge_initial: row.edge_initial,
+    resolution_date: row.resolution_date,
+    in_basket: row.in_basket,
+    outcome: row.outcome,
+    resolved_at: row.resolved_at,
+    created_at: row.created_at ?? nowIso(),
+    updated_at: row.updated_at ?? nowIso(),
+  };
+  const sb = getSupabase();
+  if (sb) {
+    // Build payload incrementally and retry on "column not found" by
+    // stripping the offending field. The user's Supabase tracked_markets
+    // schema has been observed to differ slightly from schema.sql
+    // (e.g. missing `category` / `created_at` columns) so we trim what
+    // PostgREST rejects rather than fail the whole insert.
+    let payload: Record<string, unknown> = { ...full };
+    let attempts = 0;
+    while (attempts++ < 6) {
+      const { data, error } = await sb
+        .from('tracked_markets')
+        .upsert(payload, { onConflict: 'condition_id' })
+        .select()
+        .maybeSingle();
+      if (!error) {
+        return ({ ...full, ...(data ?? {}) }) as TrackedMarket;
+      }
+      const m = error.message?.match(/Could not find the '(\w+)' column/);
+      if (m && m[1] in payload) {
+        delete payload[m[1]];
+        continue;
+      }
+      throw error;
+    }
+    throw new Error('upsertTrackedMarket: too many schema mismatches');
+  }
+  mem.tracked.set(full.condition_id, full);
+  return full;
+}
+
+export async function updateTrackedMarket(
+  conditionId: string,
+  patch: Partial<TrackedMarket>,
+): Promise<TrackedMarket | null> {
+  const sb = getSupabase();
+  if (sb) {
+    const { data, error } = await sb
+      .from('tracked_markets')
+      .update({ ...patch, updated_at: nowIso() })
+      .eq('condition_id', conditionId)
+      .select()
+      .maybeSingle();
+    if (error) throw error;
+    return (data ?? null) as TrackedMarket | null;
+  }
+  const cur = mem.tracked.get(conditionId);
+  if (!cur) return null;
+  Object.assign(cur, patch, { updated_at: nowIso() });
+  return cur;
+}
+
+// ---------- market_price_history ------------------------------------
+
+export async function recordPricePoint(
+  point: Omit<MarketPricePoint, 'id' | 'recorded_at'> & {
+    id?: string;
+    recorded_at?: string;
+  },
+): Promise<MarketPricePoint> {
+  const row: MarketPricePoint = {
+    id: point.id ?? randomUUID(),
+    condition_id: point.condition_id,
+    price: point.price,
+    days_to_close: point.days_to_close,
+    recorded_at: point.recorded_at ?? nowIso(),
+  };
+  const sb = getSupabase();
+  if (sb) {
+    const { data, error } = await sb.from('market_price_history').insert(row).select().single();
+    if (error) throw error;
+    return data as MarketPricePoint;
+  }
+  const arr = mem.prices.get(row.condition_id) ?? [];
+  arr.push(row);
+  mem.prices.set(row.condition_id, arr);
+  return row;
+}
+
+export async function getLatestPricePoint(conditionId: string): Promise<MarketPricePoint | null> {
+  const sb = getSupabase();
+  if (sb) {
+    const { data, error } = await sb
+      .from('market_price_history')
+      .select('*')
+      .eq('condition_id', conditionId)
+      .order('recorded_at', { ascending: false })
+      .limit(1)
+      .maybeSingle();
+    if (error) throw error;
+    return (data ?? null) as MarketPricePoint | null;
+  }
+  const arr = mem.prices.get(conditionId);
+  if (!arr || arr.length === 0) return null;
+  return arr[arr.length - 1];
+}
+
+export async function getPriceHistory(conditionId: string): Promise<MarketPricePoint[]> {
+  const sb = getSupabase();
+  if (sb) {
+    const { data, error } = await sb
+      .from('market_price_history')
+      .select('*')
+      .eq('condition_id', conditionId)
+      .order('recorded_at', { ascending: true });
+    if (error) throw error;
+    return (data ?? []) as MarketPricePoint[];
+  }
+  return (mem.prices.get(conditionId) ?? []).slice().sort((a, b) =>
+    a.recorded_at.localeCompare(b.recorded_at),
+  );
+}
+
+export async function deletePriceHistory(conditionId: string): Promise<number> {
+  const sb = getSupabase();
+  if (sb) {
+    const { data, error } = await sb
+      .from('market_price_history')
+      .delete()
+      .eq('condition_id', conditionId)
+      .select('id');
+    if (error) throw error;
+    return (data ?? []).length;
+  }
+  const arr = mem.prices.get(conditionId);
+  const n = arr?.length ?? 0;
+  mem.prices.delete(conditionId);
+  return n;
+}
+
 // ---------- helpers --------------------------------------------------
 
 /**
@@ -460,4 +1113,9 @@ export function __resetInMemory(): void {
   mem.leveraged.clear();
   mem.nav.clear();
   mem.txs.clear();
+  mem.screened.clear();
+  mem.scored.clear();
+  mem.predictions.clear();
+  mem.tracked.clear();
+  mem.prices.clear();
 }
