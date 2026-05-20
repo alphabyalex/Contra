@@ -24,7 +24,13 @@ import {
 import { scanLongshots as scanKalshi } from './kalshi';
 import { scoreMany, type ScorableMarket } from './mispricing';
 import { batchScreenMarkets, type MarketToScreen } from './screener';
-import { scoreAllMarkets, getPModel, getEdge, type MarketToScore } from './ml-scorer';
+import {
+  scoreAllMarkets,
+  rescoreAllStored,
+  getPModel,
+  getEdge,
+  type MarketToScore,
+} from './ml-scorer';
 import { collectAllPrices } from './price-collector';
 import { checkResolutions } from './resolution-monitor';
 import { checkAutoRotation } from './basket-builder';
@@ -143,6 +149,25 @@ export function startCron(): void {
   });
 
   console.info('[cron] scheduled jobs started');
+
+  // One-time startup tasks (fire-and-forget):
+  //   1. Re-score every stored market with the active model (calibration_v3)
+  //   2. Kick an immediate price-collection pass so market_price_history
+  //      starts filling without waiting for the first 15-min tick.
+  setTimeout(() => {
+    rescoreAllStored()
+      .then((r) =>
+        console.info(
+          `[cron] startup rescore: ${r.rescored}/${r.total} → ${r.model_version} (${r.included} in basket)`,
+        ),
+      )
+      .catch((e) => console.error('[cron] startup rescore failed:', (e as Error).message))
+      .finally(() => {
+        collectAllPrices().catch((e) =>
+          console.error('[cron] startup price collection failed:', (e as Error).message),
+        );
+      });
+  }, 4000);
 }
 
 // ---------------------------------------------------------------------

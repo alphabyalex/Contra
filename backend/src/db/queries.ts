@@ -169,6 +169,7 @@ export interface TrackedMarket {
 export interface MarketPricePoint {
   id: string;
   condition_id: string;
+  source: string;
   price: number;
   days_to_close: number | null;
   recorded_at: string;
@@ -898,6 +899,52 @@ export async function listRecentlyExcluded(limit = 10): Promise<ScreenedMarket[]
     .slice(0, limit);
 }
 
+export interface ScreenerSummary {
+  total_tracked: number;
+  total_screened: number;
+  excluded: number;
+  eligible: number;
+  in_basket: number;
+}
+
+/**
+ * Counts for the admin Screener Summary panel, fetched directly from the
+ * source tables (not derived from the scanner route). Uses Supabase
+ * head+count queries when available; falls back to the in-memory store.
+ */
+export async function getScreenerSummary(): Promise<ScreenerSummary> {
+  const sb = getSupabase();
+  if (sb) {
+    const headCount = async (
+      table: string,
+      apply?: (q: any) => any,
+    ): Promise<number> => {
+      let q = sb.from(table).select('*', { count: 'exact', head: true });
+      if (apply) q = apply(q);
+      const { count, error } = await q;
+      if (error) throw error;
+      return count ?? 0;
+    };
+    const [total_tracked, total_screened, excluded, eligible, in_basket] = await Promise.all([
+      headCount('tracked_markets'),
+      headCount('screened_markets'),
+      headCount('screened_markets', (q) => q.eq('excluded', true)),
+      headCount('screened_markets', (q) => q.eq('excluded', false)),
+      headCount('scored_markets', (q) => q.eq('include_in_basket', true)),
+    ]);
+    return { total_tracked, total_screened, excluded, eligible, in_basket };
+  }
+
+  const screenedArr = [...mem.screened.values()];
+  return {
+    total_tracked: mem.tracked.size,
+    total_screened: screenedArr.length,
+    excluded: screenedArr.filter((s) => s.excluded).length,
+    eligible: screenedArr.filter((s) => !s.excluded).length,
+    in_basket: [...mem.scored.values()].filter((s) => s.include_in_basket).length,
+  };
+}
+
 // ---------- tracked_markets -----------------------------------------
 
 export async function getTrackedMarket(conditionId: string): Promise<TrackedMarket | null> {
@@ -1025,14 +1072,17 @@ export async function updateTrackedMarket(
 // ---------- market_price_history ------------------------------------
 
 export async function recordPricePoint(
-  point: Omit<MarketPricePoint, 'id' | 'recorded_at'> & {
+  point: Omit<MarketPricePoint, 'id' | 'recorded_at' | 'source'> & {
     id?: string;
     recorded_at?: string;
+    source?: string;
   },
 ): Promise<MarketPricePoint> {
   const row: MarketPricePoint = {
     id: point.id ?? randomUUID(),
     condition_id: point.condition_id,
+    // market_price_history.source is NOT NULL in Supabase.
+    source: point.source ?? 'polymarket',
     price: point.price,
     days_to_close: point.days_to_close,
     recorded_at: point.recorded_at ?? nowIso(),

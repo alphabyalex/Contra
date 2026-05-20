@@ -13,14 +13,14 @@ resolution = true
 skip-lint = false
 
 [programs.localnet]
-contra_vault    = "Contra1111111111111111111111111111111111111"
-contra_lending  = "Contra2222222222222222222222222222222222222"
-contra_leverage = "Contra3333333333333333333333333333333333333"
+contra_vault    = "5t7Juh2ZpxNGeaMCjvLjA6YnXnFahWcYWKouMzeahNgt"
+contra_lending  = "BqGJk8CXCcdVhCVg41VapQVFdQgM3rXdW5MenhMmiQLR"
+contra_leverage = "5Y4oQ2QcQoBKdcRzPmdHNBGMg4As535GysADjjbdQS9V"
 
 [programs.devnet]
-contra_vault    = "Contra1111111111111111111111111111111111111"
-contra_lending  = "Contra2222222222222222222222222222222222222"
-contra_leverage = "Contra3333333333333333333333333333333333333"
+contra_vault    = "5t7Juh2ZpxNGeaMCjvLjA6YnXnFahWcYWKouMzeahNgt"
+contra_lending  = "BqGJk8CXCcdVhCVg41VapQVFdQgM3rXdW5MenhMmiQLR"
+contra_leverage = "5Y4oQ2QcQoBKdcRzPmdHNBGMg4As535GysADjjbdQS9V"
 
 [registry]
 url = "https://api.apr.dev"

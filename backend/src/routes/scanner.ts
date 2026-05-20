@@ -1,12 +1,22 @@
 /**
  * Scanner API.
- *   GET /api/scanner/snapshot — merged Polymarket + Kalshi raw markets
- *                               filtered to longshot range (default 0.02–0.15)
- *   GET /api/scanner/live      — SSE stream, refreshed every 30s
- *   GET /api/scanner/history   — most recent scored scan output
+ *   GET /api/scanner/markets   — PRIMARY display endpoint. Reads the
+ *                                scored_markets table (full curated pool,
+ *                                178+ rows) enriched with screened_markets
+ *                                + tracked_markets. Layered factors
+ *                                (adjusted_edge / time / category / volume)
+ *                                are recomputed on the fly from the ML
+ *                                scorer so they stay consistent with the
+ *                                active model even though they are not
+ *                                persisted as columns.
+ *   GET /api/scanner/market/:id — single-market detail (live snapshot join)
+ *   GET /api/scanner/snapshot   — raw merged live markets (debug)
+ *   GET /api/scanner/live       — SSE stream
+ *   GET /api/scanner/history    — most recent scored scan output
  *
- * snapshot returns rows in the shape the new scanner page expects;
- * live/history keep returning the model-scored output for backwards compat.
+ * The live Polymarket / Kalshi APIs are intentionally NOT the source for
+ * /markets — they are only used by the weekly screener (new market
+ * discovery) and the price collector (price updates).
  */
 
 import { Router, Request, Response } from 'express';
@@ -16,201 +26,162 @@ import {
   flattenOutcomes as flattenPoly,
   daysToClose,
 } from '../services/polymarket';
+import { getLastKalshiError, getLastKalshiThrottled } from '../services/kalshi';
 import {
-  getAllOpenMarkets as getAllKalshi,
-  flattenOutcomes as flattenKalshi,
-  getLastKalshiError,
-  getLastKalshiThrottled,
-} from '../services/kalshi';
-import {
-  getScreenedByConditionIds,
-  getScoredByConditionIds,
+  listScoredMarkets,
+  listScreenedMarkets,
+  listTrackedMarkets,
   getScreenedMarket,
   getScoredMarket,
   listRecentlyExcluded,
+  type ScreenedMarket,
+  type TrackedMarket,
 } from '../db/queries';
+import { computeLayeredScore } from '../services/ml-scorer';
 
 export const scannerRouter: Router = Router();
 
-interface SnapshotRow {
+interface ScannerMarketRow {
+  condition_id: string;
+  marketId: string; // alias of condition_id for legacy frontend consumers
   question: string;
-  source: 'kalshi' | 'polymarket';
-  marketId: string;
-  outcomeLabel: string;
+  source: string;
   p_market: number;
-  volume: number;
-  endDateIso?: string;
-  daysToClose?: number | null;
-  category?: string;
-}
-
-interface EnrichedRow extends SnapshotRow {
+  p_model: number;
+  adjusted_edge: number;
+  edge: number; // raw base edge (p_market - p_model)
+  time_factor: number;
+  category_factor: number;
+  volume_factor: number;
+  category: string;
+  days_to_close: number | null;
+  daysToClose: number | null; // alias for legacy frontend consumers
+  volume: number | null;
   screened: boolean;
   excluded: boolean;
   impossible: boolean;
   exclusion_reason: string | null;
-  p_model: number | null;
-  edge: number | null;
-  adjusted_edge: number | null;
-  time_factor: number | null;
-  category_factor: number | null;
-  volume_factor: number | null;
-  include_in_basket: boolean | null;
+  include_in_basket: boolean;
+  model_version: string | null;
 }
 
-// Polymarket condition_ids are 66-char hex strings; PostgREST .in() puts
-// every id in the URL, so a single 200+ id call easily exceeds the 8KB
-// upstream limit and silently 400s. Chunk to keep each request well under.
-const ID_CHUNK_SIZE = 50;
-
-async function fetchManyChunked<T>(
-  ids: string[],
-  fetcher: (chunk: string[]) => Promise<Map<string, T>>,
-): Promise<Map<string, T>> {
-  const out = new Map<string, T>();
-  for (let i = 0; i < ids.length; i += ID_CHUNK_SIZE) {
-    const chunk = ids.slice(i, i + ID_CHUNK_SIZE);
-    try {
-      const m = await fetcher(chunk);
-      m.forEach((v, k) => out.set(k, v));
-    } catch (e) {
-      console.warn('[scanner] enrich chunk failed:', (e as Error).message);
-    }
-  }
-  return out;
+interface ScoredCacheEntry {
+  at: number;
+  rows: ScannerMarketRow[];
 }
 
-async function enrichRows(rows: SnapshotRow[]): Promise<EnrichedRow[]> {
-  const ids = [...new Set(rows.map((r) => r.marketId))];
-  const [screenedMap, scoredMap] = await Promise.all([
-    fetchManyChunked(ids, getScreenedByConditionIds),
-    fetchManyChunked(ids, getScoredByConditionIds),
+let scoredCache: ScoredCacheEntry | null = null;
+const SCORED_TTL_MS = 30_000;
+
+async function buildScoredRows(): Promise<ScannerMarketRow[]> {
+  const [scored, screened, tracked] = await Promise.all([
+    listScoredMarkets(),
+    listScreenedMarkets().catch(() => [] as ScreenedMarket[]),
+    listTrackedMarkets().catch(() => [] as TrackedMarket[]),
   ]);
-  return rows.map((r) => {
-    const sc = screenedMap.get(r.marketId);
-    const sd = scoredMap.get(r.marketId);
+
+  const screenedById = new Map<string, ScreenedMarket>();
+  for (const s of screened) screenedById.set(s.condition_id, s);
+
+  const trackedById = new Map<string, TrackedMarket>();
+  for (const t of tracked) trackedById.set(t.condition_id, t);
+
+  const rows: ScannerMarketRow[] = scored.map((sd) => {
+    const sc = screenedById.get(sd.condition_id) ?? null;
+    const tm = trackedById.get(sd.condition_id) ?? null;
+
+    const impossible = sc?.impossible ?? sd.impossible_edge ?? false;
+    const excludedByScreener = sc?.excluded ?? false;
+
+    // Volume / days: scored_markets carries both; fall back to tracked.
+    const volume =
+      sd.volume ??
+      (tm && (tm as unknown as { volume_at_start?: number | null }).volume_at_start) ??
+      null;
+
+    let days = sd.days_to_close ?? null;
+    if (days == null && tm?.resolution_date) {
+      const t = Date.parse(tm.resolution_date);
+      if (!Number.isNaN(t)) days = Math.max(0, Math.round((t - Date.now()) / 86_400_000));
+    }
+
+    const layered = computeLayeredScore({
+      p_market: sd.p_market ?? 0,
+      question: sd.question,
+      isImpossible: impossible,
+      excludedByScreener,
+      volume,
+      days_to_close: days,
+      category: sd.category ?? null,
+    });
+
     return {
-      ...r,
-      // Prefer category from scored row (computed via classifyCategory) over snapshot.
-      category: sd?.category ?? r.category,
-      daysToClose: sd?.days_to_close ?? r.daysToClose,
+      condition_id: sd.condition_id,
+      marketId: sd.condition_id,
+      question: sd.question,
+      source: sd.source,
+      p_market: sd.p_market ?? 0,
+      p_model: layered.p_model,
+      adjusted_edge: layered.adjusted_edge,
+      edge: layered.base_edge,
+      time_factor: layered.time_factor,
+      category_factor: layered.category_factor,
+      volume_factor: layered.volume_factor,
+      category: layered.category,
+      days_to_close: days,
+      daysToClose: days,
+      volume,
       screened: Boolean(sc),
-      excluded: sc?.excluded ?? false,
-      impossible: sc?.impossible ?? false,
+      excluded: excludedByScreener,
+      impossible,
       exclusion_reason: sc?.exclusion_reason ?? null,
-      p_model: sd?.p_model ?? null,
-      edge: sd?.edge ?? null,
-      adjusted_edge: sd?.adjusted_edge ?? null,
-      time_factor: sd?.time_factor ?? null,
-      category_factor: sd?.category_factor ?? null,
-      volume_factor: sd?.volume_factor ?? null,
-      include_in_basket: sd ? sd.include_in_basket : null,
+      include_in_basket: layered.include_in_basket,
+      model_version: sd.model_version ?? null,
     };
   });
-}
 
-let snapshotCache: { at: number; rows: SnapshotRow[] } | null = null;
-const SNAPSHOT_TTL_MS = 30_000;
-
-async function fetchSnapshot(min = 0.02, max = 0.15): Promise<SnapshotRow[]> {
-  // Pull both sources in parallel. Kalshi paginates up to 10 pages and
-  // early-stops once it has 50+ priced markets in the wider 0.01..0.20
-  // band; the snapshot's own min/max filter (default 0.02..0.15) is
-  // applied below to the merged set.
-  const [poly, kalshi] = await Promise.all([
-    safeArr(() => getAllPoly(2)),
-    safeArr(() => getAllKalshi(10)),
-  ]);
-  const rows: SnapshotRow[] = [];
-  for (const m of poly) {
-    for (const o of flattenPoly(m)) {
-      if (o.pMarket >= min && o.pMarket <= max) {
-        rows.push({
-          question: o.question,
-          source: 'polymarket',
-          marketId: o.conditionId,
-          outcomeLabel: o.outcomeLabel,
-          p_market: o.pMarket,
-          volume: o.volumeUsd,
-          endDateIso: o.endDateIso,
-          daysToClose: daysToClose(o.endDateIso),
-          category: o.category,
-        });
-      }
-    }
-  }
-  for (const m of kalshi) {
-    for (const o of flattenKalshi(m)) {
-      if (o.pMarket >= min && o.pMarket <= max) {
-        rows.push({
-          question: o.question,
-          source: 'kalshi',
-          marketId: o.ticker,
-          outcomeLabel: o.outcomeLabel,
-          p_market: o.pMarket,
-          volume: o.volumeUsd,
-          endDateIso: o.endDateIso,
-          daysToClose: o.endDateIso ? daysToCloseLocal(o.endDateIso) : null,
-          category: o.category,
-        });
-      }
-    }
-  }
-  rows.sort((a, b) => a.p_market - b.p_market);
   return rows;
 }
 
-function daysToCloseLocal(iso: string): number | null {
-  const t = Date.parse(iso);
-  if (Number.isNaN(t)) return null;
-  return Math.max(0, (t - Date.now()) / 86_400_000);
-}
-
-async function safeArr<T>(fn: () => Promise<T[]>): Promise<T[]> {
-  try {
-    return await fn();
-  } catch (e) {
-    console.warn('[scanner] data source error:', (e as Error).message);
-    return [];
-  }
-}
-
-// Frontend-friendly alias for the new home + scanner pages. Same shape as
-// /snapshot, also returns per-source counts so the UI can render
-// "X from Polymarket · Y from Kalshi".
+/**
+ * GET /api/scanner/markets
+ *
+ * Reads from scored_markets (the curated pool), not the live APIs.
+ *   ?sort=volume|edge|days|p_market   (volume DESC default)
+ *   ?search=term                      filters question across ALL rows,
+ *                                     no limit
+ *   ?limit=N                          explicit cap (else 25 when no search)
+ */
 scannerRouter.get('/markets', async (req, res) => {
   try {
-    const min = req.query.min ? Number(req.query.min) : 0.02;
-    const max = req.query.max ? Number(req.query.max) : 0.15;
     const sortParam = String(req.query.sort ?? 'volume').toLowerCase();
     const search = (req.query.search ?? '').toString().trim().toLowerCase();
-    const limitParam = req.query.limit != null ? Math.max(1, Math.min(500, Number(req.query.limit))) : null;
+    const limitParam =
+      req.query.limit != null ? Math.max(1, Math.min(2000, Number(req.query.limit))) : null;
 
-    const fresh = snapshotCache && Date.now() - snapshotCache.at < SNAPSHOT_TTL_MS;
+    const fresh = scoredCache && Date.now() - scoredCache.at < SCORED_TTL_MS;
     if (!fresh) {
-      const rows = await fetchSnapshot(min, max);
-      snapshotCache = { at: Date.now(), rows };
+      scoredCache = { at: Date.now(), rows: await buildScoredRows() };
     }
-    const rows = snapshotCache!.rows;
-    const polymarket = rows.filter((r) => r.source === 'polymarket').length;
-    const kalshi = rows.filter((r) => r.source === 'kalshi').length;
+    const all = scoredCache!.rows;
 
-    // Enrich the full set first so search hits ALL markets, not just the
-    // top-25 view. enrichRows is bounded by the 500-row cap on the source
-    // array — and chunks Supabase calls — so the cost stays reasonable.
-    let enriched = await enrichRows(rows.slice(0, 500));
+    const polymarket = all.filter((r) => r.source === 'polymarket').length;
+    const kalshi = all.filter((r) => r.source === 'kalshi').length;
 
+    let filtered = all;
     if (search) {
-      enriched = enriched.filter((r) => r.question?.toLowerCase().includes(search));
+      filtered = all.filter((r) => r.question?.toLowerCase().includes(search));
     }
 
-    // Sort
-    const cmp = (a: EnrichedRow, b: EnrichedRow): number => {
+    const cmp = (a: ScannerMarketRow, b: ScannerMarketRow): number => {
       switch (sortParam) {
         case 'edge':
-          return (b.adjusted_edge ?? b.edge ?? 0) - (a.adjusted_edge ?? a.edge ?? 0);
+          return (b.adjusted_edge ?? 0) - (a.adjusted_edge ?? 0);
         case 'days':
-          return (a.daysToClose ?? Number.POSITIVE_INFINITY) - (b.daysToClose ?? Number.POSITIVE_INFINITY);
+          return (
+            (a.days_to_close ?? Number.POSITIVE_INFINITY) -
+            (b.days_to_close ?? Number.POSITIVE_INFINITY)
+          );
         case 'p_market':
           return a.p_market - b.p_market;
         case 'volume':
@@ -218,24 +189,24 @@ scannerRouter.get('/markets', async (req, res) => {
           return (b.volume ?? 0) - (a.volume ?? 0);
       }
     };
-    enriched.sort(cmp);
+    const sorted = [...filtered].sort(cmp);
 
     // Limit semantics:
-    //   - search set → no limit (return all matches)
-    //   - explicit limit → that
-    //   - default → 25
-    const limit = search ? enriched.length : (limitParam ?? 25);
-    const sliced = enriched.slice(0, limit);
+    //   - search set       → no limit (return all matches)
+    //   - explicit ?limit= → that
+    //   - default          → 25
+    const limit = search ? sorted.length : (limitParam ?? 25);
+    const sliced = sorted.slice(0, limit);
 
     res.json({
-      at: snapshotCache!.at,
-      count: rows.length,
+      at: scoredCache!.at,
+      count: all.length,
       counts: { polymarket, kalshi },
       kalshi_error: getLastKalshiError(),
       kalshi_throttled: getLastKalshiThrottled(),
       sort: sortParam,
       search: search || null,
-      total_after_filter: enriched.length,
+      total_after_filter: filtered.length,
       rows: sliced,
     });
   } catch (e) {
@@ -252,35 +223,25 @@ scannerRouter.get('/markets', async (req, res) => {
 /**
  * GET /api/scanner/market/:condition_id
  *
- * Full detail for a single market. Looks up the most recent live snapshot
- * (so the user gets current p_market / volume / category), then joins on
- * screened_markets and scored_markets for the model verdict.
- *
- * status legend:
- *   "impossible"          — screen verdict marked the outcome impossible
- *   "excluded_resolved"   — already resolved
- *   "excluded_ambiguous"  — vague resolution criteria
- *   "excluded"            — excluded for some other reason
- *   "eligible"            — screened, not excluded
- *   "unscreened"          — never screened yet
+ * Full detail for a single market — joins the scored row with the
+ * screened verdict. Falls back to a live snapshot lookup if the market
+ * isn't in scored_markets yet.
  */
 scannerRouter.get('/market/:condition_id', async (req, res) => {
   const id = req.params.condition_id;
   try {
-    // Refresh snapshot if stale, then look the row up by marketId.
-    const fresh = snapshotCache && Date.now() - snapshotCache.at < SNAPSHOT_TTL_MS;
-    if (!fresh) {
-      const rows = await fetchSnapshot(0.0, 1.0);
-      snapshotCache = { at: Date.now(), rows };
-    }
-    const market = snapshotCache!.rows.find((r) => r.marketId === id) ?? null;
-
     const [screened, scored] = await Promise.all([
       getScreenedMarket(id).catch(() => null),
       getScoredMarket(id).catch(() => null),
     ]);
 
-    let status: 'impossible' | 'excluded_resolved' | 'excluded_ambiguous' | 'excluded' | 'eligible' | 'unscreened';
+    let status:
+      | 'impossible'
+      | 'excluded_resolved'
+      | 'excluded_ambiguous'
+      | 'excluded'
+      | 'eligible'
+      | 'unscreened';
     if (!screened) status = 'unscreened';
     else if (screened.impossible) status = 'impossible';
     else if (screened.already_resolved) status = 'excluded_resolved';
@@ -288,17 +249,24 @@ scannerRouter.get('/market/:condition_id', async (req, res) => {
     else if (screened.excluded) status = 'excluded';
     else status = 'eligible';
 
+    let market: unknown = null;
+    if (scored) {
+      market = {
+        question: scored.question,
+        source: scored.source,
+        marketId: scored.condition_id,
+        p_market: scored.p_market,
+        volume: scored.volume,
+        daysToClose: scored.days_to_close,
+        category: scored.category,
+      };
+    }
+
     if (!market && !screened && !scored) {
       return res.status(404).json({ error: 'market_not_found', condition_id: id });
     }
 
-    res.json({
-      condition_id: id,
-      market,
-      screened,
-      scored,
-      status,
-    });
+    res.json({ condition_id: id, market, screened, scored, status });
   } catch (e) {
     res.status(500).json({ error: (e as Error).message });
   }
@@ -306,7 +274,7 @@ scannerRouter.get('/market/:condition_id', async (req, res) => {
 
 /**
  * Recently excluded screened markets. Used by the admin dashboard to
- * surface what Claude has been kicking out and why.
+ * surface what the screener has been kicking out and why.
  */
 scannerRouter.get('/recent-excluded', async (req, res) => {
   try {
@@ -329,20 +297,54 @@ scannerRouter.get('/recent-excluded', async (req, res) => {
   }
 });
 
+// ---- live debug endpoints (raw merged sources, not the curated pool) ---
+
+interface SnapshotRow {
+  question: string;
+  source: 'kalshi' | 'polymarket';
+  marketId: string;
+  outcomeLabel: string;
+  p_market: number;
+  volume: number;
+  endDateIso?: string;
+  daysToClose?: number | null;
+  category?: string;
+}
+
+async function safeArr<T>(fn: () => Promise<T[]>): Promise<T[]> {
+  try {
+    return await fn();
+  } catch (e) {
+    console.warn('[scanner] data source error:', (e as Error).message);
+    return [];
+  }
+}
+
 scannerRouter.get('/snapshot', async (req, res) => {
   try {
     const min = req.query.min ? Number(req.query.min) : 0.02;
     const max = req.query.max ? Number(req.query.max) : 0.15;
-    const fresh = snapshotCache && Date.now() - snapshotCache.at < SNAPSHOT_TTL_MS;
-    if (!fresh) {
-      const rows = await fetchSnapshot(min, max);
-      snapshotCache = { at: Date.now(), rows };
+    const poly = await safeArr(() => getAllPoly(2));
+    const rows: SnapshotRow[] = [];
+    for (const m of poly) {
+      for (const o of flattenPoly(m)) {
+        if (o.pMarket >= min && o.pMarket <= max) {
+          rows.push({
+            question: o.question,
+            source: 'polymarket',
+            marketId: o.conditionId,
+            outcomeLabel: o.outcomeLabel,
+            p_market: o.pMarket,
+            volume: o.volumeUsd,
+            endDateIso: o.endDateIso,
+            daysToClose: daysToClose(o.endDateIso),
+            category: o.category,
+          });
+        }
+      }
     }
-    res.json({
-      at: snapshotCache!.at,
-      count: snapshotCache!.rows.length,
-      rows: snapshotCache!.rows.slice(0, 200),
-    });
+    rows.sort((a, b) => a.p_market - b.p_market);
+    res.json({ at: Date.now(), count: rows.length, rows: rows.slice(0, 200) });
   } catch (e) {
     res.status(500).json({ error: (e as Error).message, rows: [] });
   }

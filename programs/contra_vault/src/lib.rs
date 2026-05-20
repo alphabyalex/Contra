@@ -20,7 +20,7 @@
 use anchor_lang::prelude::*;
 use anchor_spl::token::{self, Burn, Mint, MintTo, Token, TokenAccount, Transfer};
 
-declare_id!("Contra1111111111111111111111111111111111111");
+declare_id!("5t7Juh2ZpxNGeaMCjvLjA6YnXnFahWcYWKouMzeahNgt");
 
 pub const VAULT_SEED: &[u8] = b"vault";
 pub const MINT_SEED: &[u8] = b"contra_mint";

@@ -77,18 +77,26 @@ export async function updateMomentum(): Promise<MomentumSummary> {
       const momentum = p7 - pNow;
       const momentum_factor = computeMomentumFactor(momentum);
 
-      const baseEdge = Number(s.edge ?? 0);
       const tf = Number(s.time_factor ?? 1);
       const cf = Number(s.category_factor ?? 1);
       const vf = Number(s.volume_factor ?? 1);
-      const adjusted_edge = baseEdge * tf * cf * vf * momentum_factor;
+      const baseEdge = Number(s.edge ?? 0);
+
+      // calibration_v4 invariant: adjusted_edge = p_market − p_model_shown.
+      // Apply momentum by folding it into p_model so the invariant holds:
+      //   edge_post  = (p_market − p_model_pre) × momentum_factor
+      //   p_model_post = p_market − edge_post
+      const pModelPre = Number(s.p_model ?? 0);
+      const edgePre = pNow - pModelPre;
+      const adjusted_edge = Math.max(edgePre * momentum_factor, 0);
+      const p_model_post = pNow - adjusted_edge;
 
       await upsertScoredMarket({
         condition_id: s.condition_id,
         source: s.source,
         question: s.question,
         p_market: pNow,
-        p_model: s.p_model,
+        p_model: p_model_post,
         edge: baseEdge,
         volume: s.volume,
         days_to_close: s.days_to_close,

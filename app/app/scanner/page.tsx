@@ -7,8 +7,10 @@
  *   - Search box queries the FULL pool server-side via ?search=
  *   - All probabilities rendered as percentages
  *   - Edge column = adjusted_edge (post time/category/volume layers)
- *   - Impossible markets get a red IMPOSSIBLE label and green p_model=0%
- *   - No more Eligible/Excluded chips — the data speaks for itself
+ *   - No internal classification labels (Eligible / Excluded / Impossible)
+ *     — the data speaks for itself. Excluded/unscreened rows show "—" for
+ *     p_model and adj. edge. Impossible rows show their numeric scores
+ *     (p_model 0%, edge = p_market) without any label.
  */
 
 import { useCallback, useEffect, useMemo, useRef, useState } from 'react';
@@ -201,9 +203,6 @@ export default function ScannerPage() {
                     <Th align="right">P_model</Th>
                     <Th align="right" sortable active={sortField === 'edge'} onClick={() => setSortField('edge')}>
                       Adj. Edge
-                      <div style={{ fontSize: 9, color: '#9B9B9B', fontWeight: 400, marginTop: 2, textTransform: 'none', letterSpacing: 0 }}>
-                        edge × time × category × volume
-                      </div>
                     </Th>
                     <Th align="right" sortable active={sortField === 'days'} onClick={() => setSortField('days')}>Days</Th>
                     <Th align="right" sortable active={sortField === 'volume'} onClick={() => setSortField('volume')}>Volume</Th>
@@ -275,13 +274,8 @@ function ScannerRow({ row }: { row: Row }) {
       style={{ borderBottom: '1px solid #E5E5E3', background: hover ? '#F7F7F5' : '#FFFFFF', transition: 'background 150ms ease-out' }}
     >
       <td style={{ padding: '16px 18px', verticalAlign: 'top' }}>
-        <div style={{ fontSize: 15, color: '#0A0A0A', display: 'flex', alignItems: 'center', gap: 8, flexWrap: 'wrap' }} title={row.question}>
+        <div style={{ fontSize: 15, color: '#0A0A0A' }} title={row.question}>
           {truncated}
-          {isImpossible && (
-            <span title={row.exclusion_reason ?? 'Flagged as factually impossible'} style={impossibleLabel}>
-              IMPOSSIBLE
-            </span>
-          )}
         </div>
         <div style={{ marginTop: 8, height: 4, width: 600, maxWidth: '100%', background: '#F0F0EE', borderRadius: 2 }}>
           <div
@@ -467,15 +461,3 @@ function CategoryPill({ category }: { category?: string | null }) {
   );
 }
 
-const impossibleLabel: React.CSSProperties = {
-  fontSize: 9,
-  padding: '2px 6px',
-  borderRadius: 3,
-  background: '#FCE9EC',
-  color: '#CC2936',
-  fontFamily: '"DM Sans", sans-serif',
-  fontWeight: 600,
-  letterSpacing: '0.08em',
-  textTransform: 'uppercase',
-  cursor: 'help',
-};

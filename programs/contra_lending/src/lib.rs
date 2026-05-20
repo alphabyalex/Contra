@@ -15,7 +15,7 @@
 use anchor_lang::prelude::*;
 use anchor_spl::token::{self, Burn, Mint, MintTo, Token, TokenAccount, Transfer};
 
-declare_id!("Contra2222222222222222222222222222222222222");
+declare_id!("BqGJk8CXCcdVhCVg41VapQVFdQgM3rXdW5MenhMmiQLR");
 
 pub const POOL_SEED: &[u8] = b"lending_pool";
 pub const LP_MINT_SEED: &[u8] = b"lending_lp_mint";

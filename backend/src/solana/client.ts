@@ -83,7 +83,7 @@ let vaultProgram: Program | null = null;
 export function getVaultProgram(): Program {
   if (vaultProgram) return vaultProgram;
   const idl = loadIdl('contra_vault');
-  vaultProgram = new Program(idl, contraVaultProgramId(), getProvider());
+  vaultProgram = new Program(idl, getProvider());
   return vaultProgram;
 }
 
@@ -91,7 +91,7 @@ let lendingProgram: Program | null = null;
 export function getLendingProgram(): Program {
   if (lendingProgram) return lendingProgram;
   const idl = loadIdl('contra_lending');
-  lendingProgram = new Program(idl, contraLendingProgramId(), getProvider());
+  lendingProgram = new Program(idl, getProvider());
   return lendingProgram;
 }
 
@@ -99,7 +99,7 @@ let leverageProgram: Program | null = null;
 export function getLeverageProgram(): Program {
   if (leverageProgram) return leverageProgram;
   const idl = loadIdl('contra_leverage');
-  leverageProgram = new Program(idl, contraLeverageProgramId(), getProvider());
+  leverageProgram = new Program(idl, getProvider());
   return leverageProgram;
 }
 

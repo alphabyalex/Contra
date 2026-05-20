@@ -28,7 +28,7 @@ use contra_lending::program::ContraLending;
 use contra_vault::cpi::accounts::{Deposit as VaultDeposit, ExitActive, Redeem};
 use contra_vault::program::ContraVault;
 
-declare_id!("Contra3333333333333333333333333333333333333");
+declare_id!("5Y4oQ2QcQoBKdcRzPmdHNBGMg4As535GysADjjbdQS9V");
 
 pub const BORROWER_AUTH_SEED: &[u8] = b"borrower_authority";
 pub const POSITION_SEED: &[u8] = b"position";
@@ -196,7 +196,7 @@ pub mod contra_leverage {
         Ok(())
     }
 
-    pub fn close_position(ctx: Context<ClosePosition>) -> Result<()> {
+    pub fn close_position(ctx: Context<ClosePosition>, vault_finalized: bool) -> Result<()> {
         let pos = &mut ctx.accounts.position;
         require!(pos.status == PositionStatus::Open as u8, LeverageError::WrongStatus);
         unwind_position(
@@ -207,14 +207,14 @@ pub mod contra_leverage {
             &ctx.accounts.contra_mint,
             &ctx.accounts.vault_usdc_account,
             &ctx.accounts.position,
-            &ctx.accounts.position_usdc_account,
+            &mut ctx.accounts.position_usdc_account,
             &ctx.accounts.position_ctrs_account,
             &ctx.accounts.lending_pool,
             &ctx.accounts.lending_pool_usdc,
             &ctx.accounts.borrower_authority,
             &ctx.accounts.user_usdc_account,
             None, // no liquidator bonus
-            ctx.accounts.vault_finalized,
+            vault_finalized,
         )?;
         let pos = &mut ctx.accounts.position;
         pos.status = PositionStatus::Closed as u8;
@@ -224,7 +224,7 @@ pub mod contra_leverage {
 
     /// Anyone may liquidate when health_factor < 1.15. Liquidator gets a 5%
     /// bonus skimmed off the recovered USDC; user gets the rest after debt repay.
-    pub fn liquidate(ctx: Context<Liquidate>, current_nav_scaled: u64) -> Result<()> {
+    pub fn liquidate(ctx: Context<Liquidate>, current_nav_scaled: u64, vault_finalized: bool) -> Result<()> {
         let pos = &mut ctx.accounts.position;
         require!(pos.status == PositionStatus::Open as u8, LeverageError::WrongStatus);
         let hf = compute_health(pos.ctrs_held, current_nav_scaled, pos.debt_usdc)?;
@@ -239,14 +239,14 @@ pub mod contra_leverage {
             &ctx.accounts.contra_mint,
             &ctx.accounts.vault_usdc_account,
             &ctx.accounts.position,
-            &ctx.accounts.position_usdc_account,
+            &mut ctx.accounts.position_usdc_account,
             &ctx.accounts.position_ctrs_account,
             &ctx.accounts.lending_pool,
             &ctx.accounts.lending_pool_usdc,
             &ctx.accounts.borrower_authority,
             &ctx.accounts.user_usdc_account,
             Some(&ctx.accounts.liquidator_usdc_account),
-            ctx.accounts.vault_finalized,
+            vault_finalized,
         )?;
 
         let pos = &mut ctx.accounts.position;
@@ -267,7 +267,7 @@ fn unwind_position<'info>(
     contra_mint: &Account<'info, Mint>,
     vault_usdc_account: &Account<'info, TokenAccount>,
     position: &Account<'info, Position>,
-    position_usdc: &Account<'info, TokenAccount>,
+    position_usdc: &mut Account<'info, TokenAccount>,
     position_ctrs: &Account<'info, TokenAccount>,
     lending_pool: &Account<'info, contra_lending::Pool>,
     lending_pool_usdc: &Account<'info, TokenAccount>,
@@ -593,10 +593,6 @@ pub struct ClosePosition<'info> {
     )]
     pub user_usdc_account: Account<'info, TokenAccount>,
 
-    /// True if the basket vault has been finalized — caller must pass
-    /// the right value or vault::redeem/exit_active will reject the CPI.
-    pub vault_finalized: bool,
-
     pub contra_vault_program: Program<'info, ContraVault>,
     pub contra_lending_program: Program<'info, ContraLending>,
     pub token_program: Program<'info, Token>,
@@ -649,8 +645,6 @@ pub struct Liquidate<'info> {
         constraint = liquidator_usdc_account.owner == liquidator.key() @ LeverageError::Unauthorized,
     )]
     pub liquidator_usdc_account: Account<'info, TokenAccount>,
-
-    pub vault_finalized: bool,
 
     pub contra_vault_program: Program<'info, ContraVault>,
     pub contra_lending_program: Program<'info, ContraLending>,

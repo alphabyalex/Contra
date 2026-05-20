@@ -2,20 +2,23 @@
  * Kalshi REST client (v2 trade-api).
  *
  * Auth: Kalshi v2 signs every request with RSA-PSS (SHA-256). The signed
- * payload is `${timestamp_ms}${METHOD}${url_path}` and goes into the
- * KALSHI-ACCESS-SIGNATURE header alongside KALSHI-ACCESS-KEY (the key
- * id from KALSHI_KEY_ID env) and KALSHI-ACCESS-TIMESTAMP. The private
- * key is read once from KALSHI_PRIVATE_KEY_PATH (resolved against the
- * repo root, falling back to CWD).
+ * payload is `${timestamp_ms}${METHOD}${path}` where `path` is the
+ * request path WITHOUT query parameters (e.g. `/trade-api/v2/markets`,
+ * not `/trade-api/v2/markets?limit=100`). The signature goes in the
+ * KALSHI-ACCESS-SIGNATURE header alongside KALSHI-ACCESS-KEY (the key id
+ * from KALSHI_KEY_ID) and KALSHI-ACCESS-TIMESTAMP. There is NO
+ * Authorization: Bearer header and NO JWT — that was the old (wrong)
+ * scheme.
+ *
+ * Price format: Kalshi completed a migration in March 2026 — prices are
+ * now decimal strings like "0.0650" rather than integer cents. All price
+ * fields are parsed with parseFloat and treated as probabilities in
+ * [0,1]; a value > 1 is defensively divided by 100 (legacy cents).
  *
  * Graceful degradation:
- *   - missing KALSHI_API_KEY / KALSHI_KEY_ID → skip auth, return [].
- *   - missing PEM file → skip, log once, return [].
+ *   - missing KALSHI_KEY_ID / private key → skip auth, return [].
  *   - PEM body without BEGIN/END headers → auto-wrap before parsing.
  *   - any HTTP failure → log warn, return [].
- *
- * The user-facing spec said RS256 but Kalshi v2 actually requires
- * RSASSA-PSS — implementing what works. The header set is identical.
  */
 
 import * as crypto from 'crypto';
@@ -28,13 +31,26 @@ export interface RawKalshiMarket {
   series_ticker?: string;
   title: string;
   subtitle?: string;
-  yes_bid?: number;
-  yes_ask?: number;
-  no_bid?: number;
-  no_ask?: number;
-  last_price?: number;
-  volume?: number;
-  open_interest?: number;
+  // Post-March-2026 migration: prices are decimal-dollar STRINGS in
+  // `*_dollars` fields (e.g. "0.0650" = 6.5%), volumes in `*_fp` fields.
+  yes_bid_dollars?: number | string;
+  yes_ask_dollars?: number | string;
+  no_bid_dollars?: number | string;
+  no_ask_dollars?: number | string;
+  last_price_dollars?: number | string;
+  previous_price_dollars?: number | string;
+  volume_fp?: number | string;
+  volume_24h_fp?: number | string;
+  open_interest_fp?: number | string;
+  // Legacy (pre-migration) field names — kept as fallback.
+  yes_bid?: number | string;
+  yes_ask?: number | string;
+  no_bid?: number | string;
+  no_ask?: number | string;
+  last_price?: number | string;
+  price?: number | string;
+  volume?: number | string;
+  open_interest?: number | string;
   close_time?: string;
   category?: string;
   status?: string;
@@ -51,9 +67,8 @@ export interface KalshiOutcome {
 }
 
 const BASE = (): string =>
-  process.env.KALSHI_BASE_URL?.trim() || 'https://trading-api.kalshi.com/trade-api/v2';
+  process.env.KALSHI_BASE_URL?.trim() || 'https://api.elections.kalshi.com/trade-api/v2';
 
-let warnedNoCreds = false;
 let warnedNoKey = false;
 let cachedKey: crypto.KeyObject | null = null;
 let keyAttempted = false;
@@ -116,7 +131,7 @@ function loadPrivateKey(): crypto.KeyObject | null {
  * debug line in the scanner UI. 429s are NOT treated as errors and do
  * not populate this field; they go through `_lastKalshiThrottled`. */
 let _lastKalshiError: string | null = null;
-let _lastKalshiThrottled: boolean = false;
+let _lastKalshiThrottled = false;
 export function getLastKalshiError(): string | null {
   return _lastKalshiError;
 }
@@ -126,61 +141,70 @@ export function getLastKalshiThrottled(): boolean {
 
 const sleep = (ms: number) => new Promise<void>((r) => setTimeout(r, ms));
 
-function b64url(buf: Buffer): string {
-  return buf.toString('base64').replace(/\+/g, '-').replace(/\//g, '_').replace(/=+$/g, '');
-}
-
-function buildJwt(sub: string, key: crypto.KeyObject): string {
-  const header = { alg: 'RS256', typ: 'JWT' };
-  const payload = { sub, nonce: Date.now().toString() };
-  const headerB64 = b64url(Buffer.from(JSON.stringify(header)));
-  const payloadB64 = b64url(Buffer.from(JSON.stringify(payload)));
-  const signingInput = `${headerB64}.${payloadB64}`;
-  const sig = crypto.sign('sha256', Buffer.from(signingInput), {
-    key,
-    padding: crypto.constants.RSA_PKCS1_PADDING, // RS256 uses PKCS1 v1.5
-  });
-  return `${signingInput}.${b64url(sig)}`;
-}
-
-function signedHeaders(): Record<string, string> | null {
-  const keyId = process.env.KALSHI_KEY_ID?.trim() || process.env.KALSHI_API_KEY?.trim();
+/**
+ * Build the RSA-PSS signed headers for a request. `signedPath` must be
+ * the URL pathname WITHOUT the query string (Kalshi signs the path only).
+ */
+function signedHeaders(method: string, signedPath: string): Record<string, string> | null {
+  const keyId = process.env.KALSHI_KEY_ID?.trim();
   const key = loadPrivateKey();
   if (!keyId || !key) {
-    if (!warnedNoCreds) {
-      console.warn('[kalshi] KALSHI_KEY_ID or private key missing — calls will skip silently.');
-      warnedNoCreds = true;
-    }
+    _lastKalshiError = 'KALSHI_KEY_ID or private key missing';
     return null;
   }
-  let token: string;
+
+  const timestamp = Date.now().toString(); // milliseconds, as a string
+  const messageToSign = timestamp + method.toUpperCase() + signedPath;
+
+  let signature: string;
   try {
-    token = buildJwt(keyId, key);
+    signature = crypto
+      .sign('RSA-SHA256', Buffer.from(messageToSign), {
+        key,
+        padding: crypto.constants.RSA_PKCS1_PSS_PADDING,
+        saltLength: crypto.constants.RSA_PSS_SALTLEN_DIGEST,
+      })
+      .toString('base64');
   } catch (e) {
-    _lastKalshiError = `JWT sign failed: ${(e as Error).message}`;
+    _lastKalshiError = `RSA-PSS sign failed: ${(e as Error).message}`;
     console.warn(`[kalshi] ${_lastKalshiError}`);
     return null;
   }
+
   return {
-    Authorization: `Bearer ${token}`,
-    Accept: 'application/json',
+    'KALSHI-ACCESS-KEY': keyId,
+    'KALSHI-ACCESS-TIMESTAMP': timestamp,
+    'KALSHI-ACCESS-SIGNATURE': signature,
+    'Content-Type': 'application/json',
   };
 }
 
-interface KalshiHttpResult<T> { data: T | null; status: number }
+interface KalshiHttpResult<T> {
+  data: T | null;
+  status: number;
+}
+
+let loggedRawShape = false;
 
 async function getJson<T>(pathSeg: string, search?: URLSearchParams): Promise<KalshiHttpResult<T>> {
-  const headers = signedHeaders();
-  if (!headers) return { data: null, status: 0 };
   const base = BASE().replace(/\/+$/g, '');
   const url = `${base}${pathSeg}${search ? `?${search}` : ''}`;
+  // Kalshi signs the path WITHOUT query params. Derive it from the full
+  // URL so the /trade-api/v2 prefix from KALSHI_BASE_URL is included.
+  const signedPath = new URL(url).pathname;
+  const headers = signedHeaders('GET', signedPath);
+  if (!headers) return { data: null, status: 0 };
+
   try {
     const res = await fetch(url, { headers });
     if (!res.ok) {
       let body = '';
-      try { body = (await res.text()).slice(0, 240); } catch { /* ignore */ }
+      try {
+        body = (await res.text()).slice(0, 240);
+      } catch {
+        /* ignore */
+      }
       if (res.status === 429) {
-        // Rate-limited — not an auth error. Don't pollute the red error line.
         _lastKalshiThrottled = true;
         console.info(`[kalshi] 429 throttled — backing off — ${url}`);
       } else {
@@ -191,7 +215,22 @@ async function getJson<T>(pathSeg: string, search?: URLSearchParams): Promise<Ka
     }
     _lastKalshiError = null;
     _lastKalshiThrottled = false;
-    return { data: (await res.json()) as T, status: res.status };
+    const json = (await res.json()) as T;
+
+    // One-time: dump the raw shape of the first market so we can see
+    // exactly which price fields Kalshi returns post-migration.
+    if (!loggedRawShape) {
+      const markets = (json as unknown as { markets?: unknown[] })?.markets;
+      if (Array.isArray(markets) && markets.length > 0) {
+        loggedRawShape = true;
+        console.info(
+          '[kalshi] RAW first market structure:\n' + JSON.stringify(markets[0], null, 2),
+        );
+        console.info('[kalshi] first market keys: ' + Object.keys(markets[0] as object).join(', '));
+      }
+    }
+
+    return { data: json, status: res.status };
   } catch (e) {
     _lastKalshiError = `fetch error: ${(e as Error).message}`;
     console.warn(`[kalshi] ${_lastKalshiError}`);
@@ -204,11 +243,50 @@ interface MarketsResponse {
   cursor?: string;
 }
 
-export async function getMarkets(params: {
-  limit?: number;
-  status?: 'open' | 'closed' | 'settled';
-  cursor?: string;
-} = {}): Promise<RawKalshiMarket[]> {
+/**
+ * Parse a Kalshi price field. Post-March-2026 these are decimal strings
+ * like "0.0650"; older responses used integer cents. parseFloat handles
+ * the string case; a value > 1 is treated as legacy cents and divided
+ * by 100. Returns null when the field is absent / unparseable.
+ */
+function parsePrice(v: number | string | undefined | null): number | null {
+  if (v == null || v === '') return null;
+  const n = parseFloat(String(v));
+  if (!Number.isFinite(n)) return null;
+  if (n > 1) return n / 100; // defensive: legacy integer cents
+  return n;
+}
+
+/** Best available YES probability for a market, or null if unpriced. */
+function yesProb(m: RawKalshiMarket): number | null {
+  // Post-migration `*_dollars` strings first, then legacy names.
+  const bid = parsePrice(m.yes_bid_dollars) ?? parsePrice(m.yes_bid);
+  const ask = parsePrice(m.yes_ask_dollars) ?? parsePrice(m.yes_ask);
+  if (bid != null && ask != null) return (bid + ask) / 2;
+  const single =
+    bid ??
+    ask ??
+    parsePrice(m.last_price_dollars) ??
+    parsePrice(m.previous_price_dollars) ??
+    parsePrice(m.last_price) ??
+    parsePrice(m.price);
+  return single ?? null;
+}
+
+function volumeUsd(m: RawKalshiMarket): number {
+  const n = parseFloat(
+    String(m.volume_fp ?? m.volume_24h_fp ?? m.volume ?? 0),
+  );
+  return Number.isFinite(n) ? n : 0;
+}
+
+export async function getMarkets(
+  params: {
+    limit?: number;
+    status?: 'open' | 'closed' | 'settled';
+    cursor?: string;
+  } = {},
+): Promise<RawKalshiMarket[]> {
   const search = new URLSearchParams();
   search.set('limit', String(params.limit ?? 200));
   if (params.status) search.set('status', params.status);
@@ -218,14 +296,9 @@ export async function getMarkets(params: {
 }
 
 /**
- * Paginate Kalshi /markets up to `maxPages` (default 10 → ~2000 markets).
- * Most Kalshi markets are unpriced sports props on early pages, so we
- * keep walking until we've found at least 50 priced markets in a wider
- * longshot range (0.01..0.20). The wider band is intentional — Kalshi's
- * pricing model can sit slightly outside the Polymarket window we use
- * for the final display filter.
- *
- * Logs total / priced / in-range so the operator can see progress.
+ * Paginate Kalshi /markets up to `maxPages`. Most Kalshi markets are
+ * unpriced sports props on early pages, so we keep walking until we've
+ * found at least 50 priced markets in the wider 0.01..0.20 longshot band.
  */
 export async function getAllOpenMarkets(maxPages = 10): Promise<RawKalshiMarket[]> {
   const all: RawKalshiMarket[] = [];
@@ -234,13 +307,13 @@ export async function getAllOpenMarkets(maxPages = 10): Promise<RawKalshiMarket[
   let inRange = 0;
   let throttled = false;
   for (let i = 0; i < maxPages; i++) {
-    if (i > 0) await sleep(300); // 300ms between pages to dodge Kalshi rate limits
+    if (i > 0) await sleep(300); // dodge Kalshi rate limits
     const search = new URLSearchParams({ limit: '200', status: 'open' });
     if (cursor) search.set('cursor', cursor);
     const r = await getJson<MarketsResponse>('/markets', search);
     if (r.status === 429) {
       throttled = true;
-      break; // stop immediately on rate limit; return whatever we found
+      break;
     }
     if (!r.data || !r.data.markets || r.data.markets.length === 0) break;
     all.push(...r.data.markets);
@@ -248,12 +321,11 @@ export async function getAllOpenMarkets(maxPages = 10): Promise<RawKalshiMarket[
     priced = 0;
     inRange = 0;
     for (const m of all) {
-      const cents = midPriceCents(m);
-      if (cents == null) continue;
+      const yesP = yesProb(m);
+      if (yesP == null) continue;
       priced++;
-      const yesP = cents / 100;
       const noP = 1 - yesP;
-      if ((yesP >= 0.01 && yesP <= 0.20) || (noP >= 0.01 && noP <= 0.20)) inRange++;
+      if ((yesP >= 0.01 && yesP <= 0.2) || (noP >= 0.01 && noP <= 0.2)) inRange++;
     }
     if (inRange >= 50) break;
     if (!r.data.cursor) break;
@@ -265,25 +337,17 @@ export async function getAllOpenMarkets(maxPages = 10): Promise<RawKalshiMarket[
   return all;
 }
 
-function midPriceCents(m: RawKalshiMarket): number | null {
-  if (typeof m.last_price === 'number') return m.last_price;
-  if (typeof m.yes_bid === 'number' && typeof m.yes_ask === 'number') {
-    return (m.yes_bid + m.yes_ask) / 2;
-  }
-  return null;
-}
-
 export function flattenOutcomes(m: RawKalshiMarket): KalshiOutcome[] {
-  const cents = midPriceCents(m);
-  if (cents == null) return [];
-  const yesPrice = cents / 100;
+  const yesPrice = yesProb(m);
+  if (yesPrice == null) return [];
+  const vol = volumeUsd(m);
   return [
     {
       ticker: m.ticker,
       question: m.title,
       outcomeLabel: 'YES',
       pMarket: yesPrice,
-      volumeUsd: Number(m.volume ?? 0) || 0,
+      volumeUsd: vol,
       endDateIso: m.close_time,
       category: m.category,
     },
@@ -292,7 +356,7 @@ export function flattenOutcomes(m: RawKalshiMarket): KalshiOutcome[] {
       question: m.title,
       outcomeLabel: 'NO',
       pMarket: 1 - yesPrice,
-      volumeUsd: Number(m.volume ?? 0) || 0,
+      volumeUsd: vol,
       endDateIso: m.close_time,
       category: m.category,
     },
@@ -314,3 +378,35 @@ export async function getOrderbook(ticker: string): Promise<unknown | null> {
   const r = await getJson(`/markets/${encodeURIComponent(ticker)}/orderbook`);
   return r.data;
 }
+
+/**
+ * One-shot auth smoke test. Hits GET /trade-api/v2/markets?limit=5&status=open
+ * and logs the full response so we can confirm the RSA-PSS auth works and
+ * see what the post-migration price fields look like. Fired once on module
+ * load; never throws.
+ */
+export async function testKalshiAuth(): Promise<void> {
+  try {
+    const search = new URLSearchParams({ limit: '5', status: 'open' });
+    const r = await getJson<MarketsResponse>('/markets', search);
+    if (r.data) {
+      console.info(
+        `[kalshi] AUTH TEST OK (HTTP ${r.status}) — ${r.data.markets?.length ?? 0} markets returned`,
+      );
+      console.info(
+        '[kalshi] AUTH TEST full response:\n' + JSON.stringify(r.data, null, 2).slice(0, 4000),
+      );
+    } else {
+      console.warn(
+        `[kalshi] AUTH TEST FAILED (HTTP ${r.status}) — ${_lastKalshiError ?? 'no data'}`,
+      );
+    }
+  } catch (e) {
+    console.warn(`[kalshi] AUTH TEST threw: ${(e as Error).message}`);
+  }
+}
+
+// Fire the smoke test shortly after startup (non-blocking).
+setTimeout(() => {
+  void testKalshiAuth();
+}, 2000);

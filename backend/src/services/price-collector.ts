@@ -1,28 +1,32 @@
 /**
- * Polymarket CLOB price collector.
+ * Polymarket price collector — batch Gamma API.
  *
- * One scheduled call (every 15 minutes) iterates every open tracked
- * market and decides per-market whether enough time has passed since the
- * last sample to take a new one. The cadence depends on time-to-resolve:
+ * One scheduled call (every 15 minutes) makes a SINGLE batch request to
+ * the Gamma API:
  *
+ *   GET https://gamma-api.polymarket.com/markets?active=true&limit=500
+ *
+ * which returns `outcomePrices` (a JSON-stringified array, e.g.
+ * '["0.082","0.918"]') for every active market in one shot. The YES
+ * price is parseFloat(JSON.parse(outcomePrices)[0]).
+ *
+ * For each tracked market we find the matching Gamma row by conditionId,
+ * decide per-market whether enough time has passed since the last sample
+ * (cadence by time-to-resolve), and if so write a new sample to:
+ *   1. market_price_history (Postgres, queried by NAV / charts)
+ *   2. market_data/active/<conditionId>.csv (filesystem, archived to
+ *      market_data/resolved/ when the market settles)
+ *
+ * Cadence by days-to-resolve:
  *   < 30 days  →  every 15 minutes
  *   30–90      →  every 60 minutes
  *   90–180     →  every 4 hours
  *   > 180      →  every 12 hours
- *
- * Samples land in two places:
- *   1. market_price_history table (Postgres, queried by NAV / charts)
- *   2. market_data/active/<conditionId>.csv (filesystem, archived to
- *      market_data/resolved/ when the market settles, and used by the
- *      training pipeline)
- *
- * The CLOB endpoint we use is /prices-history?market=<token_id>. We take
- * the last point in the response as "current". If a tracked market has
- * no token_id yet, we skip it (a future weeklyScreener pass will fix).
  */
 
 import * as fs from 'fs';
 import * as path from 'path';
+import { getAllActiveMarkets, type RawPolymarketMarket } from './polymarket';
 import {
   deletePriceHistory,
   getLatestPricePoint,
@@ -34,14 +38,12 @@ import {
   type TrackedMarket,
 } from '../db/queries';
 
-const CLOB_BASE = 'https://clob.polymarket.com';
-
 // Cadence by tier (milliseconds between samples for the same market).
 const TIER_INTERVAL_MS = {
-  high:    15 * 60 * 1000,        //  15 min
-  medium:  60 * 60 * 1000,        //  60 min
-  low:     4 * 60 * 60 * 1000,    //   4 h
-  minimal: 12 * 60 * 60 * 1000,   //  12 h
+  high: 15 * 60 * 1000, //  15 min  (< 30 days)
+  medium: 60 * 60 * 1000, //  60 min  (30–90)
+  low: 4 * 60 * 60 * 1000, //   4 h    (90–180)
+  minimal: 12 * 60 * 60 * 1000, //  12 h    (> 180)
 } as const;
 
 export type FrequencyTier = keyof typeof TIER_INTERVAL_MS;
@@ -84,118 +86,138 @@ function daysToCloseFromIso(iso: string | null): number | null {
   return Math.max(0, Math.round((t - Date.now()) / 86_400_000));
 }
 
-interface ClobHistoryResponse {
-  history?: { t: number; p: number }[];
-}
-
 /**
- * Fetch the most recent CLOB price for a token. Returns null on any
- * error or empty history — caller is expected to skip silently.
+ * Parse the YES price out of a Gamma market row. `outcomePrices` is
+ * usually a JSON-stringified array ('["0.082","0.918"]') but can also
+ * already be an array. Returns null when unparseable.
  */
-async function fetchCurrentPrice(tokenId: string): Promise<number | null> {
-  // CLOB requires `interval` (or startTs/endTs); we use 1d so we always
-  // get a reasonable window and take the most recent point as "current".
-  const params = new URLSearchParams({
-    market: tokenId,
-    interval: '1d',
-    fidelity: '60',
-  });
-  try {
-    const res = await fetch(`${CLOB_BASE}/prices-history?${params.toString()}`);
-    if (!res.ok) {
-      console.warn(`[price-collector] CLOB ${res.status} for token ${tokenId.slice(0, 12)}…`);
+function yesPriceFromGamma(m: RawPolymarketMarket): number | null {
+  const raw = m.outcomePrices;
+  if (!raw) return null;
+  let arr: unknown;
+  if (Array.isArray(raw)) {
+    arr = raw;
+  } else {
+    try {
+      arr = JSON.parse(raw);
+    } catch {
       return null;
     }
-    const json = (await res.json()) as ClobHistoryResponse;
-    const hist = json.history;
-    if (!Array.isArray(hist) || hist.length === 0) return null;
-    const last = hist[hist.length - 1];
-    return typeof last.p === 'number' ? last.p : null;
-  } catch (e) {
-    console.warn(`[price-collector] fetch failed for ${tokenId.slice(0, 12)}…: ${(e as Error).message}`);
-    return null;
   }
-}
-
-export interface CollectResult {
-  collected: boolean;
-  reason?: 'no_token' | 'too_soon' | 'no_price' | 'error';
-}
-
-export async function collectPriceForMarket(market: TrackedMarket): Promise<CollectResult> {
-  if (!market.token_id) return { collected: false, reason: 'no_token' };
-
-  const days = daysToCloseFromIso(market.resolution_date);
-  const tier = tierForDays(days);
-  const interval = TIER_INTERVAL_MS[tier];
-
-  try {
-    const last = await getLatestPricePoint(market.condition_id);
-    if (last) {
-      const sinceMs = Date.now() - Date.parse(last.recorded_at);
-      if (sinceMs < interval) return { collected: false, reason: 'too_soon' };
-    }
-
-    const price = await fetchCurrentPrice(market.token_id);
-    if (price == null) return { collected: false, reason: 'no_price' };
-
-    const point = await recordPricePoint({
-      condition_id: market.condition_id,
-      price,
-      days_to_close: days,
-    });
-
-    appendCsvRow(
-      csvPath(market.condition_id, ACTIVE_DIR),
-      `${point.recorded_at},${price.toFixed(8)},${days ?? ''}`,
-    );
-
-    return { collected: true };
-  } catch (e) {
-    console.warn(`[price-collector] ${market.condition_id} failed: ${(e as Error).message}`);
-    return { collected: false, reason: 'error' };
-  }
+  if (!Array.isArray(arr) || arr.length === 0) return null;
+  const yes = parseFloat(String(arr[0]));
+  return Number.isFinite(yes) ? yes : null;
 }
 
 export interface CollectAllSummary {
-  total: number;
-  collected: number;
-  skipped_too_soon: number;
-  skipped_no_token: number;
+  total: number; // tracked markets considered
+  fetched: number; // markets returned by the Gamma batch call
+  collected: number; // new price rows written
+  skipped_too_soon: number; // matched but cadence interval not elapsed
+  skipped_no_match: number; // tracked market not in the Gamma batch
   errors: number;
 }
 
+/**
+ * Paginated Gamma fetch → per-tracked-market cadence check → write.
+ */
 export async function collectAllPrices(): Promise<CollectAllSummary> {
+  // All tracked markets that have not yet resolved. The DB filter is
+  // `resolved_at IS NULL`; `listTrackedMarkets({ onlyOpen: true })` does
+  // the equivalent via `outcome IS NULL`. Either way: no row cap, fetch
+  // every unresolved market.
   const tracked = await listTrackedMarkets({ onlyOpen: true }).catch((e) => {
     console.warn('[price-collector] listTrackedMarkets failed:', (e as Error).message);
     return [] as TrackedMarket[];
   });
+  console.info(`[price-collector] loaded ${tracked.length} tracked markets from DB`);
+
+  let gamma: RawPolymarketMarket[] = [];
+  try {
+    gamma = await getAllActiveMarkets(20);
+  } catch (e) {
+    console.warn('[price-collector] Gamma paginated fetch failed:', (e as Error).message);
+  }
+  const pagesFetched = (gamma as any).__pagesFetched ?? 0;
+  console.info(
+    `[price-collector] Gamma API: fetched ${gamma.length} total active markets across ${pagesFetched} pages`,
+  );
+
+  // conditionId → YES price, from the merged paginated response.
+  const priceById = new Map<string, number>();
+  for (const m of gamma) {
+    if (!m.conditionId) continue;
+    const yes = yesPriceFromGamma(m);
+    if (yes != null) priceById.set(m.conditionId, yes);
+  }
 
   let collected = 0;
   let tooSoon = 0;
-  let noToken = 0;
+  let noMatch = 0;
   let errors = 0;
 
   for (const m of tracked) {
-    const r = await collectPriceForMarket(m);
-    if (r.collected) collected += 1;
-    else if (r.reason === 'too_soon') tooSoon += 1;
-    else if (r.reason === 'no_token') noToken += 1;
-    else errors += 1;
+    const price = priceById.get(m.condition_id);
+    if (price == null) {
+      noMatch += 1;
+      continue;
+    }
+
+    const days = daysToCloseFromIso(m.resolution_date);
+    const interval = TIER_INTERVAL_MS[tierForDays(days)];
+
+    try {
+      const last = await getLatestPricePoint(m.condition_id);
+      if (last) {
+        const sinceMs = Date.now() - Date.parse(last.recorded_at);
+        if (sinceMs < interval) {
+          tooSoon += 1;
+          continue;
+        }
+      }
+
+      const point = await recordPricePoint({
+        condition_id: m.condition_id,
+        source: m.source ?? 'polymarket',
+        price,
+        days_to_close: days,
+      });
+
+      appendCsvRow(
+        csvPath(m.condition_id, ACTIVE_DIR),
+        `${point.recorded_at},${price.toFixed(8)},${days ?? ''}`,
+      );
+
+      collected += 1;
+    } catch (e) {
+      console.warn(`[price-collector] ${m.condition_id} failed: ${(e as Error).message}`);
+      errors += 1;
+    }
   }
 
   console.info(
-    `[price-collector] collected ${collected} prices, skipped ${tooSoon} (too soon), ${noToken} (no token), ${errors} errors`,
+    `[price-collector] recorded ${collected} new prices, skipped ${tooSoon} (too soon)`,
   );
-  return { total: tracked.length, collected, skipped_too_soon: tooSoon, skipped_no_token: noToken, errors };
+  if (noMatch > 0 || errors > 0) {
+    console.info(
+      `[price-collector] (${noMatch} tracked markets not in batch, ${errors} write errors)`,
+    );
+  }
+
+  return {
+    total: tracked.length,
+    fetched: gamma.length,
+    collected,
+    skipped_too_soon: tooSoon,
+    skipped_no_match: noMatch,
+    errors,
+  };
 }
 
 /**
  * Move a market's full price history out of the live table into a CSV in
  * market_data/resolved/. Called by the resolution monitor when a market
- * settles. Idempotent: if there are no rows to move, the CSV is still
- * written (with just the header block) so we have a record of the
- * resolution.
+ * settles. Idempotent.
  */
 export async function archiveResolvedMarket(conditionId: string, outcome: 0 | 1): Promise<void> {
   ensureDirs();
@@ -233,10 +255,13 @@ export async function archiveResolvedMarket(conditionId: string, outcome: 0 | 1)
 
   fs.writeFileSync(outFile, headerLines.join('\n') + '\n' + body + (body ? '\n' : ''), 'utf8');
 
-  // Drop the active CSV (if it exists) and the live history rows.
   const activeFile = csvPath(conditionId, ACTIVE_DIR);
   if (fs.existsSync(activeFile)) {
-    try { fs.unlinkSync(activeFile); } catch { /* ignore */ }
+    try {
+      fs.unlinkSync(activeFile);
+    } catch {
+      /* ignore */
+    }
   }
   await deletePriceHistory(conditionId).catch((e) =>
     console.warn(`[price-collector] deletePriceHistory failed: ${(e as Error).message}`),

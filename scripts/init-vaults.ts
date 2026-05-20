@@ -14,7 +14,9 @@
  * Run:  cd backend && npx tsx ../scripts/init-vaults.ts
  */
 
-import 'dotenv/config';
+import * as path from 'path';
+import { config as loadDotenv } from 'dotenv';
+loadDotenv({ path: path.resolve(__dirname, '..', '.env') });
 import { SystemProgram, SYSVAR_RENT_PUBKEY } from '@solana/web3.js';
 import { TOKEN_PROGRAM_ID } from '@solana/spl-token';
 import { listBaskets, updateBasket } from '../backend/src/db/queries';

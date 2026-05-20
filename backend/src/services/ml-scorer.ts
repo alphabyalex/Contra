@@ -1,29 +1,41 @@
 /**
- * ML scorer — calibration_v2 (layered).
+ * ML scorer — calibration_v4.
+ *
+ * Invariant: adj_edge = p_market − p_model_shown (the persisted p_model
+ * field). Factors adjust p_model, NOT the edge directly. p_model is
+ * always capped at p_market × 0.95 so some edge is preserved.
  *
  * Pipeline (per market):
- *   Layer 1  base calibration  → p_model from 11-bucket lookup
- *                                 base_edge = p_market - p_model
- *   Layer 2  hard exclusion    → days < 3 / days > 365 / volume < 100k
- *                                 → edge = 0, include = false, stop
- *   Layer 3  time factor       → 1.20 / 1.00 / 0.80 / 0.50
- *   Layer 4  category factor   → 1.20 sports, 1.10 politics+culture,
- *                                0.90 macro, 0.95 crypto, 1.00 other
- *   Layer 5  volume factor     → 0.90 / 1.00 / 1.05
- *   Layer 6  impossible override
- *                                 p_model = 0, base_edge = p_market,
- *                                 skip category factor, include if
- *                                 adjusted_edge >= 0.02
+ *   Layer 1  base calibration
+ *     non-sports → p_calib from 11-bucket lookup
+ *     sports     → tiered within-probability rule (replaces lookup):
+ *                    p_market > 0.08 → 0.75 × p_market   (contender)
+ *                    p_market > 0.05 → 0.35 × p_market   (moderate)
+ *                    p_market > 0.02 → 0.90 × lookup     (genuine longshot)
+ *                    else            → lookup            (extreme longshot)
+ *   Layer 2  hard exclusion → days <3 / days >365 / volume <100k
+ *                              → adj_edge = 0, include = false, stop
+ *   Layer 3  factor stack applied to p_model:
+ *              p_model_adj = base × time_factor × category_factor × volume_factor
+ *              p_model_adj = min(p_model_adj, p_market × 0.95)
+ *              adj_edge    = p_market − p_model_adj
+ *   Layer 4  impossible override:
+ *              p_model_adj = 0, adj_edge = p_market, include if adj_edge ≥ 0.02
  *
- *   adjusted_edge = base_edge × time_factor × category_factor × volume_factor
- *                   × momentum_factor (default 1.0; updated by daily job)
+ *   category_factor = getDomainHorizonMultiplier(category, days_to_close)
+ *
+ *   momentum_factor is persisted (default 1.0) and applied by the daily
+ *   momentum job by adjusting p_model so the adj_edge = p_market − p_model
+ *   invariant continues to hold.
  *
  * Inclusion gate (after layers):
- *   adjusted_edge >= 0.03 AND p_market in [0.02, 0.12] AND not excluded.
+ *   adj_edge ≥ 0.03 AND p_market ∈ [0.02, 0.12] AND not excluded.
  */
 
 import {
   upsertScoredMarket,
+  listScoredMarkets,
+  listScreenedMarkets,
   type ScreenedMarket,
   type ScoredMarket,
 } from '../db/queries';
@@ -49,7 +61,10 @@ export const CALIBRATION_TABLE: CalibrationBucket[] = [
   { min: 0.90, max: 1.01, p_model: 0.9182, n: 685 },
 ];
 
-export const MODEL_VERSION = 'calibration_v2';
+export const MODEL_VERSION = 'calibration_v4';
+
+/** p_model_adjusted is never allowed above p_market × P_MODEL_CAP_FRAC. */
+export const P_MODEL_CAP_FRAC = 0.95;
 
 // Inclusion gate (post-layered).
 export const EDGE_INCLUDE_THRESHOLD = 0.03;
@@ -74,6 +89,26 @@ export function getPModel(p_market: number): number {
     if (p_market >= b.min && p_market < b.max) return b.p_model;
   }
   return CALIBRATION_TABLE[CALIBRATION_TABLE.length - 1].p_model;
+}
+
+/**
+ * Sports-only tiered base p_model. Replaces the standard CALIBRATION_TABLE
+ * lookup for sports markets where the question is structurally "does
+ * country X / team X win the tournament" — outright lookups badly
+ * undershoot contenders (Brazil at 8% is not a 1.7% longshot).
+ */
+export function getSportsCalibratedPModel(p_market: number): number {
+  if (!Number.isFinite(p_market)) return 0;
+  if (p_market > 0.08) return p_market * 0.75;       // contender, ~25% overpriced max
+  if (p_market > 0.05) return p_market * 0.35;       // moderate longshot
+  if (p_market > 0.02) return getPModel(p_market) * 0.90; // genuine longshot, strong bias
+  return getPModel(p_market);                        // extreme longshot, full bias
+}
+
+export function getBasePModel(p_market: number, category: string | null): number {
+  return (category ?? 'other').toLowerCase() === 'sports'
+    ? getSportsCalibratedPModel(p_market)
+    : getPModel(p_market);
 }
 
 export function getEdge(p_market: number, p_model: number): number {
@@ -104,9 +139,35 @@ const CRYPTO_KEYWORDS = [
   'nft','altcoin','coinbase','binance','web3',
 ];
 const SPORTS_KEYWORDS = [
-  'win','championship','nba','nfl','mlb','nhl','cup','tournament','league','player',
-  'coach','season','playoff','score','match','game','football','basketball','baseball',
-  'hockey','soccer','tennis','golf','olympic','fifa','world cup',
+  // general sports terms
+  'win','championship','cup','tournament','league','player','coach','season','playoff',
+  'score','match','game','football','basketball','baseball','hockey','soccer','tennis',
+  'golf','olympic','fifa','world cup','nba','nfl','mlb','nhl','stanley','finals','series',
+  'medal','podium','race','grand prix',
+  // countries (national teams)
+  'england','france','spain','germany','brazil','argentina','portugal','japan','norway',
+  'netherlands','mexico','usa','canada','australia','italy','belgium','croatia','senegal',
+  'morocco','korea',
+  // NBA teams
+  'knicks','lakers','celtics','warriors','bulls','heat','nets','bucks','suns','nuggets',
+  'clippers','mavs','mavericks','spurs','rockets','pistons','cavaliers','cavs','pacers',
+  'hawks','hornets','magic','wizards','raptors','sixers','76ers','jazz','thunder','blazers',
+  'grizzlies','pelicans','kings','timberwolves','wolves',
+  // NHL teams
+  'canadiens','maple leafs','bruins','rangers','penguins','blackhawks','red wings','oilers',
+  'flames','canucks','avalanche','lightning','golden knights','capitals','flyers','blues',
+  'stars','sharks','ducks','coyotes','devils','islanders','hurricanes','panthers','senators',
+  'sabres','jets','kraken','wild','predators',
+  // MLB teams
+  'yankees','red sox','dodgers','cubs','cardinals','giants','astros','braves','mets',
+  'phillies','nationals','brewers','pirates','reds','rockies','padres','mariners','athletics',
+  'tigers','indians','guardians','twins','royals','white sox','orioles','rays','blue jays',
+  'angels','diamondbacks','marlins',
+  // NFL teams
+  'patriots','cowboys','packers','steelers','49ers','chiefs','ravens','eagles','bears',
+  'lions','seahawks','rams','broncos','raiders','chargers','colts','dolphins','bills',
+  'browns','bengals','falcons','saints','buccaneers','vikings','texans','jaguars','titans',
+  'commanders',
 ];
 const CULTURE_KEYWORDS = [
   'oscar','grammy','emmy','award','movie','film','music','actor','album','box office',
@@ -146,6 +207,45 @@ export function getCategoryFactor(category: string | null): number {
     case 'macro':    return 0.90;
     case 'crypto':   return 0.95;
     default:         return 1.00;
+  }
+}
+
+/**
+ * calibration_v3 domain × horizon multiplier. Applied to the base
+ * calibration lookup to produce p_model. Captures the empirical finding
+ * that miscalibration scales with both domain and time-to-resolution —
+ * long-horizon political markets are the most overpriced.
+ *
+ * `days == null` falls back to the medium-horizon bucket for that domain.
+ */
+export function getDomainHorizonMultiplier(
+  category: string | null,
+  days: number | null,
+): number {
+  const cat = (category ?? 'other').toLowerCase();
+  const d = days; // may be null → use medium bucket per domain
+
+  switch (cat) {
+    case 'politics':
+      if (d == null) return 0.70; // medium-term default
+      if (d <= 30) return 0.85; // near-term: fairly well priced
+      if (d <= 180) return 0.70; // medium-term: strong bias, very overpriced
+      return 0.55; // long-term: extremely overpriced (>365 hard-excluded)
+    case 'sports':
+      if (d == null) return 0.80;
+      if (d <= 30) return 0.90; // near-term: moderately well priced
+      if (d <= 90) return 0.80; // medium-term: fans overweight longshots
+      return 0.75; // 90–365
+    case 'macro':
+      if (d == null) return 1.0;
+      if (d <= 90) return 1.0; // economists involved, well calibrated
+      return 0.85; // 90–365
+    case 'crypto':
+      return 0.90; // informed traders, moderate calibration
+    case 'culture':
+      return 0.80; // fan bias, award predictions heavily biased
+    default:
+      return 0.95; // other
   }
 }
 
@@ -218,20 +318,21 @@ export function computeLayeredScore(opts: {
   const category = (opts.category ?? classifyCategory(question)) as string;
   const time_factor = getTimeFactor(days_to_close);
   const volume_factor = getVolumeFactor(volume);
-  const category_factor = isImpossible ? 1.0 : getCategoryFactor(category);
+  const category_factor = isImpossible
+    ? 1.0
+    : getDomainHorizonMultiplier(category, days_to_close);
 
-  // Layer 6 — impossible override sidesteps Anthropic excluded gating.
+  // Layer 4 — impossible override. p_model = 0, edge = p_market.
   if (isImpossible) {
-    const base_edge = p_market;
-    const adjusted_edge = base_edge * time_factor * volume_factor * momentum_factor;
     const hard_excluded = isHardExcluded(days_to_close, volume);
+    const adjusted_edge = hard_excluded ? 0 : p_market;
     return {
       p_model: 0.0,
-      base_edge,
+      base_edge: p_market,
       time_factor,
       category_factor,
       volume_factor,
-      adjusted_edge: hard_excluded ? 0 : adjusted_edge,
+      adjusted_edge,
       category,
       include_in_basket: !hard_excluded && adjusted_edge >= IMPOSSIBLE_INCLUDE_THRESHOLD,
       impossible_edge: true,
@@ -239,14 +340,14 @@ export function computeLayeredScore(opts: {
     };
   }
 
-  // Layer 1 — base calibration.
-  const p_model = getPModel(p_market);
-  const base_edge = getEdge(p_market, p_model);
+  // Layer 1 — base calibration (sports uses tiered rule, others use lookup).
+  const base_p_model = getBasePModel(p_market, category);
+  const base_edge = getEdge(p_market, base_p_model);
 
   // Layer 2 — hard exclusion. Stops further scoring.
   if (isHardExcluded(days_to_close, volume)) {
     return {
-      p_model,
+      p_model: base_p_model,
       base_edge,
       time_factor: 1,
       category_factor: 1,
@@ -259,8 +360,15 @@ export function computeLayeredScore(opts: {
     };
   }
 
-  // Layers 3-5 + momentum.
-  const adjusted_edge = base_edge * time_factor * category_factor * volume_factor * momentum_factor;
+  // Layer 3 — factor stack applies to p_model, never to edge directly.
+  // Cap p_model at 95% of p_market so some edge is always preserved.
+  const p_model_unfolded = base_p_model * time_factor * category_factor * volume_factor;
+  const p_model_adj = Math.min(p_model_unfolded, p_market * P_MODEL_CAP_FRAC);
+  // Invariant: adj_edge = p_market − p_model_shown.
+  // momentum_factor is intentionally NOT applied here — the momentum job
+  // folds it into p_model later so the invariant continues to hold.
+  void momentum_factor;
+  const adjusted_edge = p_market - p_model_adj;
 
   const include_in_basket =
     !excludedByScreener &&
@@ -269,7 +377,7 @@ export function computeLayeredScore(opts: {
     p_market <= P_MARKET_INCLUDE_MAX;
 
   return {
-    p_model,
+    p_model: p_model_adj,
     base_edge,
     time_factor,
     category_factor,
@@ -351,4 +459,63 @@ export async function scoreAllMarkets(inputs: MarketToScore[]): Promise<{
   }
   const included = scored.filter((r) => r.include_in_basket).length;
   return { scored, included, impossible_included: impossibleIncluded, hard_excluded: hardExcluded };
+}
+
+/**
+ * Re-score every existing scored_markets row against the current model
+ * (calibration_v3). Reads volume / days_to_close / category straight off
+ * the persisted scored rows so we don't depend on the live APIs and
+ * don't clobber existing metadata. Screened flags (impossible / excluded)
+ * are joined from screened_markets; rows with no screened entry are
+ * treated as not-excluded / not-impossible.
+ */
+export async function rescoreAllStored(): Promise<{
+  total: number;
+  rescored: number;
+  included: number;
+  model_version: string;
+}> {
+  const [scored, screened] = await Promise.all([
+    listScoredMarkets(),
+    listScreenedMarkets().catch(() => [] as ScreenedMarket[]),
+  ]);
+  const screenedById = new Map<string, ScreenedMarket>();
+  for (const s of screened) screenedById.set(s.condition_id, s);
+
+  let rescored = 0;
+  let included = 0;
+  for (const sd of scored) {
+    const sc = screenedById.get(sd.condition_id);
+    const synthScreened: ScreenedMarket = sc ?? {
+      id: sd.id,
+      condition_id: sd.condition_id,
+      source: sd.source as ScreenedMarket['source'],
+      question: sd.question,
+      p_market: sd.p_market ?? 0,
+      impossible: sd.impossible_edge ?? false,
+      already_resolved: false,
+      ambiguous: false,
+      excluded: false,
+      exclusion_reason: null,
+      screened_at: sd.scored_at,
+      screening_model: null,
+    };
+    try {
+      const row = await scoreMarket({
+        screened: synthScreened,
+        volume: sd.volume ?? null,
+        days_to_close: sd.days_to_close ?? null,
+        category: sd.category ?? null,
+      });
+      rescored += 1;
+      if (row.include_in_basket) included += 1;
+    } catch (e) {
+      console.warn(`[ml-scorer] rescore failed ${sd.condition_id}: ${(e as Error).message}`);
+    }
+  }
+
+  console.info(
+    `[ml-scorer] rescoreAllStored: ${rescored}/${scored.length} rows → ${MODEL_VERSION} (${included} include_in_basket)`,
+  );
+  return { total: scored.length, rescored, included, model_version: MODEL_VERSION };
 }

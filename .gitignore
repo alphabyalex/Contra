@@ -58,3 +58,36 @@ dist/
 build/
 coverage/
 *.log
+tsconfig.tsbuildinfo
+**/tsconfig.tsbuildinfo
+
+# --- claude code session state --------------------------------------
+.claude/scheduled_tasks.lock
+
+# --- one-off dev / debug helpers (kept locally, never in main) ------
+# Scratch artifacts produced by ad-hoc admin calls and local debugging.
+basket-def.json
+install-node.sh
+install-yarn.sh
+scripts/debug-init.ts
+# Most wsl-*.sh helpers were workarounds for /mnt/c FS quirks, airdrop
+# rate limits, etc. Keep the two that document the canonical deploy
+# path (wsl-deploy-leverage.sh and wsl-sync-and-deploy.sh); ignore the rest.
+wsl-airdrop-alt.sh
+wsl-airdrop-patient.sh
+wsl-anchor-build.sh
+wsl-balance-multi-rpc.sh
+wsl-build-native.sh
+wsl-build-native2.sh
+wsl-check-bal.sh
+wsl-check-history.sh
+wsl-deploy-tight.sh
+wsl-deploy.sh
+wsl-fresh-airdrop.sh
+wsl-patch-anchor.sh
+wsl-pin-pm2.sh
+wsl-pm2-latest.sh
+wsl-recover-buffer.sh
+wsl-rpc-direct.sh
+wsl-verify-deploy.sh
+wsl-yarn-install.sh

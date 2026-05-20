@@ -45,7 +45,11 @@ export interface PolymarketOutcome {
 const BASE = (): string =>
   process.env.POLYMARKET_BASE_URL?.trim() || 'https://gamma-api.polymarket.com';
 
-const PAGE_SIZE = 500;
+// Gamma's `limit` query param has a hard server-side cap of 100 per page
+// regardless of what we ask for. We paginate via `offset` to walk all
+// active markets.
+const PAGE_SIZE = 100;
+const POLITE_DELAY_MS = 300;
 
 function parseStringArray(v: string | string[] | undefined): string[] {
   if (!v) return [];
@@ -86,6 +90,7 @@ export async function getMarkets(opts: {
 /** Walk all pages until the API stops returning rows. */
 export async function getAllActiveMarkets(maxPages = 20): Promise<RawPolymarketMarket[]> {
   const all: RawPolymarketMarket[] = [];
+  let pages = 0;
   for (let page = 0; page < maxPages; page++) {
     const offset = page * PAGE_SIZE;
     const params = new URLSearchParams({
@@ -95,10 +100,14 @@ export async function getAllActiveMarkets(maxPages = 20): Promise<RawPolymarketM
       closed: 'false',
     });
     const batch = await getJson<RawPolymarketMarket[]>(`${BASE()}/markets?${params}`);
+    pages = page + 1;
     if (!batch || batch.length === 0) break;
     all.push(...batch);
     if (batch.length < PAGE_SIZE) break;
+    // Polite pause between pages — Gamma is public and unauthenticated.
+    if (page < maxPages - 1) await new Promise((r) => setTimeout(r, POLITE_DELAY_MS));
   }
+  (all as any).__pagesFetched = pages;
   return all;
 }
 

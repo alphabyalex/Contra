@@ -38,13 +38,19 @@ interface BasketRow {
   avg_edge?: number;
 }
 
-const CATEGORIES = ['All', 'Politics', 'Macro', 'Crypto', 'Sports'] as const;
+/**
+ * Leverage variants are emitted from the basket builder with a `-2X` / `-3X`
+ * suffix on the base CTRA-NN name. Base baskets are always 1x.
+ */
+function deriveLeverageFromName(name: string): string {
+  const m = name.match(/-([23])X$/i);
+  return m ? `${m[1]}x` : '1x';
+}
 
 export default function BasketsPage() {
   const [baskets, setBaskets] = useState<BasketRow[]>([]);
   const [loading, setLoading] = useState(true);
   const [usingMock, setUsingMock] = useState(false);
-  const [filter, setFilter] = useState<(typeof CATEGORIES)[number]>('All');
 
   useEffect(() => {
     api.baskets
@@ -81,13 +87,12 @@ export default function BasketsPage() {
         num_legs: b.num_legs,
         nav: b.nav ?? 1,
         avg_edge: b.avg_edge ?? 0,
-        leverage: b.leverage_type === 'degen' ? '3x' : b.leverage_type === 'aggressive' ? '2x' : '1x',
+        // Leverage variants are derived from the basket name suffix
+        // (CTRA-01 = 1x base, CTRA-01-2X = 2x, CTRA-01-3X = 3x). The
+        // `leverage_type` column tracks short/mid term, not multiplier.
+        leverage: deriveLeverageFromName(b.name),
         source: 'Both',
       }));
-
-  const filtered = display.filter(
-    (b) => filter === 'All' || (b.category ?? '').toLowerCase() === filter.toLowerCase(),
-  );
 
   return (
     <div style={{ background: '#F7F7F5', minHeight: 'calc(100vh - 56px)' }}>
@@ -132,28 +137,6 @@ export default function BasketsPage() {
           </Link>
         </div>
 
-        <div className="flex gap-2">
-          {CATEGORIES.map((c) => (
-            <button
-              key={c}
-              onClick={() => setFilter(c)}
-              style={{
-                fontSize: 10,
-                textTransform: 'uppercase',
-                letterSpacing: '0.08em',
-                padding: '6px 12px',
-                borderRadius: 3,
-                border: filter === c ? '1px solid #1A56DB' : '1px solid #E5E5E3',
-                color: filter === c ? '#1A56DB' : '#6B6B6B',
-                background: '#FFFFFF',
-                cursor: 'pointer',
-              }}
-            >
-              {c}
-            </button>
-          ))}
-        </div>
-
         {loading ? (
           <div className="grid grid-cols-1 md:grid-cols-2 lg:grid-cols-3 xl:grid-cols-4 gap-4">
             {Array.from({ length: 8 }).map((_, i) => (
@@ -162,7 +145,7 @@ export default function BasketsPage() {
           </div>
         ) : (
           <div className="grid grid-cols-1 md:grid-cols-2 lg:grid-cols-3 xl:grid-cols-4 gap-4">
-            {filtered.map((b) => (
+            {display.map((b) => (
               <BasketCard
                 key={b.id}
                 id={b.id}

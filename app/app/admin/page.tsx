@@ -217,23 +217,35 @@ interface RecentExcluded {
   screened_at: string;
 }
 
+interface ScreenerSummary {
+  total_tracked: number;
+  total_screened: number;
+  excluded: number;
+  eligible: number;
+  in_basket: number;
+}
+
 function ScreenerSummarySection() {
   const [rows, setRows] = useState<ScannerRow[] | null>(null);
   const [recent, setRecent] = useState<RecentExcluded[] | null>(null);
+  const [summary, setSummary] = useState<ScreenerSummary | null>(null);
   const [err, setErr] = useState<string | null>(null);
   useEffect(() => {
-    // Fetch enough rows to surface top-scored layered breakdown.
+    // Counts come directly from Supabase via the analytics endpoint so
+    // they aren't truncated by the scanner display limit. The scanner
+    // rows are still used only for the top-10 layered breakdown table.
     Promise.all([
-      get<{ rows: ScannerRow[] }>('/api/scanner/markets?min=0.02&max=0.15&sort=edge&limit=500').then((d) => setRows(d.rows ?? [])),
+      get<ScreenerSummary>('/api/analytics/screener-summary').then(setSummary),
+      get<{ rows: ScannerRow[] }>('/api/scanner/markets?sort=edge&limit=500').then((d) => setRows(d.rows ?? [])),
       get<{ rows: RecentExcluded[] }>('/api/scanner/recent-excluded?limit=10').then((d) => setRecent(d.rows ?? [])),
     ]).catch((e) => setErr(e.message));
   }, []);
 
-  const total = rows?.length ?? 0;
-  const screened = rows?.filter((r) => r.screened).length ?? 0;
-  const excluded = rows?.filter((r) => r.excluded).length ?? 0;
-  const eligible = rows?.filter((r) => r.screened && !r.excluded).length ?? 0;
-  const inBasket = rows?.filter((r) => r.include_in_basket).length ?? 0;
+  const total = summary?.total_tracked ?? 0;
+  const screened = summary?.total_screened ?? 0;
+  const excluded = summary?.excluded ?? 0;
+  const eligible = summary?.eligible ?? 0;
+  const inBasket = summary?.in_basket ?? 0;
 
   return (
     <div style={cardStyle}>
@@ -455,12 +467,49 @@ interface BasketRow {
   status: string;
 }
 
+interface AdminLeg {
+  leg_index: number;
+  source: string;
+  market_id: string;
+  question: string;
+  outcome_label?: string | null;
+  p_market_entry: number;
+  p_model: number;
+  edge: number;
+  weight: number;
+  outcome?: 0 | 1 | null;
+}
+
 function ActiveBasketsSection() {
   const [baskets, setBaskets] = useState<BasketRow[] | null>(null);
   const [err, setErr] = useState<string | null>(null);
+  const [expanded, setExpanded] = useState<string | null>(null);
+  const [legsCache, setLegsCache] = useState<Record<string, AdminLeg[]>>({});
+  const [legsLoading, setLegsLoading] = useState<string | null>(null);
+  const [legsErr, setLegsErr] = useState<Record<string, string>>({});
+
   useEffect(() => {
     get<{ baskets: BasketRow[] }>('/api/baskets').then((d) => setBaskets(d.baskets ?? [])).catch((e) => setErr(e.message));
   }, []);
+
+  const toggle = async (b: BasketRow) => {
+    if (expanded === b.id) {
+      setExpanded(null);
+      return;
+    }
+    setExpanded(b.id);
+    if (legsCache[b.id]) return;
+    setLegsLoading(b.id);
+    try {
+      const r = await get<{ legs: AdminLeg[] }>(`/api/baskets/${b.id}`);
+      setLegsCache((m) => ({ ...m, [b.id]: r.legs ?? [] }));
+    } catch (e) {
+      setLegsErr((m) => ({ ...m, [b.id]: (e as Error).message }));
+    } finally {
+      setLegsLoading(null);
+    }
+  };
+
   return (
     <div style={cardStyle}>
       <div style={sectionLabel}>4 · Active Baskets</div>
@@ -483,19 +532,101 @@ function ActiveBasketsSection() {
             </tr>
           </thead>
           <tbody>
-            {baskets.map((b) => (
-              <tr key={b.id} style={{ borderBottom: `1px solid ${colors.border}` }}>
-                <td style={{ padding: '10px 8px' }}>{b.name}</td>
-                <td style={{ padding: '10px 8px', color: colors.muted }}>{b.leverage_type}</td>
-                <td style={{ padding: '10px 8px', textAlign: 'right', ...numCell }}>{b.num_legs}</td>
-                <td style={{ padding: '10px 8px', textAlign: 'right', ...numCell }}>{b.legs_resolved}/{b.legs_total}</td>
-                <td style={{ padding: '10px 8px', textAlign: 'right', ...numCell }}>{(b.nav ?? 1).toFixed(4)}</td>
-                <td style={{ padding: '10px 8px', color: colors.muted }}>{b.status}</td>
-              </tr>
-            ))}
+            {baskets.map((b) => {
+              const open = expanded === b.id;
+              return (
+                <>
+                  <tr
+                    key={b.id}
+                    style={{ borderBottom: `1px solid ${colors.border}`, cursor: 'pointer' }}
+                    onClick={() => toggle(b)}
+                  >
+                    <td style={{ padding: '10px 8px', color: colors.accent, fontWeight: 500 }}>
+                      <span style={{ display: 'inline-block', width: 14, color: colors.faint }}>
+                        {open ? '▾' : '▸'}
+                      </span>
+                      {b.name}
+                    </td>
+                    <td style={{ padding: '10px 8px', color: colors.muted }}>{b.leverage_type}</td>
+                    <td style={{ padding: '10px 8px', textAlign: 'right', ...numCell }}>{b.num_legs}</td>
+                    <td style={{ padding: '10px 8px', textAlign: 'right', ...numCell }}>{b.legs_resolved}/{b.legs_total}</td>
+                    <td style={{ padding: '10px 8px', textAlign: 'right', ...numCell }}>{(b.nav ?? 1).toFixed(4)}</td>
+                    <td style={{ padding: '10px 8px', color: colors.muted }}>{b.status}</td>
+                  </tr>
+                  {open && (
+                    <tr key={`${b.id}-legs`}>
+                      <td colSpan={6} style={{ background: colors.bg, padding: 16 }}>
+                        {legsLoading === b.id && <Skeleton lines={3} />}
+                        {legsErr[b.id] && <div style={{ color: colors.negative }}>error: {legsErr[b.id]}</div>}
+                        {legsCache[b.id] && <AdminLegTable legs={legsCache[b.id]} />}
+                      </td>
+                    </tr>
+                  )}
+                </>
+              );
+            })}
           </tbody>
         </table>
       )}
+    </div>
+  );
+}
+
+function AdminLegTable({ legs }: { legs: AdminLeg[] }) {
+  return (
+    <div style={{ background: colors.card, border: `1px solid ${colors.border}`, overflowX: 'auto' }}>
+      <table style={{ width: '100%', borderCollapse: 'collapse', fontSize: 12 }}>
+        <thead>
+          <tr style={{ borderBottom: `1px solid ${colors.border}`, color: colors.faint }}>
+            <Th>#</Th>
+            <Th>Question</Th>
+            <Th>Source</Th>
+            <Th align="right">P market</Th>
+            <Th align="right">P model</Th>
+            <Th align="right">Edge</Th>
+            <Th align="right">Weight</Th>
+            <Th>Status</Th>
+          </tr>
+        </thead>
+        <tbody>
+          {legs.map((l) => {
+            const o = l.outcome;
+            const statusBg = o === 0 ? colors.positiveSoft : o === 1 ? colors.negativeSoft : '#F0F0EE';
+            const statusFg = o === 0 ? colors.positive : o === 1 ? colors.negative : colors.faint;
+            const statusText = o === 0 ? 'NO' : o === 1 ? 'YES' : 'open';
+            return (
+              <tr key={l.leg_index} style={{ borderBottom: `1px solid ${colors.border}` }}>
+                <td style={{ padding: '8px', ...numCell, color: colors.faint, fontSize: 12 }}>{l.leg_index}</td>
+                <td style={{ padding: '8px', maxWidth: 380, overflow: 'hidden', textOverflow: 'ellipsis', whiteSpace: 'nowrap' }}>
+                  {l.question}
+                </td>
+                <td style={{ padding: '8px', color: colors.muted, textTransform: 'lowercase' }}>{l.source}</td>
+                <td style={{ padding: '8px', textAlign: 'right', ...numCell, fontSize: 12, color: colors.negative }}>
+                  {(Number(l.p_market_entry) * 100).toFixed(1)}%
+                </td>
+                <td style={{ padding: '8px', textAlign: 'right', ...numCell, fontSize: 12, color: colors.accent }}>
+                  {(Number(l.p_model) * 100).toFixed(1)}%
+                </td>
+                <td style={{ padding: '8px', textAlign: 'right', ...numCell, fontSize: 12, color: colors.positive }}>
+                  +{(Number(l.edge) * 100).toFixed(1)}%
+                </td>
+                <td style={{ padding: '8px', textAlign: 'right', ...numCell, fontSize: 12 }}>
+                  {(Number(l.weight) * 100).toFixed(2)}%
+                </td>
+                <td style={{ padding: '8px' }}>
+                  <span style={{
+                    fontSize: 10, textTransform: 'uppercase', letterSpacing: '0.08em',
+                    padding: '2px 8px', borderRadius: 10, background: statusBg, color: statusFg,
+                    fontFamily: '"DM Sans", sans-serif', fontWeight: 500,
+                  }}>
+                    {statusText}
+                  </span>
+                </td>
+              </tr>
+            );
+          })}
+        </tbody>
+      </table>
     </div>
   );
 }

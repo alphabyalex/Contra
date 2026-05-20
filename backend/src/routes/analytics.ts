@@ -17,7 +17,7 @@ import {
   computeCalibration,
   computeEdgeRealization,
 } from '../services/analytics';
-import { getPredictionLogStats, listScoredMarkets } from '../db/queries';
+import { getPredictionLogStats, listScoredMarkets, getScreenerSummary } from '../db/queries';
 import { MODEL_VERSION } from '../services/ml-scorer';
 
 const analyticsRouter: Router = Router();
@@ -75,6 +75,20 @@ analyticsRouter.get('/model-status', async (_req, res) => {
       included: scored.filter((s) => s.include_in_basket).length,
       impossible: scored.filter((s) => s.impossible_edge).length,
     });
+  } catch (e) {
+    res.status(500).json({ error: (e as Error).message });
+  }
+});
+
+/**
+ * Screener summary counts for the admin dashboard. Fetched directly from
+ * the source tables so the numbers don't depend on (or get truncated by)
+ * the scanner display route.
+ */
+analyticsRouter.get('/screener-summary', async (_req, res) => {
+  try {
+    const summary = await getScreenerSummary();
+    res.json(summary);
   } catch (e) {
     res.status(500).json({ error: (e as Error).message });
   }

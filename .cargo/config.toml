@@ -1,0 +1,10 @@
+# Empty for now — see comment.
+#
+# anchor-syn 0.30.1 has a `#[cfg(procmacro2_semver_exempt)]` block that
+# calls `proc_macro2::Span::source_file()`. Enabling that cfg lets it
+# resolve type aliases / external types in IDL extraction, but
+# proc-macro2's source_file routes through `proc_macro::Span::source_file`
+# which was removed from stable rustc 1.78+. Our programs don't use type
+# aliases, so leaving the cfg off skips that block entirely.
+[build]
+rustflags = []
