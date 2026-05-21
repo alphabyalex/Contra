@@ -13,7 +13,7 @@
  *     (p_model 0%, edge = p_market) without any label.
  */
 
-import { useCallback, useEffect, useMemo, useRef, useState } from 'react';
+import React, { useCallback, useEffect, useMemo, useRef, useState } from 'react';
 import { api } from '../_lib/api';
 import { useInView } from '../_lib/useInView';
 
@@ -33,8 +33,25 @@ interface Row {
   exclusion_reason?: string | null;
   p_model?: number | null;
   edge?: number | null;
+  raw_edge?: number | null;
   adjusted_edge?: number | null;
+  signal?: 'strong_short' | 'short' | 'weak_short' | 'fair_value' | 'long' | 'strong_long' | null;
   include_in_basket?: boolean | null;
+  // calibration_v5 tournament normalization
+  tournament_group?: string | null;
+  is_tournament_market?: boolean;
+  normalized_p_market?: number | null;
+  is_favorite?: boolean;
+  is_ephemeral?: boolean;
+  score?: number;
+}
+
+interface ScannerGroup {
+  category: string;
+  short_count: number;
+  long_count: number;
+  long_section_start: number | null;
+  markets: Row[];
 }
 
 const MIN = 0.02;
@@ -46,6 +63,9 @@ type SortField = 'volume' | 'edge' | 'days' | 'p_market';
 
 export default function ScannerPage() {
   const [rows, setRows] = useState<Row[]>([]);
+  const [groups, setGroups] = useState<ScannerGroup[]>([]);
+  const [view, setView] = useState<'category_grouped' | 'search'>('category_grouped');
+  const [watchedCount, setWatchedCount] = useState<number>(0);
   const [counts, setCounts] = useState<{ polymarket: number; kalshi: number }>({ polymarket: 0, kalshi: 0 });
   const [totalAfterFilter, setTotalAfterFilter] = useState<number>(0);
   const [kalshiError, setKalshiError] = useState<string | null>(null);
@@ -72,6 +92,9 @@ export default function ScannerPage() {
       });
       const data = (Array.isArray(r.rows) ? r.rows : []) as Row[];
       setRows(data);
+      setGroups(((r as { groups?: ScannerGroup[] }).groups ?? []) as ScannerGroup[]);
+      setView(((r as { view?: 'category_grouped' | 'search' }).view ?? 'search'));
+      setWatchedCount(Number((r as { watched_count?: number }).watched_count ?? r.count ?? 0));
       setCounts(r.counts ?? { polymarket: 0, kalshi: 0 });
       setTotalAfterFilter(r.total_after_filter ?? data.length);
       setKalshiError(r.kalshi_error ?? null);
@@ -130,8 +153,10 @@ export default function ScannerPage() {
               </h1>
               <div style={{ fontSize: 12, color: '#9B9B9B', marginTop: 10 }}>
                 {isSearching
-                  ? `${visible.length} result${visible.length === 1 ? '' : 's'} for "${query.trim()}" · across ${totalAfterFilter} total markets`
-                  : `Top ${TOP_N} most liquid markets · ${totalAfterFilter} total watched`}
+                  ? `${visible.length} result${visible.length === 1 ? '' : 's'} for "${query.trim()}"${
+                      totalAfterFilter > watchedCount ? ' · including tournament context' : ''
+                    } · ${watchedCount} total watched`
+                  : `Top 5 per category · ${watchedCount} total watched`}
               </div>
               {!loading && !error && (
                 <div style={{ fontSize: 11, color: '#9B9B9B', marginTop: 4 }}>
@@ -201,17 +226,31 @@ export default function ScannerPage() {
                     <Th>Source</Th>
                     <Th align="right" sortable active={sortField === 'p_market'} onClick={() => setSortField('p_market')}>P_market</Th>
                     <Th align="right">P_model</Th>
-                    <Th align="right" sortable active={sortField === 'edge'} onClick={() => setSortField('edge')}>
-                      Adj. Edge
+                    <Th
+                      align="right"
+                      sortable
+                      active={sortField === 'edge'}
+                      onClick={() => setSortField('edge')}
+                      tooltip="raw_edge = p_market − p_model. Always shown regardless of time-decay or volume filters. adj_edge (raw_edge × time × volume) is used internally for basket inclusion."
+                    >
+                      Edge
                     </Th>
                     <Th align="right" sortable active={sortField === 'days'} onClick={() => setSortField('days')}>Days</Th>
                     <Th align="right" sortable active={sortField === 'volume'} onClick={() => setSortField('volume')}>Volume</Th>
                   </tr>
                 </thead>
                 <tbody>
-                  {visible.map((r, i) => (
-                    <ScannerRow key={`${r.source}-${r.marketId}-${i}`} row={r} />
-                  ))}
+                  {view === 'category_grouped' && !isSearching ? (
+                    groups
+                      .filter((g) => g.markets.length > 0)
+                      .map((g, gIdx) => (
+                        <CategorySection key={g.category} group={g} firstSection={gIdx === 0} />
+                      ))
+                  ) : (
+                    visible.map((r, i) => (
+                      <ScannerRow key={`${r.source}-${r.marketId}-${i}`} row={r} />
+                    ))
+                  )}
                 </tbody>
               </table>
             </div>
@@ -222,74 +261,176 @@ export default function ScannerPage() {
   );
 }
 
+// ====== category section =========================================
+
+function CategorySection({ group, firstSection }: { group: ScannerGroup; firstSection: boolean }) {
+  const colSpan = 7;
+  const sportsSplit = group.category === 'sports' && group.long_section_start != null && group.long_section_start > 0;
+  return (
+    <>
+      <tr>
+        <td colSpan={colSpan} style={{
+          background: '#FAFAFA',
+          padding: firstSection ? '8px 18px' : '24px 18px 8px',
+          borderBottom: '1px solid #F0F0EE',
+          fontSize: 11,
+          color: '#9B9B9B',
+          textTransform: 'uppercase',
+          letterSpacing: '0.1em',
+          fontFamily: '"DM Sans", sans-serif',
+          fontWeight: 500,
+        }}>
+          {group.category}
+        </td>
+      </tr>
+      {group.markets.map((r, i) => (
+        <React.Fragment key={`${r.source}-${r.marketId}`}>
+          {sportsSplit && i === group.long_section_start && (
+            <tr>
+              <td colSpan={colSpan} style={{
+                padding: '10px 18px',
+                borderBottom: '1px solid #E5E5E3',
+                borderTop: '1px solid #E5E5E3',
+                fontSize: 9,
+                color: '#9B9B9B',
+                textAlign: 'center',
+                textTransform: 'uppercase',
+                letterSpacing: '0.16em',
+                fontFamily: '"DM Sans", sans-serif',
+                background: '#FCFFFC',
+              }}>
+                Long Opportunities ↓
+              </td>
+            </tr>
+          )}
+          <ScannerRow row={r} />
+        </React.Fragment>
+      ))}
+    </>
+  );
+}
+
 // ====== row =========================================================
 
 function ScannerRow({ row }: { row: Row }) {
   const truncated = row.question.length > 64 ? row.question.slice(0, 63).trimEnd() + '…' : row.question;
-  const targetW = Math.max(8, Math.min(600, row.p_market * 600));
+  // Tournament markets display the vig-removed normalized probability;
+  // everything else displays the raw market mid.
+  const displayPMarket = row.is_tournament_market && row.normalized_p_market != null
+    ? row.normalized_p_market
+    : row.p_market;
+  const targetW = Math.max(8, Math.min(600, displayPMarket * 600));
   const days = row.daysToClose != null ? Math.round(row.daysToClose) : null;
   const [ref, inView] = useInView<HTMLTableRowElement>(0.1);
   const [hover, setHover] = useState(false);
 
-  // Display logic per spec:
+  // Display logic:
   //   impossible    → p_model green "0.0%", edge green = p_market %
-  //   excluded (not impossible) → both "—"
-  //   not screened  → both "—"
-  //   eligible      → real values
+  //   excluded      → both "—"
+  //   has model data (p_model or signal computed) → real values
+  //   missing model → "—" / fallback hint
+  //
+  // Ephemeral tournament favorites have `screened: false` but DO have a
+  // p_model computed during the group renormalization, so they render
+  // real numbers even though they never went through the Anthropic
+  // screener pipeline.
   const isImpossible = Boolean(row.impossible);
   const isExcluded = Boolean(row.excluded) && !isImpossible;
-  const isUnscreened = !row.screened && !isExcluded && !isImpossible;
+  const isTournament = Boolean(row.is_tournament_market);
+  const isFavorite = isTournament && Boolean(row.is_favorite);
+  const hasModelData =
+    !isExcluded && !isImpossible && (row.p_model != null || row.signal != null);
 
   const pModelDisplay = isImpossible
     ? '0.0%'
-    : isExcluded || isUnscreened
+    : isExcluded
     ? '—'
     : row.p_model != null
     ? formatPct(row.p_model)
+    : isFavorite
+    ? 'model: ↑ underpriced'
     : '—';
 
-  const adjEdge = row.adjusted_edge ?? row.edge ?? null;
+  // raw_edge = p_market − p_model. The honest model mispricing, never
+  // zeroed by time-decay filters — what we want to surface to users.
+  // adj_edge is preserved server-side for basket-inclusion checks but
+  // intentionally not shown in this column.
+  const rawEdge = row.raw_edge ?? row.edge ?? null;
   const edgeDisplay = isImpossible
     ? formatPct(row.p_market)
-    : isExcluded || isUnscreened
+    : isExcluded
     ? '—'
-    : adjEdge != null
-    ? formatPct(adjEdge)
+    : rawEdge != null && hasModelData
+    ? formatPct(rawEdge)
     : '—';
 
-  const pModelColor = isImpossible ? '#00875A' : isExcluded || isUnscreened ? '#9B9B9B' : '#0A0A0A';
-  const edgeColor = isImpossible ? '#00875A' : isExcluded || isUnscreened ? '#9B9B9B' : '#1A56DB';
+  const isLong = row.signal === 'long' || row.signal === 'strong_long';
+  const isIneligible = days != null && days > 365;
 
-  const daysColor =
-    days == null ? '#9B9B9B' :
-    days < 30 ? '#00875A' :
-    days <= 90 ? '#0A0A0A' :
-    days <= 180 ? '#6B6B6B' : '#9B9B9B';
+  // Color story:
+  //   shorts        → p_market red, p_model black, edge blue (positive)
+  //   longs         → p_market black, p_model green (model > market),
+  //                   edge green negative
+  //   excluded/etc  → muted greys
+  const pMarketColor = isLong
+    ? '#0A0A0A'
+    : '#CC2936';
+  const pModelColor = isImpossible
+    ? '#00875A'
+    : !hasModelData
+    ? '#9B9B9B'
+    : isLong
+    ? '#00875A'
+    : '#0A0A0A';
+  const edgeColor = isImpossible
+    ? '#00875A'
+    : !hasModelData
+    ? '#9B9B9B'
+    : isLong
+    ? '#00875A'
+    : '#1A56DB';
+
+  // Ineligible markets keep the value but render days in pale grey so the
+  // user can see "edge exists but too far out of basket window".
+  const daysColor = isIneligible
+    ? '#C0C0C0'
+    : days == null ? '#9B9B9B'
+    : days < 30 ? '#00875A'
+    : days <= 90 ? '#0A0A0A'
+    : days <= 180 ? '#6B6B6B'
+    : '#9B9B9B';
+
+  // Hover tint: green for longs, light blue/grey for everything else.
+  const hoverBg = isLong ? '#F0FDF4' : '#F7F8FF';
+  const barColor = isLong ? '#00875A' : '#1A56DB';
 
   return (
     <tr
       ref={ref}
       onMouseEnter={() => setHover(true)}
       onMouseLeave={() => setHover(false)}
-      style={{ borderBottom: '1px solid #E5E5E3', background: hover ? '#F7F7F5' : '#FFFFFF', transition: 'background 150ms ease-out' }}
+      style={{ borderBottom: '1px solid #E5E5E3', background: hover ? hoverBg : '#FFFFFF', transition: 'background 150ms ease-out' }}
     >
       <td style={{ padding: '16px 18px', verticalAlign: 'top' }}>
-        <div style={{ fontSize: 15, color: '#0A0A0A' }} title={row.question}>
-          {truncated}
+        <div style={{ fontSize: 15, color: '#0A0A0A', display: 'flex', alignItems: 'center', gap: 8, flexWrap: 'wrap' }} title={row.question}>
+          <span>{truncated}</span>
+          {row.signal && <SignalBadge signal={row.signal} />}
+          {isFavorite && <TournamentBadge tone="favorite" />}
+          {isTournament && !isFavorite && <TournamentBadge tone="longshot" />}
         </div>
         <div style={{ marginTop: 8, height: 4, width: 600, maxWidth: '100%', background: '#F0F0EE', borderRadius: 2 }}>
           <div
             style={{
               height: '100%',
               width: inView ? targetW : 0,
-              background: '#1A56DB',
+              background: barColor,
               borderRadius: 2,
               transition: 'width 700ms cubic-bezier(0.2, 0.8, 0.2, 1)',
             }}
           />
         </div>
         <div className="font-num" style={{ fontSize: 11, color: '#9B9B9B', marginTop: 6 }}>
-          market: {formatPct(row.p_market)}
+          {isTournament ? 'normalized: ' : 'market: '}{formatPct(displayPMarket)}
         </div>
       </td>
       <td style={{ padding: '16px 18px', verticalAlign: 'top' }}>
@@ -298,17 +439,24 @@ function ScannerRow({ row }: { row: Row }) {
           <CategoryPill category={row.category} />
         </div>
       </td>
-      <td className="font-num" style={{ padding: '16px 18px', textAlign: 'right', fontSize: 15, color: '#CC2936', verticalAlign: 'top' }}>
-        {formatPct(row.p_market)}
+      <td className="font-num" style={{ padding: '16px 18px', textAlign: 'right', fontSize: 15, color: pMarketColor, verticalAlign: 'top' }}>
+        {formatPct(displayPMarket)}
       </td>
       <td className="font-num" style={{ padding: '16px 18px', textAlign: 'right', fontSize: 15, color: pModelColor, verticalAlign: 'top' }}>
         {pModelDisplay}
       </td>
       <td className="font-num" style={{ padding: '16px 18px', textAlign: 'right', fontSize: 15, color: edgeColor, verticalAlign: 'top' }}>
+        {/* Negative sign for longs (edge displayed positive in formatPct
+            because rawEdge is signed — we just prepend a minus if it's
+            actually negative). */}
         {edgeDisplay}
       </td>
-      <td className="font-num" style={{ padding: '16px 18px', textAlign: 'right', fontSize: 13, color: daysColor, verticalAlign: 'top' }}>
-        {days != null ? `${days}d` : '—'}
+      <td
+        className="font-num"
+        style={{ padding: '16px 18px', textAlign: 'right', fontSize: 13, color: daysColor, verticalAlign: 'top' }}
+        title={isIneligible ? 'Outside basket window · edge exists but too far out' : undefined}
+      >
+        {days != null ? `${days}d${isIneligible ? ' ⚠' : ''}` : '—'}
       </td>
       <td className="font-num" style={{ padding: '16px 18px', textAlign: 'right', fontSize: 13, color: '#6B6B6B', verticalAlign: 'top' }}>
         {row.volume != null ? formatVolume(row.volume) : '—'}
@@ -330,13 +478,14 @@ function formatVolume(v: number): string {
 }
 
 function Th({
-  children, align = 'left', sortable, active, onClick,
+  children, align = 'left', sortable, active, onClick, tooltip,
 }: {
   children: React.ReactNode;
   align?: 'left' | 'right';
   sortable?: boolean;
   active?: boolean;
   onClick?: () => void;
+  tooltip?: string;
 }) {
   const [hover, setHover] = useState(false);
   return (
@@ -344,6 +493,7 @@ function Th({
       onClick={sortable ? onClick : undefined}
       onMouseEnter={() => setHover(true)}
       onMouseLeave={() => setHover(false)}
+      title={tooltip}
       style={{
         textAlign: align,
         fontSize: 11,
@@ -416,6 +566,66 @@ function SkeletonRows({ count }: { count: number }) {
         </div>
       ))}
     </div>
+  );
+}
+
+function SignalBadge({ signal }: { signal: NonNullable<Row['signal']> }) {
+  // strong_short / short / weak_short are red shades.
+  // long / strong_long are green shades.
+  // fair_value is grey.
+  const palette: Record<string, { fg: string; bg: string; label: string }> = {
+    strong_short: { fg: '#9F1239', bg: '#FECDD3', label: 'SHORT ↑↑' },
+    short:        { fg: '#CC2936', bg: '#FCE9EC', label: 'SHORT ↑' },
+    weak_short:   { fg: '#CC2936', bg: '#FEF2F2', label: 'SHORT' },
+    fair_value:   { fg: '#6B6B6B', bg: '#F0F0EE', label: 'FAIR' },
+    long:         { fg: '#00875A', bg: '#F0FDF4', label: 'LONG ↓' },
+    strong_long:  { fg: '#005C3D', bg: '#D1FAE5', label: 'LONG ↓↓' },
+  };
+  const p = palette[signal] ?? palette.fair_value;
+  return (
+    <span
+      style={{
+        fontSize: 9,
+        fontWeight: 600,
+        color: p.fg,
+        background: p.bg,
+        padding: '2px 6px',
+        borderRadius: 3,
+        textTransform: 'uppercase',
+        letterSpacing: '0.06em',
+        fontFamily: '"DM Sans", sans-serif',
+        whiteSpace: 'nowrap',
+      }}
+    >
+      {p.label}
+    </span>
+  );
+}
+
+function TournamentBadge({ tone }: { tone: 'favorite' | 'longshot' }) {
+  // Favorite: the market UNDERPRICES this team (edge ≤ 0 after group
+  // renorm) — interesting for the long basket product. Gold/amber.
+  // Longshot: market OVERPRICES this team — short candidate. Red.
+  const isFav = tone === 'favorite';
+  return (
+    <span
+      style={{
+        fontSize: 9,
+        fontWeight: 600,
+        letterSpacing: '0.08em',
+        textTransform: 'uppercase',
+        padding: '2px 6px',
+        borderRadius: 3,
+        background: isFav ? '#FEF3C7' : '#FCE9EC',
+        color: isFav ? '#D97706' : '#CC2936',
+        fontFamily: '"DM Sans", sans-serif',
+      }}
+      title={isFav
+        ? 'Underpriced — tournament normalization marks this side as a favorite (potential long candidate).'
+        : 'Overpriced — tournament normalization marks this side as a longshot (short candidate).'}
+    >
+      {isFav ? 'FAVORITE' : 'LONGSHOT'}
+    </span>
   );
 }
 

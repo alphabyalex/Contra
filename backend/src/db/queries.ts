@@ -146,6 +146,14 @@ export interface ScoredMarket {
   p_market_7d_ago: number | null;
   momentum: number | null;
   momentum_factor: number;
+  // calibration_v5 tournament normalization
+  tournament_group: string | null;
+  is_tournament_market: boolean;
+  normalized_p_market: number | null;
+  is_favorite: boolean;
+  // calibration_v5_1: raw edge (display) decoupled from adj edge (eligibility)
+  raw_edge: number | null;
+  signal: string | null;
 }
 
 export interface TrackedMarket {
@@ -496,6 +504,30 @@ export async function insertNavSnapshot(s: Omit<NavSnapshot, 'id' | 'snapshotted
   return row;
 }
 
+/**
+ * Most recent nav_snapshot for a basket (authoritative current NAV).
+ * Returns null when no snapshot has been written yet, in which case
+ * callers should fall back to 1.0.
+ */
+export async function getLatestNavSnapshot(basketId: string): Promise<NavSnapshot | null> {
+  const sb = getSupabase();
+  if (sb) {
+    const { data, error } = await sb
+      .from('nav_snapshots')
+      .select('*')
+      .eq('basket_id', basketId)
+      .order('snapshotted_at', { ascending: false })
+      .limit(1)
+      .maybeSingle();
+    if (error) throw error;
+    return (data ?? null) as NavSnapshot | null;
+  }
+  const rows = [...mem.nav.values()]
+    .filter((n) => n.basket_id === basketId)
+    .sort((a, b) => b.snapshotted_at.localeCompare(a.snapshotted_at));
+  return rows[0] ?? null;
+}
+
 export async function listNavHistory(basketId: string, limit = 720): Promise<NavSnapshot[]> {
   const sb = getSupabase();
   if (sb) {
@@ -678,6 +710,12 @@ export async function upsertScoredMarket(
     p_market_7d_ago: row.p_market_7d_ago ?? null,
     momentum: row.momentum ?? null,
     momentum_factor: row.momentum_factor ?? 1.0,
+    tournament_group: row.tournament_group ?? null,
+    is_tournament_market: row.is_tournament_market ?? false,
+    normalized_p_market: row.normalized_p_market ?? null,
+    is_favorite: row.is_favorite ?? false,
+    raw_edge: row.raw_edge ?? null,
+    signal: row.signal ?? null,
   };
   const sb = getSupabase();
   if (sb) {

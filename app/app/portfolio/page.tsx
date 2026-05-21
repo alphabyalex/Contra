@@ -95,6 +95,11 @@ export default function PortfolioPage() {
   const { walletAddress, basketPositions, leveragedPositions, recentTransactions, refresh, loading, error } = useContraState();
   const [usdcBalance, setUsdcBalance] = useState<number>(0);
   const [tab, setTab] = useState<Tab>('overview');
+  // The portfolio surface depends on client-only wallet state. Render a
+  // stable shell on the first server pass so React's hydration check
+  // doesn't compare wallet-conditional markup against the server output.
+  const [mounted, setMounted] = useState(false);
+  useEffect(() => setMounted(true), []);
 
   useEffect(() => {
     if (walletAddress) refresh();
@@ -123,15 +128,20 @@ export default function PortfolioPage() {
   }, [wallet.publicKey, connection]);
 
   // ---- stat aggregates ----
+  // Total Deployed = sum of USDC originally put in (never moves once
+  // deposited). Total P&L = sum of unrealized + resolved pnl_usdc values
+  // (moves with NAV). Open Baskets = count of non-finalized positions.
   let unrealizedPnl = 0;
   let resolvedPnl = 0;
   let totalDeployed = 0;
   let openCount = 0;
   for (const p of basketPositions) {
     const status = p.basket?.status ?? 'active';
-    const value = Number(p.current_value_usdc ?? 0);
     const pnl = Number(p.pnl_usdc ?? 0);
-    totalDeployed += value;
+    // usdc_deposited is the cumulative USDC the user put in — never moves.
+    // The backend also exposes entry_usdc as an alias.
+    const entryUsdc = Number(p.usdc_deposited ?? (p as any).entry_usdc ?? 0);
+    totalDeployed += entryUsdc;
     if (status === 'finalized') {
       resolvedPnl += pnl;
     } else {
@@ -197,6 +207,16 @@ export default function PortfolioPage() {
 
   const noWallet = !wallet.publicKey;
   const empty = !noWallet && !loading && holdings.length === 0 && leveragedPositions.length === 0;
+
+  if (!mounted) {
+    return (
+      <div suppressHydrationWarning style={{ background: COLOR.bg, minHeight: 'calc(100vh - 56px)' }}>
+        <div className="max-w-[1200px] mx-auto px-6" style={{ paddingTop: 56, color: COLOR.muted, fontSize: 13 }}>
+          Loading portfolio…
+        </div>
+      </div>
+    );
+  }
 
   return (
     <div style={{ background: COLOR.bg, minHeight: 'calc(100vh - 56px)' }}>
@@ -268,7 +288,11 @@ function StatsRow({
         paddingBottom: 40,
       }}
     >
-      <StatItem label="Total Deployed" value={formatUsd(totalDeployed)} />
+      <StatItem
+        label="Total Deployed"
+        value={formatUsd(totalDeployed)}
+        sub="Amount deposited"
+      />
       <Divider />
       <StatItem label="Open Baskets" value={String(openCount)} />
       <Divider />
@@ -276,12 +300,15 @@ function StatsRow({
         label="Total P&L"
         value={`${totalPnl >= 0 ? '+' : ''}${formatUsd(totalPnl)}`}
         valueColor={pnlColor}
+        sub="Unrealized · updates with NAV"
       />
     </div>
   );
 }
 
-function StatItem({ label, value, valueColor = COLOR.text }: { label: string; value: string; valueColor?: string }) {
+function StatItem({
+  label, value, valueColor = COLOR.text, sub,
+}: { label: string; value: string; valueColor?: string; sub?: string }) {
   return (
     <div style={{ paddingLeft: 24, paddingRight: 24 }}>
       <div
@@ -307,6 +334,11 @@ function StatItem({ label, value, valueColor = COLOR.text }: { label: string; va
       >
         {value}
       </div>
+      {sub && (
+        <div style={{ fontSize: 11, color: COLOR.muted, marginTop: 6, fontFamily: SANS }}>
+          {sub}
+        </div>
+      )}
     </div>
   );
 }
@@ -612,21 +644,24 @@ function HoldingRowEl({ h, total, rowIndex }: { h: HoldingRow; total: number; ro
     >
       <div style={{ display: 'flex', alignItems: 'center', gap: 12, minWidth: 0 }}>
         <Dot color={h.color} />
-        <span style={{ fontFamily: SANS, fontSize: 15, fontWeight: 500, color: COLOR.text }}>
-          {h.name}
-        </span>
-        <span
-          style={{
-            marginLeft: 8,
-            fontSize: 10,
-            color: COLOR.muted,
-            textTransform: 'uppercase',
-            letterSpacing: '0.08em',
-            fontFamily: SANS,
-          }}
-        >
-          {h.subtitle}
-        </span>
+        <div style={{ display: 'flex', flexDirection: 'column', minWidth: 0 }}>
+          <div style={{ display: 'flex', alignItems: 'baseline', gap: 8, flexWrap: 'wrap' }}>
+            <span style={{ fontFamily: SANS, fontSize: 15, fontWeight: 500, color: COLOR.text }}>
+              {h.name}
+            </span>
+            <span style={{ fontSize: 10, color: COLOR.muted, textTransform: 'uppercase', letterSpacing: '0.08em', fontFamily: SANS }}>
+              {h.subtitle}
+            </span>
+          </div>
+          {/* Token count line — only meaningful for basket positions. The
+              USDC pseudo-row has tokens === value, so suppress to avoid
+              "100 tokens" reading as redundant noise next to "$100.00". */}
+          {h.key !== 'usdc' && (
+            <span className="font-num" style={{ fontSize: 11, color: COLOR.muted, marginTop: 2 }}>
+              {h.tokens.toFixed(4)} tokens
+            </span>
+          )}
+        </div>
       </div>
 
       <div
@@ -643,7 +678,25 @@ function HoldingRowEl({ h, total, rowIndex }: { h: HoldingRow; total: number; ro
         <div className="font-num" style={{ fontSize: 16, fontWeight: 400, color: COLOR.text }}>
           {formatUsd(h.value)}
         </div>
-        <div style={{ fontSize: 12, color: COLOR.muted, marginTop: 2 }}>{pct.toFixed(1)}%</div>
+        {h.key !== 'usdc' ? (
+          <div
+            className="font-num"
+            style={{
+              fontSize: 12,
+              color: h.pnl > 0 ? COLOR.profit : h.pnl < 0 ? COLOR.loss : COLOR.muted,
+              marginTop: 2,
+            }}
+          >
+            {h.pnl >= 0 ? '+' : '−'}{formatUsd(Math.abs(h.pnl))}
+            {Number.isFinite(h.pnlPct) && (
+              <span style={{ marginLeft: 6 }}>
+                ({h.pnl >= 0 ? '+' : '−'}{Math.abs(h.pnlPct * 100).toFixed(1)}%)
+              </span>
+            )}
+          </div>
+        ) : (
+          <div style={{ fontSize: 12, color: COLOR.muted, marginTop: 2 }}>{pct.toFixed(1)}%</div>
+        )}
       </div>
 
       {hovered && <HoldingsTooltip h={h} pct={pct} coords={coords} />}
@@ -693,15 +746,22 @@ function HoldingsTooltip({ h, pct, coords }: { h: HoldingRow; pct: number; coord
         }
       `}</style>
       <TooltipRow label="Token" value={h.name} />
-      <TooltipRow label="Value" value={formatUsd(h.value)} mono />
-      <TooltipRow label="Portfolio share" value={`${pct.toFixed(1)}%`} mono />
+      {h.key !== 'usdc' && (
+        <TooltipRow label="Tokens held" value={h.tokens.toFixed(4)} mono />
+      )}
       <TooltipRow label="Entry NAV" value={`$${h.entryNav.toFixed(4)}`} mono />
       <TooltipRow label="Current NAV" value={`$${h.currentNav.toFixed(4)}`} mono />
+      <TooltipRow label="Current Value" value={formatUsd(h.value)} mono />
+      <TooltipRow label="Portfolio share" value={`${pct.toFixed(1)}%`} mono />
       <TooltipRow
         label="Unrealized P&L"
-        value={`${h.pnl >= 0 ? '+' : ''}${formatUsd(h.pnl)}`}
+        value={
+          h.key === 'usdc'
+            ? '—'
+            : `${h.pnl >= 0 ? '+' : '−'}${formatUsd(Math.abs(h.pnl))} (${h.pnl >= 0 ? '+' : '−'}${Math.abs((h.pnlPct ?? 0) * 100).toFixed(1)}%)`
+        }
         mono
-        color={h.pnl >= 0 ? COLOR.profit : COLOR.loss}
+        color={h.key === 'usdc' ? undefined : h.pnl >= 0 ? COLOR.profit : COLOR.loss}
       />
     </div>
   );

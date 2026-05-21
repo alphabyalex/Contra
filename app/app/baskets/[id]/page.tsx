@@ -16,6 +16,25 @@ interface Leg {
   edge: number;
 }
 
+/**
+ * Subtitle term label derived from the basket name + type.
+ *   CTRA-NN odd  → "SHORT TERM"
+ *   CTRA-NN even → "MID TERM"
+ *   CTRA-LXX or type === 'long' → "LONG"
+ *
+ * Falls back to a stringified leverage_type for legacy mock data.
+ */
+function basketTermLabel(basket: { name: string; leverage_type?: string; type?: string }): string {
+  const name = basket?.name ?? '';
+  if (basket?.type === 'long' || /^CTRA-L\d+/i.test(name)) return 'LONG';
+  const m = name.match(/^CTRA-(\d+)/i);
+  if (m) {
+    const n = parseInt(m[1], 10);
+    if (!Number.isNaN(n)) return n % 2 === 1 ? 'SHORT TERM' : 'MID TERM';
+  }
+  return (basket?.leverage_type ?? '').toUpperCase();
+}
+
 export default function BasketDetail() {
   const params = useParams<{ id: string }>();
   const id = params?.id ?? '';
@@ -86,7 +105,7 @@ export default function BasketDetail() {
           <div>
             <h1 style={{ fontSize: 28, fontWeight: 300, color: '#0A0A0A', margin: 0 }}>{basket.name}</h1>
             <div style={{ fontSize: 10, color: '#9B9B9B', textTransform: 'uppercase', letterSpacing: '0.08em', marginTop: 8 }}>
-              {basket.leverage_type} · {basket.category ?? 'mixed'} · {basket.num_legs} legs · status {basket.status}
+              {basketTermLabel(basket)} · {basket.category ?? 'mixed'} · {basket.num_legs} legs · status {basket.status}
             </div>
           </div>
           <div style={{ textAlign: 'right' }}>

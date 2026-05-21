@@ -11,7 +11,7 @@
  *               Click opens the wallet adapter modal.
  */
 
-import { useState } from 'react';
+import { useEffect, useState } from 'react';
 import { useWallet } from '@solana/wallet-adapter-react';
 import { useWalletModal } from '@solana/wallet-adapter-react-ui';
 
@@ -24,6 +24,14 @@ export function ConnectButton() {
   const { publicKey, disconnect, wallet } = useWallet();
   const { setVisible } = useWalletModal();
   const [hover, setHover] = useState(false);
+  // The wallet adapter is client-only; render a stable placeholder on the
+  // server so Next's hydration check doesn't trip on the publicKey switch.
+  const [mounted, setMounted] = useState(false);
+  useEffect(() => setMounted(true), []);
+
+  if (!mounted) {
+    return <div suppressHydrationWarning style={{ width: 130, height: 34 }} />;
+  }
 
   if (!publicKey) {
     return (

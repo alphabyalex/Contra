@@ -29,7 +29,7 @@ import {
 import { persistFinalRatio } from '../services/nav';
 import { weeklyScreener } from '../services/cron';
 import { scoreAllMarkets, classifyCategory } from '../services/ml-scorer';
-import { constructBasket, seedBasket, type BasketDefinition } from '../services/basket-builder';
+import { constructBasket, constructLongBasket, seedBasket, type BasketDefinition } from '../services/basket-builder';
 import {
   getAllActiveMarkets as getAllPoly,
   flattenOutcomes as flattenPoly,
@@ -225,11 +225,14 @@ adminRouter.post('/rescore', async (_req, res) => {
  * Returns the proposed leg list + weights for human review.
  */
 adminRouter.post('/construct-basket', async (req, res) => {
-  const schema = z.object({ type: z.enum(['short', 'mid']) });
+  const schema = z.object({ type: z.enum(['short', 'mid', 'long']) });
   const parsed = schema.safeParse(req.body);
   if (!parsed.success) return res.status(400).json({ error: 'bad_input', detail: parsed.error.flatten() });
   try {
-    const def = await constructBasket(parsed.data.type);
+    const def =
+      parsed.data.type === 'long'
+        ? await constructLongBasket()
+        : await constructBasket(parsed.data.type);
     if (!def) return res.status(422).json({ error: 'insufficient_legs' });
     res.json(def);
   } catch (e) {

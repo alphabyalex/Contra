@@ -1,6 +1,6 @@
 'use client';
 
-import { useMemo, useState } from 'react';
+import { useEffect, useMemo, useState } from 'react';
 import Link from 'next/link';
 import { useWallet } from '@solana/wallet-adapter-react';
 import { WalletMultiButton } from '@solana/wallet-adapter-react-ui';
@@ -37,11 +37,21 @@ export function DepositForm({ basketId, basketName, avgEdge, entryNav, onConfirm
   const [busy, setBusy] = useState(false);
   const [err, setErr] = useState<string | null>(null);
   const [confirmation, setConfirmation] = useState<ConfirmationDetails | null>(null);
+  // Hold a stable placeholder on the server so the wallet-conditional
+  // branch below doesn't trip hydration.
+  const [mounted, setMounted] = useState(false);
+  useEffect(() => setMounted(true), []);
 
   const amt = Number(amount);
   const safeAmt = Number.isFinite(amt) && amt > 0 ? amt : 0;
   const safeEntryNav = Number.isFinite(entryNav) && (entryNav as number) > 0 ? (entryNav as number) : 1;
   const safeEdge = Number.isFinite(avgEdge) ? (avgEdge as number) : 0;
+
+  if (!mounted) {
+    return (
+      <div suppressHydrationWarning className="bg-white" style={{ border: '1px solid #E5E5E3', padding: 20, minHeight: 200 }} />
+    );
+  }
 
   if (!wallet.publicKey) {
     return (

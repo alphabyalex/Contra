@@ -176,7 +176,11 @@ export function startCron(): void {
 
 const SCREEN_MIN_P = 0.02;
 const SCREEN_MAX_P = 0.10;
-const SCREEN_MIN_VOLUME = 500_000;
+// Aligned with ml-scorer's MIN_VOLUME_USD ($100k). Previously $500k but
+// that was inconsistent with the per-row hard exclusion threshold the
+// scorer itself uses — anything between $100k and $500k was passing the
+// scorer's volume gate but never even entered the screener pipeline.
+const SCREEN_MIN_VOLUME = 100_000;
 
 export interface WeeklyScreenSummary {
   candidates: number;     // markets in the price/volume band before cache check
@@ -191,7 +195,7 @@ export interface WeeklyScreenSummary {
  * Runs the screen-then-score pipeline once.
  *
  * 1. Pull active Polymarket markets, flatten to outcomes
- * 2. Filter to longshot range (0.02 ≤ p_market ≤ 0.10) and volume ≥ $500k
+ * 2. Filter to longshot range (0.02 ≤ p_market ≤ 0.10) and volume ≥ $100k
  * 3. Skip any condition_id already in screened_markets
  * 4. Send the rest to Claude via batchScreenMarkets()
  * 5. Score every non-excluded market via scoreAllMarkets()

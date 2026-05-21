@@ -9,6 +9,7 @@
 import { Router } from 'express';
 import {
   getBasket,
+  getLatestNavSnapshot,
   insertLegs,
   listBaskets,
   listLegs,
@@ -26,11 +27,20 @@ basketsRouter.get('/', async (_req, res) => {
     const baskets = await listBaskets();
     const enriched = await Promise.all(
       baskets.map(async (b) => {
-        const legs = await listLegs(b.id);
+        const [legs, snap] = await Promise.all([
+          listLegs(b.id),
+          getLatestNavSnapshot(b.id).catch(() => null),
+        ]);
+        // current_nav is authoritative — written every 2 min by the NAV
+        // cron from market_price_history. The on-the-fly recompute via
+        // computeBasketNav is kept as a fallback for the very first
+        // moments after a basket activates (before the first snapshot).
         const breakdown = computeBasketNav(legs);
+        const currentNav = snap ? Number(snap.nav) : breakdown.nav;
         return {
           ...b,
-          nav: breakdown.nav,
+          nav: currentNav,
+          current_nav: currentNav,
           legs_resolved: breakdown.legsResolved,
           legs_total: breakdown.legsTotal,
           avg_edge: legs.length
@@ -49,9 +59,20 @@ basketsRouter.get('/:id', async (req, res) => {
   try {
     const basket = await getBasket(req.params.id);
     if (!basket) return res.status(404).json({ error: 'not_found' });
-    const legs = await listLegs(basket.id);
+    const [legs, snap] = await Promise.all([
+      listLegs(basket.id),
+      getLatestNavSnapshot(basket.id).catch(() => null),
+    ]);
     const breakdown = computeBasketNav(legs);
-    res.json({ basket, legs, nav: breakdown.nav, breakdown });
+    const currentNav = snap ? Number(snap.nav) : breakdown.nav;
+    res.json({
+      basket,
+      legs,
+      nav: currentNav,
+      current_nav: currentNav,
+      latest_snapshot: snap,
+      breakdown,
+    });
   } catch (e) {
     res.status(500).json({ error: (e as Error).message });
   }

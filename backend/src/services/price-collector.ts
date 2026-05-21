@@ -32,9 +32,12 @@ import {
   getLatestPricePoint,
   getPriceHistory,
   getTrackedMarket,
+  listBaskets,
+  listLegs,
   listTrackedMarkets,
   recordPricePoint,
   updateTrackedMarket,
+  type Leg,
   type TrackedMarket,
 } from '../db/queries';
 
@@ -131,6 +134,50 @@ export async function collectAllPrices(): Promise<CollectAllSummary> {
     return [] as TrackedMarket[];
   });
   console.info(`[price-collector] loaded ${tracked.length} tracked markets from DB`);
+
+  // Pull every leg from every active basket and make sure they're in the
+  // collection list — even if some are missing from tracked_markets
+  // (e.g. seeded before tracking was wired). This guarantees NAV
+  // mark-to-market has fresh prices for every basket leg.
+  const trackedIds = new Set(tracked.map((t) => t.condition_id));
+  let basketLegsAdded = 0;
+  try {
+    const baskets = await listBaskets({ status: 'active' });
+    const resolving = await listBaskets({ status: 'resolving' });
+    const allBaskets = [...baskets, ...resolving];
+    const legArrays = await Promise.all(allBaskets.map((b) => listLegs(b.id)));
+    const allLegs: Leg[] = legArrays.flat().filter((l) => l.outcome == null);
+    for (const leg of allLegs) {
+      if (trackedIds.has(leg.market_id)) continue;
+      // Synthesize a minimal TrackedMarket so the rest of the loop treats
+      // this leg the same as any tracked entry. Cadence falls back to
+      // "minimal" since we have no resolution_date here.
+      tracked.push({
+        id: leg.id,
+        condition_id: leg.market_id,
+        source: leg.source,
+        question: leg.question,
+        token_id: null,
+        category: null,
+        p_market_initial: leg.p_market_entry,
+        p_model_initial: null,
+        edge_initial: null,
+        resolution_date: null,
+        in_basket: true,
+        outcome: null,
+        resolved_at: null,
+        created_at: leg.created_at,
+        updated_at: leg.created_at,
+      });
+      trackedIds.add(leg.market_id);
+      basketLegsAdded += 1;
+    }
+  } catch (e) {
+    console.warn('[price-collector] basket-leg priority enrichment failed:', (e as Error).message);
+  }
+  if (basketLegsAdded > 0) {
+    console.info(`[price-collector] ${basketLegsAdded} basket legs added as priority tracking`);
+  }
 
   let gamma: RawPolymarketMarket[] = [];
   try {

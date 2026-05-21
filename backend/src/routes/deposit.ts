@@ -14,7 +14,7 @@
 import { Router } from 'express';
 import { z } from 'zod';
 import { buildDepositTransaction, confirmSignature } from '../solana/deposit';
-import { getBasket, recordTransaction, upsertPosition } from '../db/queries';
+import { getBasket, getLatestNavSnapshot, recordTransaction, upsertPosition } from '../db/queries';
 
 export const depositRouter: Router = Router();
 
@@ -78,13 +78,22 @@ depositRouter.post('/confirm', async (req, res) => {
     }
     if (!confirmed) return res.status(202).json({ status: 'pending' });
 
-    // Mint was 1:1 USDC → CTRS during Active phase.
+    // Tokens minted at the current NAV: tokens = usdc / current_nav.
+    // First-deposit / pre-snapshot fallback: NAV = 1.0 (Active phase
+    // default). Once nav_snapshots starts ticking, later deposits mint
+    // proportionally fewer/more tokens.
+    const snap = await getLatestNavSnapshot(parsed.data.basketId).catch(() => null);
+    const entryNav = snap && Number.isFinite(Number(snap.nav)) && Number(snap.nav) > 0
+      ? Number(snap.nav)
+      : 1;
+    const tokens = parsed.data.amountUsdc / entryNav;
+
     await upsertPosition({
       basket_id: parsed.data.basketId,
       wallet: parsed.data.walletAddress,
-      tokens_delta: parsed.data.amountUsdc,
+      tokens_delta: tokens,
       usdc_delta: parsed.data.amountUsdc,
-      entry_nav: 1,
+      entry_nav: entryNav,
       entry_tx: parsed.data.signature,
     });
     await recordTransaction({
@@ -92,7 +101,7 @@ depositRouter.post('/confirm', async (req, res) => {
       wallet: parsed.data.walletAddress,
       type: 'deposit',
       usdc_delta: -parsed.data.amountUsdc,
-      tokens_delta: parsed.data.amountUsdc,
+      tokens_delta: tokens,
       tx_signature: parsed.data.signature,
     });
     res.json({ status: 'confirmed', signature: parsed.data.signature });

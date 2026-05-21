@@ -209,6 +209,11 @@ interface ScannerRow {
   category_factor?: number | null;
   volume_factor?: number | null;
   include_in_basket?: boolean | null;
+  // calibration_v5 tournament normalization
+  tournament_group?: string | null;
+  is_tournament_market?: boolean;
+  normalized_p_market?: number | null;
+  is_favorite?: boolean;
 }
 interface RecentExcluded {
   question: string;
@@ -298,6 +303,10 @@ function ScreenerSummarySection() {
             </table>
           </div>
 
+          <TournamentSummary rows={rows ?? []} />
+
+          <LongBasketCandidates rows={rows ?? []} />
+
           {recent && recent.length > 0 && (
             <div>
               <div style={{ ...sectionLabel, marginBottom: 8 }}>10 most recently excluded</div>
@@ -323,6 +332,142 @@ function ScreenerSummarySection() {
           )}
         </>
       )}
+    </div>
+  );
+}
+
+function LongBasketCandidates({ rows }: { rows: ScannerRow[] }) {
+  // signal-based filter; "long" + "strong_long" markers come from
+  // calibration_v5_1's classifySignal.
+  const candidates = rows
+    .filter((r) => (r as any).signal === 'long' || (r as any).signal === 'strong_long')
+    .sort((a, b) => Number(a.adjusted_edge ?? 0) - Number(b.adjusted_edge ?? 0));
+  if (candidates.length === 0) return null;
+  return (
+    <div style={{ marginTop: 28 }}>
+      <div style={{ ...sectionLabel, color: colors.positive, marginBottom: 8 }}>
+        Underpriced Markets — Long Basket Candidates
+      </div>
+      <table style={{ width: '100%', borderCollapse: 'collapse', fontSize: 13 }}>
+        <thead>
+          <tr style={{ borderBottom: `1px solid ${colors.border}`, color: colors.faint }}>
+            <Th>Market</Th>
+            <Th>Tournament Group</Th>
+            <Th align="right">Normalized P_market</Th>
+            <Th align="right">P_model</Th>
+            <Th align="right">Raw Edge</Th>
+            <Th align="right">Signal</Th>
+          </tr>
+        </thead>
+        <tbody>
+          {candidates.slice(0, 15).map((r) => {
+            const sig = String((r as any).signal ?? '-');
+            const rawEdge = Number((r as any).raw_edge ?? r.edge ?? 0);
+            const normP = (r as any).normalized_p_market != null
+              ? Number((r as any).normalized_p_market)
+              : r.p_market;
+            const pModel = Number((r as any).p_model ?? 0);
+            return (
+              <tr key={r.marketId} style={{ borderBottom: `1px solid ${colors.border}` }}>
+                <td style={{ padding: '10px 8px', maxWidth: 360 }}>{r.question}</td>
+                <td style={{ padding: '10px 8px', color: colors.muted, fontFamily: '"IBM Plex Mono", monospace', fontSize: 12 }}>
+                  {r.tournament_group ?? '—'}
+                </td>
+                <td style={{ padding: '10px 8px', textAlign: 'right', ...numCell }}>
+                  {(normP * 100).toFixed(2)}%
+                </td>
+                <td style={{ padding: '10px 8px', textAlign: 'right', ...numCell }}>
+                  {(pModel * 100).toFixed(2)}%
+                </td>
+                <td style={{ padding: '10px 8px', textAlign: 'right', ...numCell, color: colors.positive }}>
+                  {(rawEdge * 100).toFixed(2)}%
+                </td>
+                <td style={{ padding: '10px 8px', textAlign: 'right', ...numCell, color: colors.positive }}>
+                  {sig}
+                </td>
+              </tr>
+            );
+          })}
+        </tbody>
+      </table>
+      <div style={{ marginTop: 8, fontSize: 11, color: colors.muted }}>
+        These markets have raw_edge &lt; 0 — the model thinks they're underpriced. Candidates for the CTRA-L long basket (YES positions).
+      </div>
+    </div>
+  );
+}
+
+function TournamentSummary({ rows }: { rows: ScannerRow[] }) {
+  // Group by tournament_group. Rows where the field is present came from
+  // the scanner route's in-memory normalization pass (calibration_v5).
+  const groups = new Map<string, ScannerRow[]>();
+  for (const r of rows) {
+    if (!r.tournament_group) continue;
+    const arr = groups.get(r.tournament_group) ?? [];
+    arr.push(r);
+    groups.set(r.tournament_group, arr);
+  }
+  if (groups.size === 0) return null;
+
+  const entries = Array.from(groups.entries()).map(([key, members]) => {
+    const favorites = members.filter((m) => m.is_favorite).length;
+    const longshots = members.filter((m) => m.is_tournament_market && !m.is_favorite).length;
+    const avgLongshotEdge = longshots > 0
+      ? members
+          .filter((m) => m.is_tournament_market && !m.is_favorite)
+          .reduce((s, m) => s + Number(m.adjusted_edge ?? m.edge ?? 0), 0) / longshots
+      : 0;
+    const normalizedHere = members.filter((m) => m.is_tournament_market).length;
+    return { key, members, favorites, longshots, avgLongshotEdge, normalizedHere };
+  });
+  entries.sort((a, b) => b.members.length - a.members.length);
+
+  return (
+    <div style={{ marginTop: 28 }}>
+      <div style={{ ...sectionLabel, marginBottom: 8 }}>Tournament Groups</div>
+      <table style={{ width: '100%', borderCollapse: 'collapse', fontSize: 13 }}>
+        <thead>
+          <tr style={{ borderBottom: `1px solid ${colors.border}`, color: colors.faint }}>
+            <Th>Group</Th>
+            <Th align="right">Teams</Th>
+            <Th align="right">Favorites (excl.)</Th>
+            <Th align="right">Longshots (incl.)</Th>
+            <Th align="right">Avg longshot edge</Th>
+          </tr>
+        </thead>
+        <tbody>
+          {entries.map((g) => {
+            const normalized = g.normalizedHere > 0;
+            return (
+              <tr key={g.key} style={{ borderBottom: `1px solid ${colors.border}` }}>
+                <td style={{ padding: '10px 8px' }}>
+                  <code style={{ fontFamily: '"IBM Plex Mono", monospace', fontSize: 12 }}>{g.key}</code>
+                  {!normalized && (
+                    <span style={{ marginLeft: 8, fontSize: 10, color: colors.muted, fontStyle: 'italic' }}>
+                      (only tail observed — normalization skipped)
+                    </span>
+                  )}
+                </td>
+                <td style={{ padding: '10px 8px', textAlign: 'right', ...numCell }}>{g.members.length}</td>
+                <td style={{ padding: '10px 8px', textAlign: 'right', ...numCell, color: colors.positive }}>
+                  {g.favorites}
+                </td>
+                <td style={{ padding: '10px 8px', textAlign: 'right', ...numCell, color: colors.negative }}>
+                  {g.longshots}
+                </td>
+                <td style={{ padding: '10px 8px', textAlign: 'right', ...numCell }}>
+                  {normalized ? `${(g.avgLongshotEdge * 100).toFixed(2)}%` : '—'}
+                </td>
+              </tr>
+            );
+          })}
+        </tbody>
+      </table>
+      <div style={{ marginTop: 8, fontSize: 11, color: colors.muted }}>
+        Groups are detected via question-text regex (e.g. "2026 FIFA World Cup"). When the screener has only
+        captured the longshot tail of a tournament (sum of p_market &lt; 0.5), normalization is skipped and rows
+        fall back to per-row scoring.
+      </div>
     </div>
   );
 }
@@ -354,11 +499,11 @@ interface BasketDefinition {
 
 function BasketControlsSection() {
   const [proposal, setProposal] = useState<BasketDefinition | null>(null);
-  const [busy, setBusy] = useState<'short' | 'mid' | 'seed' | null>(null);
+  const [busy, setBusy] = useState<'short' | 'mid' | 'long' | 'seed' | null>(null);
   const [err, setErr] = useState<string | null>(null);
   const [seeded, setSeeded] = useState<{ name: string; legs_count: number } | null>(null);
 
-  const construct = async (type: 'short' | 'mid') => {
+  const construct = async (type: 'short' | 'mid' | 'long') => {
     setBusy(type); setErr(null); setProposal(null); setSeeded(null);
     try {
       const def = await adminPost<BasketDefinition>('/api/admin/construct-basket', { type });
@@ -391,9 +536,10 @@ function BasketControlsSection() {
     <div style={cardStyle}>
       <div style={sectionLabel}>3 · Basket Controls</div>
       <h2 style={sectionHeading}>Construct + seed CTRA baskets</h2>
-      <div style={{ display: 'flex', gap: 12, marginBottom: 16 }}>
+      <div style={{ display: 'flex', gap: 12, marginBottom: 16, flexWrap: 'wrap' }}>
         <Button label="Construct Short Basket" onClick={() => construct('short')} disabled={!!busy} loading={busy === 'short'} />
-        <Button label="Construct Mid Basket" onClick={() => construct('mid')} disabled={!!busy} loading={busy === 'mid'} />
+        <Button label="Construct Mid Basket"   onClick={() => construct('mid')}   disabled={!!busy} loading={busy === 'mid'} />
+        <Button label="Construct Long Basket"  onClick={() => construct('long')}  disabled={!!busy} loading={busy === 'long'} />
       </div>
       {err && <div style={{ color: colors.negative, marginBottom: 12 }}>error: {err}</div>}
       {seeded && (

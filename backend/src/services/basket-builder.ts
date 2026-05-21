@@ -178,7 +178,7 @@ function capitalize(s: string) {
 // only emits the 1X base — the leverage tx flow handles the variants.
 // =====================================================================
 
-export type BasketType = 'short' | 'mid';
+export type BasketType = 'short' | 'mid' | 'long';
 
 export interface BasketDefinition {
   name: string;                       // e.g. "CTRA-03"
@@ -431,15 +431,155 @@ export async function constructBasket(type: BasketType): Promise<BasketDefinitio
   };
 }
 
+// =====================================================================
+// Long basket — underpriced favorites (tournament + non-tournament)
+// =====================================================================
+
+/**
+ * Build a YES-position long basket from markets whose model says they're
+ * underpriced. Tournament favorites with normalized raw_edge < 0 are the
+ * primary source; non-tournament markets with explicit signal='long' or
+ * 'strong_long' fill in.
+ *
+ * Output uses the same BasketLeg structure as the short builder so the
+ * on-chain init flow stays uniform, but each leg's pMarketEntry is the
+ * normalized (vig-removed) probability when available — we want the long
+ * basket to track the model's view of fair price, not the raw market mid.
+ */
+export async function constructLongBasket(): Promise<BasketDefinition | null> {
+  // 1. In-DB long candidates (signal='long' or 'strong_long')
+  const scored = await listScoredMarkets();
+  const dbCandidates = scored.filter((s) => {
+    const sig = (s as any).signal as string | undefined;
+    const rawEdge = Number((s as any).raw_edge ?? s.edge ?? 0);
+    return sig === 'long' || sig === 'strong_long' || rawEdge < -0.01;
+  });
+
+  // 2. Tournament favorites from the ephemeral cache populated by the
+  //    most recent applyTournamentNormalization run.
+  const { getTournamentFavorites } = await import('./ml-scorer');
+  const favorites = getTournamentFavorites();
+
+  interface LongCandidate {
+    conditionId: string;
+    source: string;
+    question: string;
+    category: string;
+    pMarket: number;
+    normalizedPMarket: number | null;
+    pModel: number;
+    rawEdge: number;
+    daysToClose: number | null;
+  }
+
+  const candidates: LongCandidate[] = [
+    ...dbCandidates.map((s) => ({
+      conditionId: s.condition_id,
+      source: s.source,
+      question: s.question,
+      category: s.category ?? classifyCategory(s.question),
+      pMarket: Number(s.p_market ?? 0),
+      normalizedPMarket: (s as any).normalized_p_market != null ? Number((s as any).normalized_p_market) : null,
+      pModel: Number(s.p_model ?? 0),
+      rawEdge: Number((s as any).raw_edge ?? s.edge ?? 0),
+      daysToClose: s.days_to_close,
+    })),
+    ...favorites.map((f) => ({
+      conditionId: f.condition_id,
+      source: f.source,
+      question: f.question,
+      category: f.category,
+      pMarket: f.p_market,
+      normalizedPMarket: f.normalized_p_market,
+      pModel: f.p_model,
+      rawEdge: f.raw_edge,
+      daysToClose: f.days_to_close,
+    })),
+  ];
+
+  if (candidates.length === 0) return null;
+
+  // Sort by most negative raw_edge first (most underpriced) and apply
+  // the same category cap as the short builder. Long basket doesn't enforce
+  // a resolution window — favorites span tournament dates.
+  const sorted = [...candidates].sort((a, b) => a.rawEdge - b.rawEdge);
+  const counts: Record<string, number> = {};
+  const capped: LongCandidate[] = [];
+  for (const c of sorted) {
+    const cat = c.category ?? 'other';
+    counts[cat] = counts[cat] ?? 0;
+    if (counts[cat] >= MAX_LEGS_PER_CATEGORY) continue;
+    counts[cat] += 1;
+    capped.push(c);
+  }
+
+  if (capped.length < Math.min(MIN_LEG_COUNT, 5)) return null;
+
+  const chosen = capped.slice(0, TARGET_LEG_COUNT);
+  const N = chosen.length;
+  const equalWeight = 1 / N;
+  const scaled = chosen.map(() => Math.round(equalWeight * WEIGHT_TOTAL_SCALED));
+  let drift = WEIGHT_TOTAL_SCALED - scaled.reduce((a, b) => a + b, 0);
+  let i = 0;
+  while (drift !== 0) {
+    scaled[i % N] += drift > 0 ? 1 : -1;
+    drift += drift > 0 ? -1 : 1;
+    i += 1;
+  }
+
+  const legs: BasketLeg[] = chosen.map((c, idx) => {
+    const entryP = c.normalizedPMarket ?? c.pMarket;
+    return {
+      legIndex: idx,
+      source: c.source,
+      conditionId: c.conditionId,
+      question: c.question,
+      category: c.category,
+      pMarket: entryP,
+      pModel: c.pModel,
+      edge: c.rawEdge,
+      weight: scaled[idx] / WEIGHT_TOTAL_SCALED,
+      weightScaled: scaled[idx],
+      pMarketScaled: Math.max(1, Math.min(PRICE_SCALE - 1, Math.round(entryP * PRICE_SCALE))),
+      endDateIso: null,
+      daysToClose: c.daysToClose,
+      impossible: false,
+      tokenId: null,
+    };
+  });
+
+  const num = await nextCtraNumber('mid'); // long baskets reuse the even sequence
+  const name = `CTRA-L${String(num).padStart(2, '0')}`;
+  const breakdown: Record<string, number> = {};
+  for (const l of legs) breakdown[l.category] = (breakdown[l.category] ?? 0) + 1;
+  const avgEdge = legs.reduce((s, l) => s + l.edge, 0) / legs.length;
+
+  return {
+    name,
+    type: 'long',
+    description:
+      `Long basket — ${legs.length} underpriced markets, avg edge ${avgEdge.toFixed(3)} ` +
+      `(negative = underpriced from the model's view).`,
+    legs,
+    weights: Object.fromEntries(legs.map((l) => [l.conditionId, l.weight])),
+    category_breakdown: breakdown,
+    avg_edge: avgEdge,
+    impossible_count: 0,
+    resolution_window_days: { min: 0, max: 730 }, // tournaments can be 6-18 months out
+  };
+}
+
 /**
  * Persist a basket: writes baskets row + legs rows + prediction_log
  * entries + flips tracked_markets.in_basket. Returns the new basket_id.
  */
 export async function seedBasket(definition: BasketDefinition): Promise<string> {
-  // Map our 'short'/'mid' naming to the existing leverage_type column.
-  // 'short'→'aggressive' (50 legs target), 'mid'→'conservative' (longer
-  // resolution horizon). Exact mapping is cosmetic — DB enum constraint.
-  const leverageType: DbLeverageType = definition.type === 'short' ? 'aggressive' : 'conservative';
+  // Map our 'short'/'mid'/'long' naming to the existing leverage_type column.
+  // The on-chain side doesn't know about long; the column is just a tag.
+  const leverageType: DbLeverageType =
+    definition.type === 'short' ? 'aggressive' :
+    definition.type === 'long'  ? 'aggressive' :
+    'conservative';
 
   const basket = await createBasket({
     name: definition.name,

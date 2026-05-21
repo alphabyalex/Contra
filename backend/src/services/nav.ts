@@ -159,6 +159,7 @@ export async function loadCurrentPrices(legs: Leg[]): Promise<Map<string, number
 export async function snapshotBasket(
   basketId: string,
   priceLookup?: Map<string, number>,
+  basketName?: string,
 ): Promise<NavBreakdown> {
   const legs = await listLegs(basketId);
   if (legs.length === 0) {
@@ -171,6 +172,15 @@ export async function snapshotBasket(
     nav: breakdown.nav,
     legs_resolved: breakdown.legsResolved,
   });
+  const openLegs = breakdown.contributions.filter((c) => c.status === 'open').length;
+  const livePriced = breakdown.contributions.filter(
+    (c) => c.status === 'open' && c.currentPMarket != null,
+  ).length;
+  const label = basketName ?? basketId.slice(0, 8);
+  console.info(
+    `[nav] ${label}: computed NAV ${breakdown.nav.toFixed(4)} from ${livePriced}/${openLegs} legs with live prices` +
+      (breakdown.legsResolved > 0 ? ` (+${breakdown.legsResolved} resolved)` : ''),
+  );
   return breakdown;
 }
 
@@ -182,7 +192,7 @@ export async function snapshotAllActive(priceLookup?: Map<string, number>): Prom
   let n = 0;
   for (const b of targets) {
     try {
-      await snapshotBasket(b.id, priceLookup);
+      await snapshotBasket(b.id, priceLookup, b.name);
       n += 1;
     } catch (e) {
       console.warn(`[nav] snapshot failed for ${b.id}:`, (e as Error).message);

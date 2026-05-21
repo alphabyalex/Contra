@@ -7,6 +7,39 @@
 
 import { BACKEND_URL } from './tokens';
 
+/** Shape of a single scanner row returned by /api/scanner/markets. */
+export interface ScannerRowAPI {
+  question: string;
+  source: 'kalshi' | 'polymarket';
+  marketId: string;
+  outcomeLabel?: string;
+  p_market: number;
+  volume?: number;
+  daysToClose?: number | null;
+  endDateIso?: string;
+  category?: string;
+  screened?: boolean;
+  excluded?: boolean;
+  impossible?: boolean;
+  exclusion_reason?: string | null;
+  p_model?: number | null;
+  edge?: number | null;
+  raw_edge?: number | null;
+  adjusted_edge?: number | null;
+  signal?: 'strong_short' | 'short' | 'weak_short' | 'fair_value' | 'long' | 'strong_long' | null;
+  time_factor?: number | null;
+  category_factor?: number | null;
+  volume_factor?: number | null;
+  include_in_basket?: boolean | null;
+  tournament_group?: string | null;
+  is_tournament_market?: boolean;
+  normalized_p_market?: number | null;
+  is_favorite?: boolean;
+  is_ephemeral?: boolean;
+  /** raw_edge × log10(volume + 1) — set on category-grouped responses. */
+  score?: number;
+}
+
 async function jsonRequest<T>(path: string, init: RequestInit = {}): Promise<T> {
   const res = await fetch(`${BACKEND_URL}${path}`, {
     headers: { 'Content-Type': 'application/json', ...(init.headers ?? {}) },
@@ -82,34 +115,27 @@ export const api = {
       return jsonRequest<{
         at: number;
         count: number;
+        /** Curated-pool size (scored_markets only — excludes ephemeral). */
+        watched_count?: number;
         counts: { polymarket: number; kalshi: number };
         kalshi_error?: string | null;
         kalshi_throttled?: boolean;
         sort?: string;
         search?: string | null;
         total_after_filter?: number;
-        rows: Array<{
-          question: string;
-          source: 'kalshi' | 'polymarket';
-          marketId: string;
-          outcomeLabel?: string;
-          p_market: number;
-          volume?: number;
-          daysToClose?: number | null;
-          endDateIso?: string;
-          category?: string;
-          screened?: boolean;
-          excluded?: boolean;
-          impossible?: boolean;
-          exclusion_reason?: string | null;
-          p_model?: number | null;
-          edge?: number | null;
-          adjusted_edge?: number | null;
-          time_factor?: number | null;
-          category_factor?: number | null;
-          volume_factor?: number | null;
-          include_in_basket?: boolean | null;
+        /** Layout hint set by the backend: 'category_grouped' for default,
+         *  'search' for any query response. */
+        view?: 'category_grouped' | 'search';
+        /** Present only when view = 'category_grouped'. */
+        groups?: Array<{
+          category: string;
+          short_count: number;
+          long_count: number;
+          /** Index inside `markets` where the LONG section starts (sports). */
+          long_section_start: number | null;
+          markets: ScannerRowAPI[];
         }>;
+        rows: ScannerRowAPI[];
       }>(`/api/scanner/markets?${p.toString()}`);
     },
     /** Returns the EventSource — caller must close it on unmount. */

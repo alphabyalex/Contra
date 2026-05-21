@@ -1,35 +1,45 @@
 /**
- * ML scorer — calibration_v4.
+ * ML scorer — calibration_v5.
  *
- * Invariant: adj_edge = p_market − p_model_shown (the persisted p_model
- * field). Factors adjust p_model, NOT the edge directly. p_model is
- * always capped at p_market × 0.95 so some edge is preserved.
+ * Invariant: adj_edge = p_market − p_model_shown.
  *
  * Pipeline (per market):
  *   Layer 1  base calibration
- *     non-sports → p_calib from 11-bucket lookup
- *     sports     → tiered within-probability rule (replaces lookup):
- *                    p_market > 0.08 → 0.75 × p_market   (contender)
- *                    p_market > 0.05 → 0.35 × p_market   (moderate)
- *                    p_market > 0.02 → 0.90 × lookup     (genuine longshot)
- *                    else            → lookup            (extreme longshot)
+ *     1a. Detect sub-category (FIFA / NBA / NHL / MLB / NFL / Tennis;
+ *         US-primary / US-general / US-state / international politics).
+ *     1b. If a sub-category matches, use its tiered formula directly.
+ *         p_market > t1  →   p_market × f_high
+ *         p_market > t2  →   p_market × f_mid
+ *         else           →   table_lookup × f_tail
+ *     1c. If sports without a sub-category match: use legacy sports tier.
+ *     1d. Otherwise: standard 11-bucket calibration lookup.
+ *
+ *     Sub-category tiers bake the category bias into the base p_model, so
+ *     category_factor is set to 1.0 for those rows — no double-dip.
+ *
  *   Layer 2  hard exclusion → days <3 / days >365 / volume <100k
  *                              → adj_edge = 0, include = false, stop
- *   Layer 3  factor stack applied to p_model:
+ *
+ *   Layer 3  factor stack on p_model (NOT on edge):
  *              p_model_adj = base × time_factor × category_factor × volume_factor
  *              p_model_adj = min(p_model_adj, p_market × 0.95)
  *              adj_edge    = p_market − p_model_adj
+ *
  *   Layer 4  impossible override:
- *              p_model_adj = 0, adj_edge = p_market, include if adj_edge ≥ 0.02
+ *              p_model_adj = 0, adj_edge = p_market, include if ≥ 0.02
  *
- *   category_factor = getDomainHorizonMultiplier(category, days_to_close)
- *
- *   momentum_factor is persisted (default 1.0) and applied by the daily
- *   momentum job by adjusting p_model so the adj_edge = p_market − p_model
- *   invariant continues to hold.
+ *   Layer 5  tournament group renormalization (cross-row, post-scoring).
+ *              Markets in the same tournament are mutually exclusive — one
+ *              team can win. The longshot bias pushes probability AWAY from
+ *              favorites and TOWARD longshots, so renormalizing the group
+ *              both for vig (p_market) and for the calibration's overconfidence
+ *              on favorites (p_model) gives a cleaner picture of who is
+ *              underpriced (favorite, edge ≤ 0) vs overpriced (longshot,
+ *              edge > 0).
  *
  * Inclusion gate (after layers):
- *   adj_edge ≥ 0.03 AND p_market ∈ [0.02, 0.12] AND not excluded.
+ *   Non-tournament: adj_edge ≥ 0.03 AND p_market ∈ [0.02, 0.12] AND not excluded.
+ *   Tournament:     normalized edge > 0.02 → include; edge ≤ 0 → favorite, excluded.
  */
 
 import {
@@ -39,6 +49,7 @@ import {
   type ScreenedMarket,
   type ScoredMarket,
 } from '../db/queries';
+import { getAllActiveMarkets, flattenOutcomes, type RawPolymarketMarket } from './polymarket';
 
 interface CalibrationBucket {
   min: number;
@@ -61,13 +72,14 @@ export const CALIBRATION_TABLE: CalibrationBucket[] = [
   { min: 0.90, max: 1.01, p_model: 0.9182, n: 685 },
 ];
 
-export const MODEL_VERSION = 'calibration_v4';
+export const MODEL_VERSION = 'calibration_v5_1';
 
 /** p_model_adjusted is never allowed above p_market × P_MODEL_CAP_FRAC. */
 export const P_MODEL_CAP_FRAC = 0.95;
 
-// Inclusion gate (post-layered).
-export const EDGE_INCLUDE_THRESHOLD = 0.03;
+// Inclusion gates.
+export const EDGE_INCLUDE_THRESHOLD = 0.03;              // non-tournament
+export const TOURNAMENT_EDGE_INCLUDE_THRESHOLD = 0.02;   // tournament-normalized
 export const IMPOSSIBLE_INCLUDE_THRESHOLD = 0.02;
 export const P_MARKET_INCLUDE_MIN = 0.02;
 export const P_MARKET_INCLUDE_MAX = 0.12;
@@ -78,7 +90,7 @@ export const MAX_DAYS_TO_CLOSE = 365;
 export const MIN_VOLUME_USD = 100_000;
 
 // ---------------------------------------------------------------------
-// Pure layer functions
+// Base lookups
 // ---------------------------------------------------------------------
 
 export function getPModel(p_market: number): number {
@@ -92,36 +104,171 @@ export function getPModel(p_market: number): number {
 }
 
 /**
- * Sports-only tiered base p_model. Replaces the standard CALIBRATION_TABLE
- * lookup for sports markets where the question is structurally "does
- * country X / team X win the tournament" — outright lookups badly
- * undershoot contenders (Brazil at 8% is not a 1.7% longshot).
+ * Generic sports tier — used as the fallback for sports markets that don't
+ * match any of the more specific sub-category rules.
  */
 export function getSportsCalibratedPModel(p_market: number): number {
   if (!Number.isFinite(p_market)) return 0;
-  if (p_market > 0.08) return p_market * 0.75;       // contender, ~25% overpriced max
-  if (p_market > 0.05) return p_market * 0.35;       // moderate longshot
-  if (p_market > 0.02) return getPModel(p_market) * 0.90; // genuine longshot, strong bias
-  return getPModel(p_market);                        // extreme longshot, full bias
-}
-
-export function getBasePModel(p_market: number, category: string | null): number {
-  return (category ?? 'other').toLowerCase() === 'sports'
-    ? getSportsCalibratedPModel(p_market)
-    : getPModel(p_market);
+  if (p_market > 0.08) return p_market * 0.75;
+  if (p_market > 0.05) return p_market * 0.35;
+  if (p_market > 0.02) return getPModel(p_market) * 0.90;
+  return getPModel(p_market);
 }
 
 export function getEdge(p_market: number, p_model: number): number {
   return p_market - p_model;
 }
 
+// ---------------------------------------------------------------------
+// Sports sub-category detection + tier rules
+// ---------------------------------------------------------------------
+
+export type SportsSubcategory =
+  | 'fifa' | 'nba' | 'nhl' | 'mlb' | 'nfl' | 'tennis' | null;
+
+export function detectSportsSubcategory(question: string): SportsSubcategory {
+  const q = (question || '').toLowerCase();
+  if (/\b(world cup|fifa)\b/.test(q)) return 'fifa';
+  if (/\b(nba|nba finals|nba playoffs|western conference|eastern conference)\b/.test(q)) return 'nba';
+  if (/\b(stanley cup|nhl)\b/.test(q)) return 'nhl';
+  if (/\b(world series|mlb)\b/.test(q)) return 'mlb';
+  if (/\b(super bowl|nfl)\b/.test(q)) return 'nfl';
+  if (/\b(wimbledon|french open|us open|australian open)\b/.test(q)) return 'tennis';
+  return null;
+}
+
+export function getSportsSubcategoryPModel(sub: SportsSubcategory, p_market: number): number {
+  if (!Number.isFinite(p_market)) return 0;
+  switch (sub) {
+    case 'fifa':
+      if (p_market > 0.15) return p_market * 0.88;
+      if (p_market > 0.08) return p_market * 0.75;
+      if (p_market > 0.04) return p_market * 0.35;
+      return getPModel(p_market) * 0.85;
+    case 'nba':
+      if (p_market > 0.08) return p_market * 0.70;
+      if (p_market > 0.04) return p_market * 0.40;
+      return getPModel(p_market) * 0.90;
+    case 'nhl':
+      if (p_market > 0.08) return p_market * 0.82;
+      if (p_market > 0.04) return p_market * 0.45;
+      return getPModel(p_market) * 0.92;
+    case 'mlb':
+      if (p_market > 0.08) return p_market * 0.75;
+      if (p_market > 0.04) return p_market * 0.42;
+      return getPModel(p_market) * 0.88;
+    case 'nfl':
+      if (p_market > 0.08) return p_market * 0.78;
+      if (p_market > 0.04) return p_market * 0.44;
+      return getPModel(p_market) * 0.88;
+    case 'tennis':
+      if (p_market > 0.08) return p_market * 0.65;
+      if (p_market > 0.04) return p_market * 0.32;
+      return getPModel(p_market) * 0.80;
+    default:
+      return getSportsCalibratedPModel(p_market);
+  }
+}
+
+// ---------------------------------------------------------------------
+// Politics sub-category detection + tier rules
+// ---------------------------------------------------------------------
+
+export type PoliticsSubcategory =
+  | 'us_primary' | 'us_general' | 'us_state' | 'international' | null;
+
+export function detectPoliticsSubcategory(question: string): PoliticsSubcategory {
+  const q = (question || '').toLowerCase();
+  if (/\b(nomination|democratic primary|republican primary|presidential nomination|presidential nominee)\b/.test(q)) {
+    return 'us_primary';
+  }
+  if (/\b(us presidential election|win the \d{4} us presidential|win the \d{4} presidential election)\b/.test(q)) {
+    return 'us_general';
+  }
+  if (/\b(governor|senate|mayoral|gubernatorial)\b/.test(q)) {
+    return 'us_state';
+  }
+  if (/\b(election|prime minister|parliament|chancellor|prime\b)\b/.test(q)) {
+    return 'international';
+  }
+  return null;
+}
+
+export function getPoliticsSubcategoryPModel(sub: PoliticsSubcategory, p_market: number): number {
+  if (!Number.isFinite(p_market)) return 0;
+  switch (sub) {
+    case 'us_primary':
+      if (p_market > 0.08) return p_market * 0.55;
+      if (p_market > 0.04) return p_market * 0.30;
+      return getPModel(p_market) * 0.65;
+    case 'us_general':
+      if (p_market > 0.08) return p_market * 0.70;
+      if (p_market > 0.04) return p_market * 0.45;
+      return getPModel(p_market) * 0.75;
+    case 'us_state':
+      if (p_market > 0.08) return p_market * 0.60;
+      if (p_market > 0.04) return p_market * 0.35;
+      return getPModel(p_market) * 0.70;
+    case 'international':
+      return getPModel(p_market) * 0.80;
+    default:
+      return getPModel(p_market);
+  }
+}
+
+// ---------------------------------------------------------------------
+// Base p_model dispatch (returns model + flag indicating sub-cat baked in)
+// ---------------------------------------------------------------------
+
+export interface BaseModelResult {
+  p_model: number;
+  tier_baked: boolean;
+}
+
+export function getBasePModelV5(
+  p_market: number,
+  question: string,
+  category: string | null,
+): BaseModelResult {
+  const cat = (category ?? '').toLowerCase();
+  if (cat === 'sports') {
+    const sub = detectSportsSubcategory(question);
+    if (sub) return { p_model: getSportsSubcategoryPModel(sub, p_market), tier_baked: true };
+    // No matched sub-category for sports → legacy tier still applies and is
+    // already calibrated, so bake the category in.
+    return { p_model: getSportsCalibratedPModel(p_market), tier_baked: true };
+  }
+  if (cat === 'politics') {
+    const sub = detectPoliticsSubcategory(question);
+    if (sub) return { p_model: getPoliticsSubcategoryPModel(sub, p_market), tier_baked: true };
+  }
+  return { p_model: getPModel(p_market), tier_baked: false };
+}
+
+// Legacy helper kept for any callers that asked for "base p_model" before
+// the v5 split. Prefer getBasePModelV5 in new code.
+export function getBasePModel(p_market: number, category: string | null): number {
+  return getBasePModelV5(p_market, '', category).p_model;
+}
+
+// ---------------------------------------------------------------------
+// Category / time / volume factors
+// ---------------------------------------------------------------------
+
+/**
+ * Time decay applied to raw_edge to produce adj_edge. Far-future markets
+ * carry real mispricing (raw_edge stays unchanged) but eligibility for a
+ * basket position decays — a 2028 election's 1.9% edge becomes a 0.19%
+ * adj_edge that can't pass the 0.03 inclusion gate.
+ */
 export function getTimeFactor(days: number | null): number {
   if (days == null) return 1.0;
-  if (days < 7) return 1.20;       // technically excluded by Layer 2 below 3
-  if (days <= 30) return 1.20;
+  if (days < 30) return 1.20;
   if (days <= 90) return 1.00;
-  if (days <= 180) return 0.80;
-  return 0.50;                     // 180-365; >365 excluded by Layer 2
+  if (days <= 180) return 0.70;
+  if (days <= 365) return 0.40;
+  if (days <= 730) return 0.20;
+  return 0.10;
 }
 
 const POLITICS_KEYWORDS = [
@@ -139,31 +286,25 @@ const CRYPTO_KEYWORDS = [
   'nft','altcoin','coinbase','binance','web3',
 ];
 const SPORTS_KEYWORDS = [
-  // general sports terms
   'win','championship','cup','tournament','league','player','coach','season','playoff',
   'score','match','game','football','basketball','baseball','hockey','soccer','tennis',
   'golf','olympic','fifa','world cup','nba','nfl','mlb','nhl','stanley','finals','series',
   'medal','podium','race','grand prix',
-  // countries (national teams)
   'england','france','spain','germany','brazil','argentina','portugal','japan','norway',
   'netherlands','mexico','usa','canada','australia','italy','belgium','croatia','senegal',
   'morocco','korea',
-  // NBA teams
   'knicks','lakers','celtics','warriors','bulls','heat','nets','bucks','suns','nuggets',
   'clippers','mavs','mavericks','spurs','rockets','pistons','cavaliers','cavs','pacers',
   'hawks','hornets','magic','wizards','raptors','sixers','76ers','jazz','thunder','blazers',
   'grizzlies','pelicans','kings','timberwolves','wolves',
-  // NHL teams
   'canadiens','maple leafs','bruins','rangers','penguins','blackhawks','red wings','oilers',
   'flames','canucks','avalanche','lightning','golden knights','capitals','flyers','blues',
   'stars','sharks','ducks','coyotes','devils','islanders','hurricanes','panthers','senators',
   'sabres','jets','kraken','wild','predators',
-  // MLB teams
   'yankees','red sox','dodgers','cubs','cardinals','giants','astros','braves','mets',
   'phillies','nationals','brewers','pirates','reds','rockies','padres','mariners','athletics',
   'tigers','indians','guardians','twins','royals','white sox','orioles','rays','blue jays',
   'angels','diamondbacks','marlins',
-  // NFL teams
   'patriots','cowboys','packers','steelers','49ers','chiefs','ravens','eagles','bears',
   'lions','seahawks','rams','broncos','raiders','chargers','colts','dolphins','bills',
   'browns','bengals','falcons','saints','buccaneers','vikings','texans','jaguars','titans',
@@ -178,10 +319,6 @@ export type Category = 'sports' | 'politics' | 'macro' | 'crypto' | 'culture' | 
 
 export function classifyCategory(question: string): Category {
   const q = (question || '').toLowerCase();
-  // Vote count: pick the category with the most distinct keyword hits.
-  // Single-word keywords like "win" appear in many sports questions but
-  // also in political races; matching "election"/"president"/"governor"
-  // should outrank a lone "win" → politics wins.
   const count = (kws: string[]) => {
     let n = 0;
     for (const k of kws) if (q.includes(k)) n += 1;
@@ -199,6 +336,19 @@ export function classifyCategory(question: string): Category {
   return scores[0][0];
 }
 
+/**
+ * Returns 1.0 when the sub-category already baked the bias into the base
+ * p_model — avoids double-counting the category penalty.
+ */
+export function getCategoryFactorV5(
+  category: string | null,
+  days: number | null,
+  tier_baked: boolean,
+): number {
+  if (tier_baked) return 1.0;
+  return getDomainHorizonMultiplier(category, days);
+}
+
 export function getCategoryFactor(category: string | null): number {
   switch ((category ?? 'other').toLowerCase()) {
     case 'sports':   return 1.20;
@@ -210,48 +360,44 @@ export function getCategoryFactor(category: string | null): number {
   }
 }
 
-/**
- * calibration_v3 domain × horizon multiplier. Applied to the base
- * calibration lookup to produce p_model. Captures the empirical finding
- * that miscalibration scales with both domain and time-to-resolution —
- * long-horizon political markets are the most overpriced.
- *
- * `days == null` falls back to the medium-horizon bucket for that domain.
- */
 export function getDomainHorizonMultiplier(
   category: string | null,
   days: number | null,
 ): number {
   const cat = (category ?? 'other').toLowerCase();
-  const d = days; // may be null → use medium bucket per domain
-
+  const d = days;
   switch (cat) {
     case 'politics':
-      if (d == null) return 0.70; // medium-term default
-      if (d <= 30) return 0.85; // near-term: fairly well priced
-      if (d <= 180) return 0.70; // medium-term: strong bias, very overpriced
-      return 0.55; // long-term: extremely overpriced (>365 hard-excluded)
+      if (d == null) return 0.70;
+      if (d <= 30) return 0.85;
+      if (d <= 180) return 0.70;
+      return 0.55;
     case 'sports':
       if (d == null) return 0.80;
-      if (d <= 30) return 0.90; // near-term: moderately well priced
-      if (d <= 90) return 0.80; // medium-term: fans overweight longshots
-      return 0.75; // 90–365
+      if (d <= 30) return 0.90;
+      if (d <= 90) return 0.80;
+      return 0.75;
     case 'macro':
       if (d == null) return 1.0;
-      if (d <= 90) return 1.0; // economists involved, well calibrated
-      return 0.85; // 90–365
+      if (d <= 90) return 1.0;
+      return 0.85;
     case 'crypto':
-      return 0.90; // informed traders, moderate calibration
+      return 0.90;
     case 'culture':
-      return 0.80; // fan bias, award predictions heavily biased
+      return 0.80;
     default:
-      return 0.95; // other
+      return 0.95;
   }
 }
 
+/**
+ * Volume confidence factor. Below the $100k floor we cut adj_edge sharply
+ * (10%) so low-liquidity markets stay basket-ineligible — but we no longer
+ * zero it out, so raw_edge and signal stay readable in the scanner.
+ */
 export function getVolumeFactor(volume: number | null): number {
   if (volume == null) return 1.0;
-  if (volume < MIN_VOLUME_USD) return 0.0; // hard-excluded but defensive default
+  if (volume < MIN_VOLUME_USD) return 0.10;
   if (volume < 500_000) return 0.90;
   if (volume <= 2_000_000) return 1.00;
   return 1.05;
@@ -264,36 +410,108 @@ export function isHardExcluded(days: number | null, volume: number | null): bool
 }
 
 // ---------------------------------------------------------------------
+// Signal classification — used by both short and long basket selection
+// and rendered as a badge in the scanner UI.
+// ---------------------------------------------------------------------
+
+export type Signal =
+  | 'strong_short' | 'short' | 'weak_short'
+  | 'fair_value'
+  | 'long' | 'strong_long';
+
+export function classifySignal(raw_edge: number): Signal {
+  if (!Number.isFinite(raw_edge)) return 'fair_value';
+  if (raw_edge > 0.05) return 'strong_short';
+  if (raw_edge > 0.02) return 'short';
+  if (raw_edge > 0.00) return 'weak_short';
+  if (raw_edge >= -0.01) return 'fair_value';
+  if (raw_edge > -0.05) return 'long';
+  return 'strong_long';
+}
+
+// ---------------------------------------------------------------------
+// Tournament group detection
+// ---------------------------------------------------------------------
+
+type Pat = { regex: RegExp; key: (m: RegExpMatchArray) => string };
+
+const TOURNAMENT_PATTERNS: Pat[] = [
+  // FIFA World Cup — "Will <X> win the 2026 FIFA World Cup" / "World Cup 2026"
+  { regex: /\b(\d{4})\s+fifa\s+world\s+cup\b/i, key: (m) => `fifa_world_cup_${m[1]}` },
+  { regex: /\bfifa\s+world\s+cup\s+(\d{4})\b/i, key: (m) => `fifa_world_cup_${m[1]}` },
+  { regex: /\bworld\s+cup\s+(\d{4})\b/i,        key: (m) => `fifa_world_cup_${m[1]}` },
+  { regex: /\b(\d{4})\s+world\s+cup\b/i,        key: (m) => `fifa_world_cup_${m[1]}` },
+  // NBA Conference Finals (these have only 4 teams each — narrower group).
+  { regex: /\b(\d{4})\s+nba\s+western\s+conference\s+finals\b/i, key: (m) => `nba_west_finals_${m[1]}` },
+  { regex: /\b(\d{4})\s+nba\s+eastern\s+conference\s+finals\b/i, key: (m) => `nba_east_finals_${m[1]}` },
+  // NBA Finals — checked AFTER the conference variants so "NBA Finals" alone matches the league.
+  { regex: /\b(\d{4})\s+nba\s+finals\b/i,       key: (m) => `nba_finals_${m[1]}` },
+  { regex: /\bnba\s+finals\s+(\d{4})\b/i,       key: (m) => `nba_finals_${m[1]}` },
+  // NHL
+  { regex: /\b(\d{4})\s+nhl\s+stanley\s+cup\b/i, key: (m) => `nhl_stanley_cup_${m[1]}` },
+  { regex: /\b(\d{4})\s+stanley\s+cup\b/i,       key: (m) => `nhl_stanley_cup_${m[1]}` },
+  // MLB
+  { regex: /\b(\d{4})\s+world\s+series\b/i,      key: (m) => `mlb_world_series_${m[1]}` },
+  // NFL
+  { regex: /\b(\d{4})\s+super\s+bowl\b/i,        key: (m) => `nfl_super_bowl_${m[1]}` },
+  // Tennis grand slams
+  { regex: /\b(\d{4})\s+men'?s\s+wimbledon\b/i,        key: (m) => `tennis_wimbledon_mens_${m[1]}` },
+  { regex: /\b(\d{4})\s+women'?s\s+wimbledon\b/i,      key: (m) => `tennis_wimbledon_womens_${m[1]}` },
+  { regex: /\b(\d{4})\s+men'?s\s+french\s+open\b/i,    key: (m) => `tennis_french_open_mens_${m[1]}` },
+  { regex: /\b(\d{4})\s+men'?s\s+us\s+open\b/i,        key: (m) => `tennis_us_open_mens_${m[1]}` },
+  { regex: /\b(\d{4})\s+men'?s\s+australian\s+open\b/i, key: (m) => `tennis_aus_open_mens_${m[1]}` },
+];
+
+export function detectTournamentGroup(question: string): string | null {
+  if (!question) return null;
+  // Tournament normalization only makes sense for winner-take-all
+  // questions ("Will <X> win the <YYYY> <tournament>"). Reject anything
+  // else — "Will Messi play in the 2026 World Cup", "Will any 2026 World
+  // Cup game be held in the US", etc. — because their probabilities
+  // don't sum to ~1 across the field and would corrupt the renormalize.
+  const isWinnerQuestion = /\bwin\b[^?]*\b(world cup|fifa|nba|stanley cup|nhl|world series|mlb|super bowl|nfl|wimbledon|french open|us open|australian open)\b/i.test(question);
+  if (!isWinnerQuestion) return null;
+  for (const p of TOURNAMENT_PATTERNS) {
+    const m = question.match(p.regex);
+    if (m) return p.key(m);
+  }
+  return null;
+}
+
+// ---------------------------------------------------------------------
 // scoreMarket
 // ---------------------------------------------------------------------
 
 export interface MarketToScore {
-  /** Output of the screener for this market. */
   screened: ScreenedMarket;
-  /** Live volume — rescore endpoint pulls from Polymarket. */
   volume?: number | null;
-  /** Days-to-close at scoring time. */
   days_to_close?: number | null;
-  /** Optional pre-classified category; otherwise derived from question text. */
   category?: string | null;
 }
 
 export interface LayeredScoreFields {
   p_model: number;
+  /** raw_edge = p_market − p_model. The honest model mispricing. */
+  raw_edge: number;
+  /** Legacy alias of raw_edge for downstream code that hasn't migrated. */
   base_edge: number;
   time_factor: number;
   category_factor: number;
   volume_factor: number;
+  /** adj_edge = raw_edge × time_factor × volume_factor. Eligibility metric. */
   adjusted_edge: number;
+  signal: Signal;
   category: string;
   include_in_basket: boolean;
   impossible_edge: boolean;
   hard_excluded: boolean;
+  tier_baked: boolean;
 }
 
 /**
- * Pure layered computation — exposed for unit tests + the basket builder.
- * Persistence-free version of scoreMarket.
+ * calibration_v5_1: raw_edge is the honest p_market − p_model. adj_edge
+ * multiplies raw_edge by time and volume factors and is used only for
+ * basket-inclusion eligibility; hard exclusion no longer zeros raw_edge.
  */
 export function computeLayeredScore(opts: {
   p_market: number;
@@ -318,84 +536,71 @@ export function computeLayeredScore(opts: {
   const category = (opts.category ?? classifyCategory(question)) as string;
   const time_factor = getTimeFactor(days_to_close);
   const volume_factor = getVolumeFactor(volume);
-  const category_factor = isImpossible
-    ? 1.0
-    : getDomainHorizonMultiplier(category, days_to_close);
+  const hard_excluded = isHardExcluded(days_to_close, volume);
 
-  // Layer 4 — impossible override. p_model = 0, edge = p_market.
+  // Impossible markets are special: p_model = 0 by definition, so raw_edge
+  // equals the full p_market. They still go through the same time/volume
+  // decay for adj_edge so impossible far-future longshots aren't basket-
+  // eligible just because raw_edge looks fat.
   if (isImpossible) {
-    const hard_excluded = isHardExcluded(days_to_close, volume);
-    const adjusted_edge = hard_excluded ? 0 : p_market;
+    const p_model = 0;
+    const raw_edge = p_market - p_model;
+    const adjusted_edge = raw_edge * time_factor * volume_factor;
+    const signal = classifySignal(raw_edge);
     return {
-      p_model: 0.0,
-      base_edge: p_market,
+      p_model,
+      raw_edge,
+      base_edge: raw_edge,
       time_factor,
-      category_factor,
+      category_factor: 1.0,
       volume_factor,
       adjusted_edge,
+      signal,
       category,
-      include_in_basket: !hard_excluded && adjusted_edge >= IMPOSSIBLE_INCLUDE_THRESHOLD,
+      include_in_basket:
+        !hard_excluded &&
+        adjusted_edge >= IMPOSSIBLE_INCLUDE_THRESHOLD &&
+        !excludedByScreener,
       impossible_edge: true,
       hard_excluded,
+      tier_baked: false,
     };
   }
 
-  // Layer 1 — base calibration (sports uses tiered rule, others use lookup).
-  const base_p_model = getBasePModel(p_market, category);
-  const base_edge = getEdge(p_market, base_p_model);
-
-  // Layer 2 — hard exclusion. Stops further scoring.
-  if (isHardExcluded(days_to_close, volume)) {
-    return {
-      p_model: base_p_model,
-      base_edge,
-      time_factor: 1,
-      category_factor: 1,
-      volume_factor: 1,
-      adjusted_edge: 0,
-      category,
-      include_in_basket: false,
-      impossible_edge: false,
-      hard_excluded: true,
-    };
-  }
-
-  // Layer 3 — factor stack applies to p_model, never to edge directly.
-  // Cap p_model at 95% of p_market so some edge is always preserved.
-  const p_model_unfolded = base_p_model * time_factor * category_factor * volume_factor;
-  const p_model_adj = Math.min(p_model_unfolded, p_market * P_MODEL_CAP_FRAC);
-  // Invariant: adj_edge = p_market − p_model_shown.
-  // momentum_factor is intentionally NOT applied here — the momentum job
-  // folds it into p_model later so the invariant continues to hold.
+  // Non-impossible. Subcategory tiers bake category bias into p_model so
+  // we no longer apply a separate category_factor on top.
+  const base = getBasePModelV5(p_market, question, category);
+  const p_model = base.p_model;
+  const raw_edge = p_market - p_model;
+  void getCategoryFactorV5; // intentionally not part of v5_1's adj_edge math
+  const adjusted_edge = raw_edge * time_factor * volume_factor;
   void momentum_factor;
-  const adjusted_edge = p_market - p_model_adj;
+  const signal = classifySignal(raw_edge);
 
   const include_in_basket =
     !excludedByScreener &&
+    !hard_excluded &&
     adjusted_edge >= EDGE_INCLUDE_THRESHOLD &&
     p_market >= P_MARKET_INCLUDE_MIN &&
     p_market <= P_MARKET_INCLUDE_MAX;
 
   return {
-    p_model: p_model_adj,
-    base_edge,
+    p_model,
+    raw_edge,
+    base_edge: raw_edge,
     time_factor,
-    category_factor,
+    category_factor: 1.0,
     volume_factor,
     adjusted_edge,
+    signal,
     category,
     include_in_basket,
     impossible_edge: false,
-    hard_excluded: false,
+    hard_excluded,
+    tier_baked: base.tier_baked,
   };
 }
 
-/**
- * Score one market and persist. Layered model — see file header.
- *
- * `isImpossible` arg overrides the screened-row impossible flag. In normal
- * use the caller passes nothing and we read it off `input.screened`.
- */
 export async function scoreMarket(
   input: MarketToScore,
   isImpossibleOverride?: boolean,
@@ -414,6 +619,8 @@ export async function scoreMarket(
     category: input.category ?? null,
   });
 
+  // Per-row scoring does NOT set tournament fields — those are filled in
+  // by applyTournamentNormalization (Layer 5).
   return upsertScoredMarket({
     condition_id: s.condition_id,
     source: s.source,
@@ -421,6 +628,8 @@ export async function scoreMarket(
     p_market: s.p_market ?? 0,
     p_model: layered.p_model,
     edge: layered.base_edge,
+    raw_edge: layered.raw_edge,
+    signal: layered.signal,
     volume: input.volume ?? null,
     days_to_close: input.days_to_close ?? null,
     category: layered.category,
@@ -431,15 +640,413 @@ export async function scoreMarket(
     time_factor: layered.time_factor,
     category_factor: layered.category_factor,
     volume_factor: layered.volume_factor,
-    momentum_factor: 1.0, // momentum job updates this once 7d of history exists
+    momentum_factor: 1.0,
+    tournament_group: null,
+    is_tournament_market: false,
+    normalized_p_market: null,
+    is_favorite: false,
   });
 }
+
+// ---------------------------------------------------------------------
+// Layer 5 — tournament normalization
+// ---------------------------------------------------------------------
+
+export interface TournamentNormalizationSummary {
+  groups: Array<{
+    key: string;
+    members: number;          // count from scored_markets only
+    full_field: number;       // count from live polymarket fetch
+    favorites: number;
+    longshots: number;
+    avg_longshot_edge: number;
+    sum_p_market: number;     // from full field, not just scored
+    skipped: boolean;
+    skipped_reason?: string;
+  }>;
+  total_favorites: number;
+  total_longshots: number;
+  total_tournament_markets: number;
+}
+
+/**
+ * Ephemeral display rows for tournament favorites that aren't in
+ * scored_markets (their p_market sits above the screener's 0.10 ceiling).
+ * Cleared and repopulated on every normalization pass. The scanner route
+ * reads from this cache to surface "underpriced favorite" candidates for
+ * the long basket without persisting them.
+ */
+export interface TournamentFavoriteRow {
+  condition_id: string;
+  question: string;
+  source: 'polymarket';
+  category: string;
+  p_market: number;            // raw market mid
+  normalized_p_market: number; // after vig removal
+  p_model: number;             // group-normalized
+  raw_edge: number;            // p_market - p_model (negative for favorites)
+  adjusted_edge: number;       // raw_edge × time × volume (still negative)
+  time_factor: number;
+  volume_factor: number;
+  signal: Signal;
+  tournament_group: string;
+  is_tournament_market: true;
+  /**
+   * True when raw_edge ≤ 0 (model thinks underpriced). False when this
+   * tournament participant happens to be a longshot the screener filtered
+   * out for being above the 0.10 p_market ceiling — they still need to
+   * appear in tournament search results but they are NOT long-basket
+   * candidates and we must not let the UI render them with a FAVORITE
+   * badge while the signal says SHORT.
+   */
+  is_favorite: boolean;
+  volume: number | null;
+  days_to_close: number | null;
+  model_version: string;
+}
+
+const tournamentFavoritesCache: Map<string, TournamentFavoriteRow[]> = new Map();
+
+/** Read-only accessor for the favorites cache, used by the scanner route. */
+export function getTournamentFavorites(groupKey?: string): TournamentFavoriteRow[] {
+  if (groupKey) return tournamentFavoritesCache.get(groupKey) ?? [];
+  return Array.from(tournamentFavoritesCache.values()).flat();
+}
+
+/**
+ * Pull live Polymarket markets, flatten to one row per outcome, attach
+ * tournament group keys. Cached for the duration of a single
+ * applyTournamentNormalization run so we don't refetch per group.
+ */
+async function fetchTournamentContext(): Promise<Map<string, Array<{ marketId: string; question: string; pMarket: number; volume: number; endDateIso?: string }>>> {
+  const byGroup = new Map<string, Array<{ marketId: string; question: string; pMarket: number; volume: number; endDateIso?: string }>>();
+  let raw: RawPolymarketMarket[] = [];
+  try {
+    raw = await getAllActiveMarkets(20);
+  } catch (e) {
+    console.warn('[tournament] live Polymarket fetch failed:', (e as Error).message);
+    return byGroup;
+  }
+  // De-dupe by conditionId — we only want one row per "Will X win" market,
+  // and we want the YES side specifically (the probability of the team
+  // actually winning). flattenOutcomes returns both YES and NO sides which
+  // would double the group and inflate sum_p_market to ~N.
+  const seen = new Set<string>();
+  for (const m of raw) {
+    const outcomes = flattenOutcomes(m);
+    for (const o of outcomes) {
+      const label = (o.outcomeLabel ?? '').toLowerCase();
+      if (label !== 'yes') continue;
+      if (seen.has(o.conditionId)) continue;
+      const g = detectTournamentGroup(o.question);
+      if (!g) continue;
+      seen.add(o.conditionId);
+      const arr = byGroup.get(g) ?? [];
+      arr.push({
+        marketId: o.conditionId,
+        question: o.question,
+        pMarket: o.pMarket,
+        volume: o.volumeUsd,
+        endDateIso: o.endDateIso,
+      });
+      byGroup.set(g, arr);
+    }
+  }
+  return byGroup;
+}
+
+/**
+ * Renormalize each detected tournament group using its FULL live field
+ * (fetched from Polymarket), not just the scored_markets tail. Scored
+ * members are persisted with new p_model/raw_edge/adj_edge/signal;
+ * favorites that aren't in scored_markets are cached as ephemeral display
+ * rows the scanner route can return when filtering by that tournament.
+ */
+export async function applyTournamentNormalization(
+  scored: ScoredMarket[],
+): Promise<TournamentNormalizationSummary> {
+  // Reset the ephemeral favorites cache before we repopulate.
+  tournamentFavoritesCache.clear();
+
+  // Bucket scored rows by detected group.
+  const scoredByGroup = new Map<string, ScoredMarket[]>();
+  for (const m of scored) {
+    const g = detectTournamentGroup(m.question);
+    if (!g) continue;
+    const arr = scoredByGroup.get(g) ?? [];
+    arr.push(m);
+    scoredByGroup.set(g, arr);
+  }
+
+  // Fetch the live full-field context for every tournament we care about.
+  const liveByGroup = await fetchTournamentContext();
+
+  const summary: TournamentNormalizationSummary = {
+    groups: [],
+    total_favorites: 0,
+    total_longshots: 0,
+    total_tournament_markets: 0,
+  };
+
+  // Process every group that appears EITHER in scored OR live data. A
+  // tournament that's all favorites still produces a long-basket signal
+  // even if zero scored rows match.
+  const allGroupKeys = new Set<string>([...scoredByGroup.keys(), ...liveByGroup.keys()]);
+
+  for (const groupKey of allGroupKeys) {
+    const scoredMembers = scoredByGroup.get(groupKey) ?? [];
+    const liveMembers = liveByGroup.get(groupKey) ?? [];
+
+    // Merge by market_id — scored rows win on conflict (they have richer
+    // metadata). Anything in live but not in scored becomes a favorite
+    // candidate (raw market mid likely > 0.10, screener-filtered).
+    const scoredIds = new Set(scoredMembers.map((m) => m.condition_id));
+    const onlyLive = liveMembers.filter((l) => !scoredIds.has(l.marketId));
+
+    // Full-field probabilities and questions.
+    interface Member {
+      kind: 'scored' | 'live';
+      condition_id: string;
+      question: string;
+      p_market: number;
+      volume: number | null;
+      days_to_close: number | null;
+      scored?: ScoredMarket;
+    }
+    const fullField: Member[] = [
+      ...scoredMembers.map((m): Member => ({
+        kind: 'scored',
+        condition_id: m.condition_id,
+        question: m.question,
+        p_market: Number(m.p_market ?? 0),
+        volume: m.volume,
+        days_to_close: m.days_to_close,
+        scored: m,
+      })),
+      ...onlyLive.map((l): Member => ({
+        kind: 'live',
+        condition_id: l.marketId,
+        question: l.question,
+        p_market: l.pMarket,
+        volume: l.volume,
+        days_to_close: l.endDateIso ? Math.max(0, Math.round((Date.parse(l.endDateIso) - Date.now()) / 86_400_000)) : null,
+      })),
+    ];
+
+    if (fullField.length < 2) {
+      summary.groups.push({
+        key: groupKey, members: scoredMembers.length, full_field: fullField.length,
+        favorites: 0, longshots: 0, avg_longshot_edge: 0,
+        sum_p_market: fullField.reduce((s, m) => s + m.p_market, 0),
+        skipped: true, skipped_reason: 'single_member',
+      });
+      continue;
+    }
+
+    const sumP = fullField.reduce((s, m) => s + m.p_market, 0);
+    if (sumP < 0.5 || sumP > 2.5) {
+      summary.groups.push({
+        key: groupKey, members: scoredMembers.length, full_field: fullField.length,
+        favorites: 0, longshots: 0, avg_longshot_edge: 0,
+        sum_p_market: sumP,
+        skipped: true, skipped_reason: `sum_p_market_out_of_range:${sumP.toFixed(3)}`,
+      });
+      console.warn(
+        `[tournament] skipping ${groupKey}: full_field=${fullField.length} sum_p_market=${sumP.toFixed(3)}`,
+      );
+      continue;
+    }
+
+    // Step b — normalize implied probabilities (remove vig).
+    const normalizedImplied = fullField.map((m) => m.p_market / sumP);
+
+    // Step c — sub-category calibration applied to the normalized input.
+    const pModelsRaw = fullField.map((m, i) => {
+      const sub = detectSportsSubcategory(m.question);
+      return sub
+        ? getSportsSubcategoryPModel(sub, normalizedImplied[i])
+        : getSportsCalibratedPModel(normalizedImplied[i]);
+    });
+
+    const sumPModel = pModelsRaw.reduce((s, p) => s + p, 0);
+    if (sumPModel <= 0) {
+      summary.groups.push({
+        key: groupKey, members: scoredMembers.length, full_field: fullField.length,
+        favorites: 0, longshots: 0, avg_longshot_edge: 0,
+        sum_p_market: sumP,
+        skipped: true, skipped_reason: 'zero_p_model_sum',
+      });
+      continue;
+    }
+    const pModelsNorm = pModelsRaw.map((p) => p / sumPModel);
+
+    let favCount = 0;
+    let longshotCount = 0;
+    let longshotEdgeSum = 0;
+    const favoriteRowsThisGroup: TournamentFavoriteRow[] = [];
+    const favoriteSamples: string[] = [];
+    const longshotSamples: string[] = [];
+
+    for (let i = 0; i < fullField.length; i++) {
+      const member = fullField[i];
+      const newPMarket = normalizedImplied[i];
+      const newPModel = pModelsNorm[i];
+      const newRawEdge = newPMarket - newPModel;
+      const time_factor = getTimeFactor(member.days_to_close);
+      const volume_factor = getVolumeFactor(member.volume);
+      const newAdjEdge = newRawEdge * time_factor * volume_factor;
+      const isFavorite = newRawEdge <= 0;
+      const include = newRawEdge > TOURNAMENT_EDGE_INCLUDE_THRESHOLD;
+      const signal = classifySignal(newRawEdge);
+      const category = 'sports';
+
+      if (isFavorite) favCount += 1;
+      if (include) { longshotCount += 1; longshotEdgeSum += newRawEdge; }
+
+      if (isFavorite && favoriteSamples.length < 5) {
+        favoriteSamples.push(`${shortTeam(member.question)} ${(newPMarket * 100).toFixed(1)}%`);
+      }
+      if (!isFavorite && longshotSamples.length < 5) {
+        longshotSamples.push(`${shortTeam(member.question)} ${(newPMarket * 100).toFixed(1)}% edge ${(newRawEdge * 100).toFixed(1)}%`);
+      }
+
+      if (member.kind === 'scored' && member.scored) {
+        const m = member.scored;
+        m.p_model = newPModel;
+        m.edge = newRawEdge;
+        m.raw_edge = newRawEdge;
+        m.adjusted_edge = newAdjEdge;
+        m.include_in_basket = include;
+        m.is_tournament_market = true;
+        m.tournament_group = groupKey;
+        m.normalized_p_market = newPMarket;
+        m.is_favorite = isFavorite;
+        m.signal = signal;
+        m.time_factor = time_factor;
+        m.volume_factor = volume_factor;
+        m.category_factor = 1.0;
+        m.model_version = MODEL_VERSION;
+
+        try {
+          await upsertScoredMarket({
+            condition_id: m.condition_id,
+            source: m.source,
+            question: m.question,
+            p_market: m.p_market,
+            p_model: newPModel,
+            edge: newRawEdge,
+            raw_edge: newRawEdge,
+            signal,
+            adjusted_edge: newAdjEdge,
+            time_factor,
+            category_factor: 1.0,
+            volume_factor,
+            volume: m.volume ?? null,
+            days_to_close: m.days_to_close ?? null,
+            category,
+            include_in_basket: include,
+            impossible_edge: false,
+            model_version: MODEL_VERSION,
+            momentum_factor: m.momentum_factor ?? 1.0,
+            tournament_group: groupKey,
+            is_tournament_market: true,
+            normalized_p_market: newPMarket,
+            is_favorite: isFavorite,
+          });
+        } catch (e) {
+          console.warn(`[tournament] persist failed ${m.condition_id}: ${(e as Error).message}`);
+        }
+      } else {
+        // Live-only row → cached for the scanner so tournament search
+        // surfaces it. Two distinct cases get pushed here:
+        //   raw_edge ≤ 0  → real favorite (model thinks underpriced) →
+        //                   is_favorite=true, signal forced into the
+        //                   long/fair range (never short).
+        //   raw_edge > 0  → tournament longshot that sits above the
+        //                   screener's 0.10 ceiling — NOT a favorite for
+        //                   the long basket; signal keeps its natural
+        //                   classifySignal output.
+        const isLongCandidate = newRawEdge <= 0;
+        const clampedSignal: Signal = isLongCandidate
+          ? (newRawEdge < -0.05 ? 'strong_long'
+            : newRawEdge < -0.01 ? 'long'
+            : 'fair_value')
+          : signal;
+        favoriteRowsThisGroup.push({
+          condition_id: member.condition_id,
+          question: member.question,
+          source: 'polymarket',
+          category,
+          p_market: member.p_market,
+          normalized_p_market: newPMarket,
+          p_model: newPModel,
+          raw_edge: newRawEdge,
+          adjusted_edge: newAdjEdge,
+          time_factor,
+          volume_factor,
+          signal: clampedSignal,
+          tournament_group: groupKey,
+          is_tournament_market: true,
+          is_favorite: isLongCandidate,
+          volume: member.volume,
+          days_to_close: member.days_to_close,
+          model_version: MODEL_VERSION,
+        });
+      }
+    }
+
+    if (favoriteRowsThisGroup.length > 0) {
+      tournamentFavoritesCache.set(groupKey, favoriteRowsThisGroup);
+    }
+
+    console.info(
+      `[tournament] ${groupKey}: full field ${fullField.length} teams, sum_p=${sumP.toFixed(3)}`,
+    );
+    if (favoriteSamples.length > 0) {
+      console.info(
+        `[tournament] favorites (excluded from short basket): ${favoriteSamples.join(', ')}`,
+      );
+    }
+    if (longshotSamples.length > 0) {
+      console.info(
+        `[tournament] longshots (short candidates): ${longshotSamples.join(', ')}`,
+      );
+    }
+
+    summary.groups.push({
+      key: groupKey,
+      members: scoredMembers.length,
+      full_field: fullField.length,
+      favorites: favCount,
+      longshots: longshotCount,
+      avg_longshot_edge: longshotCount > 0 ? longshotEdgeSum / longshotCount : 0,
+      sum_p_market: sumP,
+      skipped: false,
+    });
+    summary.total_favorites += favCount;
+    summary.total_longshots += longshotCount;
+    summary.total_tournament_markets += fullField.length;
+  }
+
+  return summary;
+}
+
+function shortTeam(question: string): string {
+  // "Will Brazil win the 2026 FIFA World Cup?" → "Brazil"
+  const m = question.match(/^Will\s+([A-Za-z][\w\s.'-]{0,40}?)\s+win\b/i);
+  return m ? m[1].trim() : question.slice(0, 24);
+}
+
+// ---------------------------------------------------------------------
+// Bulk operations
+// ---------------------------------------------------------------------
 
 export async function scoreAllMarkets(inputs: MarketToScore[]): Promise<{
   scored: ScoredMarket[];
   included: number;
   impossible_included: number;
   hard_excluded: number;
+  tournaments?: TournamentNormalizationSummary;
 }> {
   const scored: ScoredMarket[] = [];
   let impossibleIncluded = 0;
@@ -457,23 +1064,25 @@ export async function scoreAllMarkets(inputs: MarketToScore[]): Promise<{
       );
     }
   }
+
+  // Layer 5 — apply tournament normalization across the full scored set.
+  const tournaments = await applyTournamentNormalization(scored);
   const included = scored.filter((r) => r.include_in_basket).length;
-  return { scored, included, impossible_included: impossibleIncluded, hard_excluded: hardExcluded };
+  return {
+    scored,
+    included,
+    impossible_included: impossibleIncluded,
+    hard_excluded: hardExcluded,
+    tournaments,
+  };
 }
 
-/**
- * Re-score every existing scored_markets row against the current model
- * (calibration_v3). Reads volume / days_to_close / category straight off
- * the persisted scored rows so we don't depend on the live APIs and
- * don't clobber existing metadata. Screened flags (impossible / excluded)
- * are joined from screened_markets; rows with no screened entry are
- * treated as not-excluded / not-impossible.
- */
 export async function rescoreAllStored(): Promise<{
   total: number;
   rescored: number;
   included: number;
   model_version: string;
+  tournaments?: TournamentNormalizationSummary;
 }> {
   const [scored, screened] = await Promise.all([
     listScoredMarkets(),
@@ -483,7 +1092,7 @@ export async function rescoreAllStored(): Promise<{
   for (const s of screened) screenedById.set(s.condition_id, s);
 
   let rescored = 0;
-  let included = 0;
+  const updatedRows: ScoredMarket[] = [];
   for (const sd of scored) {
     const sc = screenedById.get(sd.condition_id);
     const synthScreened: ScreenedMarket = sc ?? {
@@ -507,15 +1116,32 @@ export async function rescoreAllStored(): Promise<{
         days_to_close: sd.days_to_close ?? null,
         category: sd.category ?? null,
       });
+      updatedRows.push(row);
       rescored += 1;
-      if (row.include_in_basket) included += 1;
     } catch (e) {
       console.warn(`[ml-scorer] rescore failed ${sd.condition_id}: ${(e as Error).message}`);
     }
   }
 
+  // Layer 5 — apply tournament normalization across the rescored set.
+  const tournaments = await applyTournamentNormalization(updatedRows);
+  const included = updatedRows.filter((r) => r.include_in_basket).length;
+
   console.info(
     `[ml-scorer] rescoreAllStored: ${rescored}/${scored.length} rows → ${MODEL_VERSION} (${included} include_in_basket)`,
   );
-  return { total: scored.length, rescored, included, model_version: MODEL_VERSION };
+  console.info(
+    `[tournament] processed ${tournaments.groups.length} group(s): ` +
+      tournaments.groups
+        .filter((g) => !g.skipped)
+        .map((g) => `${g.key} (${g.members} teams: ${g.longshots} longshot, ${g.favorites} fav)`)
+        .join(', '),
+  );
+  if (tournaments.total_favorites > 0 || tournaments.total_longshots > 0) {
+    console.info(
+      `[tournament] excluded ${tournaments.total_favorites} favorite(s), included ${tournaments.total_longshots} longshot(s) across all groups`,
+    );
+  }
+
+  return { total: scored.length, rescored, included, model_version: MODEL_VERSION, tournaments };
 }
