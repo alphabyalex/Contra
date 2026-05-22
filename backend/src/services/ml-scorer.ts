@@ -46,6 +46,7 @@ import {
   upsertScoredMarket,
   listScoredMarkets,
   listScreenedMarkets,
+  getLatestPricesMap,
   type ScreenedMarket,
   type ScoredMarket,
 } from '../db/queries';
@@ -72,7 +73,7 @@ export const CALIBRATION_TABLE: CalibrationBucket[] = [
   { min: 0.90, max: 1.01, p_model: 0.9182, n: 685 },
 ];
 
-export const MODEL_VERSION = 'calibration_v5_1';
+export const MODEL_VERSION = 'calibration_v5_2';
 
 /** p_model_adjusted is never allowed above p_market × P_MODEL_CAP_FRAC. */
 export const P_MODEL_CAP_FRAC = 0.95;
@@ -150,8 +151,12 @@ export function getSportsSubcategoryPModel(sub: SportsSubcategory, p_market: num
       if (p_market > 0.04) return p_market * 0.40;
       return getPModel(p_market) * 0.90;
     case 'nhl':
-      if (p_market > 0.08) return p_market * 0.82;
-      if (p_market > 0.04) return p_market * 0.45;
+      // calibration_v5_2: an NHL team at 15%+ is a real Stanley Cup
+      // contender — minimal longshot bias. (Was too aggressive: a 19%
+      // team scored ~8% p_model, implying massive overpricing.)
+      if (p_market > 0.15) return p_market * 0.88; // leading contender
+      if (p_market > 0.08) return p_market * 0.82; // solid contender
+      if (p_market > 0.04) return p_market * 0.55; // longshot
       return getPModel(p_market) * 0.92;
     case 'mlb':
       if (p_market > 0.08) return p_market * 0.75;
@@ -319,6 +324,9 @@ export type Category = 'sports' | 'politics' | 'macro' | 'crypto' | 'culture' | 
 
 export function classifyCategory(question: string): Category {
   const q = (question || '').toLowerCase();
+  // Nobel Prize markets ("Nobel Peace Prize") trip the sports keyword "win";
+  // they belong in 'other', not sports.
+  if (/\bnobel\b.*\bprize\b|\bnobel prize\b|\bnobel peace prize\b/.test(q)) return 'other';
   const count = (kws: string[]) => {
     let n = 0;
     for (const k of kws) if (q.includes(k)) n += 1;
@@ -419,6 +427,28 @@ export type Signal =
   | 'fair_value'
   | 'long' | 'strong_long';
 
+/**
+ * Constitutional / legal impossibilities the screener may not catch.
+ * Currently: Trump winning a 2028+ presidential election — he will have
+ * served two terms, so the 22nd Amendment bars a third. These resolve NO
+ * with certainty, so p_model = 0 and they're maximum-conviction shorts.
+ */
+export function isConstitutionallyImpossible(question: string): boolean {
+  if (!question) return false;
+  const q = question.toLowerCase();
+  if (!q.includes('trump')) return false;
+  // Only Donald Trump Sr. is term-limited. "Trump Jr." (Donald Jr.) is a
+  // different, eligible person — never flag him.
+  if (/trump\s+jr\b|donald\s+trump\s+jr/.test(q)) return false;
+  const mentions2028 = q.includes('2028') || /\b202[89]\b|\b203\d\b/.test(q);
+  if (!mentions2028) return false;
+  return (
+    q.includes('presidential election') ||
+    /\bwin the 202[89]\b/.test(q) ||
+    (q.includes('president') && (q.includes('win') || q.includes('elect')))
+  );
+}
+
 export function classifySignal(raw_edge: number): Signal {
   if (!Number.isFinite(raw_edge)) return 'fair_value';
   if (raw_edge > 0.05) return 'strong_short';
@@ -506,6 +536,8 @@ export interface LayeredScoreFields {
   impossible_edge: boolean;
   hard_excluded: boolean;
   tier_baked: boolean;
+  /** True when impossibility is a constitutional/legal constraint (Trump 2028). */
+  constitutional: boolean;
 }
 
 /**
@@ -538,15 +570,21 @@ export function computeLayeredScore(opts: {
   const volume_factor = getVolumeFactor(volume);
   const hard_excluded = isHardExcluded(days_to_close, volume);
 
+  // Constitutional/legal impossibility (e.g. Trump 2028) is treated exactly
+  // like a screener-flagged impossible: p_model = 0, full premium is edge.
+  const constitutional = isConstitutionallyImpossible(question);
+  const impossible = isImpossible || constitutional;
+
   // Impossible markets are special: p_model = 0 by definition, so raw_edge
   // equals the full p_market. They still go through the same time/volume
   // decay for adj_edge so impossible far-future longshots aren't basket-
   // eligible just because raw_edge looks fat.
-  if (isImpossible) {
+  if (impossible) {
     const p_model = 0;
     const raw_edge = p_market - p_model;
     const adjusted_edge = raw_edge * time_factor * volume_factor;
-    const signal = classifySignal(raw_edge);
+    // Impossible NO is a max-conviction short regardless of the time penalty.
+    const signal: Signal = raw_edge > 0 ? 'strong_short' : classifySignal(raw_edge);
     return {
       p_model,
       raw_edge,
@@ -564,6 +602,7 @@ export function computeLayeredScore(opts: {
       impossible_edge: true,
       hard_excluded,
       tier_baked: false,
+      constitutional,
     };
   }
 
@@ -598,6 +637,7 @@ export function computeLayeredScore(opts: {
     impossible_edge: false,
     hard_excluded,
     tier_baked: base.tier_baked,
+    constitutional: false,
   };
 }
 
@@ -1144,4 +1184,56 @@ export async function rescoreAllStored(): Promise<{
   }
 
   return { total: scored.length, rescored, included, model_version: MODEL_VERSION, tournaments };
+}
+
+// =====================================================================
+// Auto-rescore markets that moved (6h cron). Rerun the ML scorer with the
+// live price for any market whose price drifted >5pts from its stored value.
+// =====================================================================
+
+export async function rescoreMovedMarkets(): Promise<{ checked: number; moved: number; rescored: number }> {
+  const scored = await listScoredMarkets();
+  const prices = await getLatestPricesMap(scored.map((s) => s.condition_id)).catch(
+    () => new Map<string, { price: number; recorded_at: string }>(),
+  );
+  let moved = 0;
+  let rescored = 0;
+  for (const sd of scored) {
+    const live = prices.get(sd.condition_id);
+    if (!live || !Number.isFinite(live.price)) continue;
+    const liveP = live.price;
+    const baseline = Number(sd.p_market ?? 0);
+    if (Math.abs(liveP - baseline) <= 0.05) continue;
+    moved += 1;
+    // Leave resolved/blown-up markets to the price-collector's flagging —
+    // don't un-flag them by rescoring.
+    if ((sd as { signal?: string | null }).signal === 'resolved_likely' || liveP >= 0.8 || liveP <= 0.01) continue;
+    const l = computeLayeredScore({
+      p_market: liveP,
+      question: sd.question,
+      isImpossible: sd.impossible_edge ?? false,
+      volume: sd.volume,
+      days_to_close: sd.days_to_close,
+      category: sd.category ?? null,
+    });
+    try {
+      await upsertScoredMarket({
+        condition_id: sd.condition_id, source: sd.source, question: sd.question,
+        p_market: liveP, p_model: l.p_model, edge: l.raw_edge, raw_edge: l.raw_edge,
+        signal: l.signal, adjusted_edge: l.adjusted_edge, time_factor: l.time_factor,
+        category_factor: l.category_factor, volume_factor: l.volume_factor, volume: sd.volume ?? null,
+        days_to_close: sd.days_to_close ?? null, category: l.category, include_in_basket: l.include_in_basket,
+        impossible_edge: sd.impossible_edge ?? false, model_version: MODEL_VERSION, momentum_factor: sd.momentum_factor ?? 1.0,
+        tournament_group: (sd as { tournament_group?: string | null }).tournament_group ?? null,
+        is_tournament_market: (sd as { is_tournament_market?: boolean }).is_tournament_market ?? false,
+        normalized_p_market: (sd as { normalized_p_market?: number | null }).normalized_p_market ?? null,
+        is_favorite: (sd as { is_favorite?: boolean }).is_favorite ?? false,
+      } as Parameters<typeof upsertScoredMarket>[0]);
+      rescored += 1;
+    } catch (e) {
+      console.warn(`[rescore] failed ${sd.condition_id}: ${(e as Error).message}`);
+    }
+  }
+  console.info(`[rescore] checked ${scored.length} markets, ${moved} had >5% movement, ${rescored} rescored`);
+  return { checked: scored.length, moved, rescored };
 }

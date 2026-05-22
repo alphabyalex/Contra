@@ -18,8 +18,9 @@
  *   loss   / negative P&L         → #CC2936
  */
 
-import { useEffect, useState } from 'react';
+import { useCallback, useEffect, useState } from 'react';
 import Link from 'next/link';
+import { useRouter } from 'next/navigation';
 import { PublicKey } from '@solana/web3.js';
 import { useConnection, useWallet } from '@solana/wallet-adapter-react';
 import { WalletMultiButton } from '@solana/wallet-adapter-react-ui';
@@ -70,6 +71,8 @@ interface HoldingRow {
   currentNav: number;
   pnl: number;
   pnlPct: number;
+  basketId: string | null;
+  description: string | null;
 }
 
 interface TxRow {
@@ -80,10 +83,11 @@ interface TxRow {
   basketName: string | null;
   usdcDelta: number;
   tokensDelta: number;
+  leverageBps: number;
   createdAt: string;
 }
 
-type Tab = 'overview' | 'history';
+type Tab = 'overview' | 'history' | 'leverage';
 
 // =====================================================================
 // Page
@@ -92,7 +96,12 @@ type Tab = 'overview' | 'history';
 export default function PortfolioPage() {
   const wallet = useWallet();
   const { connection } = useConnection();
-  const { walletAddress, basketPositions, leveragedPositions, recentTransactions, refresh, loading, error } = useContraState();
+  const { walletAddress, basketPositions: rawBasketPositions, leveragedPositions, recentTransactions, refresh, loading, error } = useContraState();
+  // Phase 3: hide fully-redeemed / dust positions everywhere (rows, donut,
+  // legend, open-baskets count).
+  const basketPositions = (rawBasketPositions ?? []).filter(
+    (p: any) => Number(p.tokens_held ?? p.token_amount ?? 0) > 0 && Number(p.current_value_usdc ?? 0) >= 0.01,
+  );
   const [usdcBalance, setUsdcBalance] = useState<number>(0);
   const [tab, setTab] = useState<Tab>('overview');
   // The portfolio surface depends on client-only wallet state. Render a
@@ -105,27 +114,29 @@ export default function PortfolioPage() {
     if (walletAddress) refresh();
   }, [walletAddress, refresh]);
 
-  useEffect(() => {
-    if (!wallet.publicKey) {
+  // On-chain USDC balance. Fetched once on connect AND polled every 10s so
+  // it converges to reality after a deposit/redeem — previously it was read
+  // only once on connect, so a redeem left a stale balance on screen (looked
+  // like the USDC "dropped" when really the display just never refreshed).
+  const fetchUsdcBalance = useCallback(async () => {
+    if (!wallet.publicKey) { setUsdcBalance(0); return; }
+    try {
+      const accounts = await connection.getParsedTokenAccountsByOwner(wallet.publicKey, { mint: USDC_MINT_DEVNET });
+      const total = accounts.value.reduce((s, acc) => {
+        const ui = (acc.account.data as any)?.parsed?.info?.tokenAmount?.uiAmount;
+        return s + (typeof ui === 'number' ? ui : 0);
+      }, 0);
+      setUsdcBalance(total);
+    } catch {
       setUsdcBalance(0);
-      return;
     }
-    const pk = wallet.publicKey;
-    let cancelled = false;
-    (async () => {
-      try {
-        const accounts = await connection.getParsedTokenAccountsByOwner(pk, { mint: USDC_MINT_DEVNET });
-        const total = accounts.value.reduce((s, acc) => {
-          const ui = (acc.account.data as any)?.parsed?.info?.tokenAmount?.uiAmount;
-          return s + (typeof ui === 'number' ? ui : 0);
-        }, 0);
-        if (!cancelled) setUsdcBalance(total);
-      } catch {
-        if (!cancelled) setUsdcBalance(0);
-      }
-    })();
-    return () => { cancelled = true; };
   }, [wallet.publicKey, connection]);
+
+  useEffect(() => {
+    fetchUsdcBalance();
+    const iv = setInterval(fetchUsdcBalance, 10_000);
+    return () => clearInterval(iv);
+  }, [fetchUsdcBalance]);
 
   // ---- stat aggregates ----
   // Total Deployed = sum of USDC originally put in (never moves once
@@ -151,6 +162,10 @@ export default function PortfolioPage() {
   }
   const totalPnl = unrealizedPnl + resolvedPnl;
 
+  // ---- leveraged positions ----
+  const levPositions = (leveragedPositions ?? []) as any[];
+  const leveragedPnl = levPositions.reduce((s, lp) => s + Number(lp.unrealized_pnl ?? lp.pnl_usdc ?? 0), 0);
+
   // ---- holdings rows (positions + USDC) ----
   const positionRows: HoldingRow[] = basketPositions.map((p) => {
     const name = p.basket?.name ?? 'Basket';
@@ -166,6 +181,8 @@ export default function PortfolioPage() {
       currentNav: Number(p.current_nav ?? 1),
       pnl: Number(p.pnl_usdc ?? 0),
       pnlPct: Number(p.pnl_pct ?? 0),
+      basketId: p.basket?.id ?? (p as any).basket_id ?? null,
+      description: (p.basket as any)?.description ?? null,
     };
   });
   const holdings: HoldingRow[] = wallet.publicKey && usdcBalance > 0
@@ -182,6 +199,8 @@ export default function PortfolioPage() {
           currentNav: 1,
           pnl: 0,
           pnlPct: 0,
+          basketId: null,
+          description: null,
         },
       ]
     : positionRows;
@@ -200,10 +219,18 @@ export default function PortfolioPage() {
     basketName: t.basket_id ? basketNames.get(t.basket_id) ?? null : null,
     usdcDelta: Number(t.usdc_delta ?? 0),
     tokensDelta: Number(t.tokens_delta ?? 0),
+    leverageBps: Number(t.leverage_bps ?? (t.leverage ? t.leverage * 10000 : 10000)),
     createdAt: String(t.created_at ?? ''),
   }));
   txs.sort((a, b) => (a.createdAt < b.createdAt ? 1 : -1));
-  const txsView = txs.slice(0, 50);
+  // Hide DB-settled rows that have no real on-chain signature (fake
+  // "pending-…" closes and synthetic "auto_redeem_…" rows).
+  const txsView = txs
+    .filter((t) => {
+      const sig = t.signature ?? '';
+      return sig !== '' && !sig.startsWith('pending-') && !sig.startsWith('auto_redeem');
+    })
+    .slice(0, 50);
 
   const noWallet = !wallet.publicKey;
   const empty = !noWallet && !loading && holdings.length === 0 && leveragedPositions.length === 0;
@@ -233,11 +260,12 @@ export default function PortfolioPage() {
           <div style={{ paddingTop: 24, paddingBottom: 64, display: 'flex', flexDirection: 'column', gap: 24 }}>
             {noWallet && <NoWalletState />}
             {empty && <EmptyState />}
-            {!noWallet && !empty && holdings.length > 0 && (
+            {!noWallet && !empty && (holdings.length > 0 || levPositions.length > 0) && (
               <>
-                <DonutCard holdings={holdings} total={holdingsTotal} />
+                <DonutCard holdings={holdings} total={holdingsTotal} leveraged={levPositions} />
                 <HoldingsSection holdings={holdings} total={holdingsTotal} />
-                <PerformanceSection unrealizedPnl={unrealizedPnl} resolvedPnl={resolvedPnl} />
+                <LeveragedSection positions={levPositions} />
+                <PerformanceSection unrealizedPnl={unrealizedPnl} resolvedPnl={resolvedPnl} leveragedPnl={leveragedPnl} />
               </>
             )}
           </div>
@@ -246,6 +274,12 @@ export default function PortfolioPage() {
         {tab === 'history' && (
           <div style={{ paddingTop: 24, paddingBottom: 64 }}>
             <HistoryCard rows={txsView} noWallet={noWallet} />
+          </div>
+        )}
+
+        {tab === 'leverage' && (
+          <div style={{ paddingTop: 24, paddingBottom: 64 }}>
+            <LeverageTab positions={levPositions} />
           </div>
         )}
       </div>
@@ -357,6 +391,7 @@ function TabBar({ active, onChange }: { active: Tab; onChange: (t: Tab) => void 
       <div style={{ display: 'flex', gap: 32 }}>
         <TabButton label="Overview" tab="overview" active={active} onClick={() => onChange('overview')} />
         <TabButton label="History" tab="history" active={active} onClick={() => onChange('history')} />
+        <TabButton label="Leverage" tab="leverage" active={active} onClick={() => onChange('leverage')} />
       </div>
     </div>
   );
@@ -399,7 +434,29 @@ const DONUT_RADIUS = 150;
 const DONUT_STROKE = 32;
 const DONUT_STROKE_HOVER = 42;
 
-function DonutCard({ holdings, total }: { holdings: HoldingRow[]; total: number }) {
+const LEVERAGE_ORANGE = '#F97316';
+
+function DonutCard({ holdings, total, leveraged }: { holdings: HoldingRow[]; total: number; leveraged?: any[] }) {
+  // Leveraged positions enter the donut as orange segments sized by net
+  // equity (collateral minus debt minus accrued interest) — true equity.
+  const levSegments: HoldingRow[] = (leveraged ?? [])
+    .map((lp, i) => ({
+      key: `lev-${lp.id ?? i}`,
+      name: `${lp.basket_name ?? 'Basket'} ${lp.leverage ?? 2}x`,
+      subtitle: 'LEVERAGED',
+      color: LEVERAGE_ORANGE,
+      value: Math.max(0, Number(lp.net_value ?? 0)),
+      tokens: Number(lp.token_amount ?? 0),
+      entryNav: Number(lp.entry_nav ?? 1),
+      currentNav: Number(lp.current_nav ?? 1),
+      pnl: Number(lp.unrealized_pnl ?? 0),
+      pnlPct: 0,
+      basketId: null,
+      description: null,
+    }))
+    .filter((s) => s.value > 0);
+  const merged = [...holdings, ...levSegments];
+  const mergedTotal = total + levSegments.reduce((s, x) => s + x.value, 0);
   return (
     <section
       style={{
@@ -409,12 +466,12 @@ function DonutCard({ holdings, total }: { holdings: HoldingRow[]; total: number 
         padding: 48,
       }}
     >
-      <PortfolioDonut holdings={holdings} total={total} />
+      <PortfolioDonut holdings={merged} total={mergedTotal} />
 
-      {holdings.length > 0 && (
+      {merged.length > 0 && (
         <>
           <div style={{ height: 1, background: COLOR.hairline, marginTop: 32 }} />
-          <MiniLegend holdings={holdings} />
+          <MiniLegend holdings={merged} />
         </>
       )}
     </section>
@@ -422,6 +479,7 @@ function DonutCard({ holdings, total }: { holdings: HoldingRow[]; total: number 
 }
 
 function MiniLegend({ holdings }: { holdings: HoldingRow[] }) {
+  const router = useRouter();
   return (
     <div
       style={{
@@ -432,13 +490,18 @@ function MiniLegend({ holdings }: { holdings: HoldingRow[] }) {
         paddingTop: 24,
       }}
     >
-      {holdings.map((h) => (
-        <div key={h.key} style={{ display: 'flex', alignItems: 'center', gap: 8 }}>
-          <span style={{ width: 8, height: 8, borderRadius: 4, background: h.color, display: 'inline-block' }} />
-          <span style={{ fontFamily: SANS, fontSize: 12, color: COLOR.body }}>{h.name}</span>
-          <span className="font-num" style={{ fontSize: 12, color: COLOR.text }}>{formatUsd(h.value)}</span>
-        </div>
-      ))}
+      {holdings.map((h) => {
+        // Leveraged segments have key `lev-<positionId>` → click to the close page.
+        const posId = h.key.startsWith('lev-') ? h.key.slice(4) : null;
+        return (
+          <div key={h.key} onClick={() => posId && router.push(`/leverage/${posId}`)}
+            style={{ display: 'flex', alignItems: 'center', gap: 8, cursor: posId ? 'pointer' : 'default' }}>
+            <span style={{ width: 8, height: 8, borderRadius: 4, background: h.color, display: 'inline-block' }} />
+            <span style={{ fontFamily: SANS, fontSize: 12, color: COLOR.body }}>{h.name}</span>
+            <span className="font-num" style={{ fontSize: 12, color: COLOR.text }}>{formatUsd(h.value)}</span>
+          </div>
+        );
+      })}
     </div>
   );
 }
@@ -615,6 +678,7 @@ function HoldingsSection({ holdings, total }: { holdings: HoldingRow[]; total: n
 }
 
 function HoldingRowEl({ h, total, rowIndex }: { h: HoldingRow; total: number; rowIndex: number }) {
+  const router = useRouter();
   const [hovered, setHovered] = useState(false);
   const [coords, setCoords] = useState<{ x: number; y: number }>({ x: 0, y: 0 });
   const pct = total > 0 ? (h.value / total) * 100 : 0;
@@ -624,22 +688,25 @@ function HoldingRowEl({ h, total, rowIndex }: { h: HoldingRow; total: number; ro
   // Bar opacity scales with portfolio share so small holdings fade out
   // gracefully — clamped to 15% so a tiny slice is still visible.
   const barOpacity = Math.max(0.15, Math.min(1, pct / 100));
+  const clickable = Boolean(h.basketId);
 
   return (
     <div
       onMouseEnter={() => setHovered(true)}
       onMouseLeave={() => setHovered(false)}
       onMouseMove={(e) => setCoords({ x: e.clientX, y: e.clientY })}
+      onClick={() => clickable && router.push(`/baskets/${h.basketId}`)}
       style={{
         position: 'relative',
         display: 'grid',
-        gridTemplateColumns: '1fr 200px auto',
+        gridTemplateColumns: '1fr 200px auto auto',
         gap: 24,
         alignItems: 'center',
         height: 64,
         padding: '0 24px',
         background: hovered ? COLOR.rowHover : baseBg,
         transition: 'background 120ms ease-out',
+        cursor: clickable ? 'pointer' : 'default',
       }}
     >
       <div style={{ display: 'flex', alignItems: 'center', gap: 12, minWidth: 0 }}>
@@ -699,7 +766,27 @@ function HoldingRowEl({ h, total, rowIndex }: { h: HoldingRow; total: number; ro
         )}
       </div>
 
-      {hovered && <HoldingsTooltip h={h} pct={pct} coords={coords} />}
+      <div style={{ width: 80, display: 'flex', justifyContent: 'flex-end' }}>
+        {clickable && (
+          <Link
+            href={`/baskets/${h.basketId}?tab=sell`}
+            onClick={(e) => e.stopPropagation()}
+            style={{
+              border: '1px solid #CC2936',
+              color: '#CC2936',
+              padding: '8px',
+              fontSize: 12,
+              borderRadius: 4,
+              textDecoration: 'none',
+              fontFamily: SANS,
+              lineHeight: 1,
+            }}
+          >
+            Redeem
+          </Link>
+        )}
+      </div>
+
     </div>
   );
 }
@@ -716,54 +803,6 @@ function Dot({ color }: { color: string }) {
         flexShrink: 0,
       }}
     />
-  );
-}
-
-function HoldingsTooltip({ h, pct, coords }: { h: HoldingRow; pct: number; coords: { x: number; y: number } }) {
-  const flipLeft = typeof window !== 'undefined' && coords.x > window.innerWidth - 320;
-  return (
-    <div
-      style={{
-        position: 'fixed',
-        left: flipLeft ? coords.x - 280 : coords.x + 16,
-        top: coords.y + 12,
-        background: COLOR.surface,
-        border: `1px solid ${COLOR.border}`,
-        borderRadius: 8,
-        padding: 12,
-        minWidth: 260,
-        boxShadow: '0 8px 24px rgba(0,0,0,0.06)',
-        pointerEvents: 'none',
-        animation: 'tooltipFade 150ms ease-out',
-        fontFamily: SANS,
-        zIndex: 100,
-      }}
-    >
-      <style>{`
-        @keyframes tooltipFade {
-          from { opacity: 0; transform: translateY(-2px); }
-          to { opacity: 1; transform: translateY(0); }
-        }
-      `}</style>
-      <TooltipRow label="Token" value={h.name} />
-      {h.key !== 'usdc' && (
-        <TooltipRow label="Tokens held" value={h.tokens.toFixed(4)} mono />
-      )}
-      <TooltipRow label="Entry NAV" value={`$${h.entryNav.toFixed(4)}`} mono />
-      <TooltipRow label="Current NAV" value={`$${h.currentNav.toFixed(4)}`} mono />
-      <TooltipRow label="Current Value" value={formatUsd(h.value)} mono />
-      <TooltipRow label="Portfolio share" value={`${pct.toFixed(1)}%`} mono />
-      <TooltipRow
-        label="Unrealized P&L"
-        value={
-          h.key === 'usdc'
-            ? '—'
-            : `${h.pnl >= 0 ? '+' : '−'}${formatUsd(Math.abs(h.pnl))} (${h.pnl >= 0 ? '+' : '−'}${Math.abs((h.pnlPct ?? 0) * 100).toFixed(1)}%)`
-        }
-        mono
-        color={h.key === 'usdc' ? undefined : h.pnl >= 0 ? COLOR.profit : COLOR.loss}
-      />
-    </div>
   );
 }
 
@@ -789,7 +828,136 @@ function TooltipRow({
 // Performance
 // =====================================================================
 
-function PerformanceSection({ unrealizedPnl, resolvedPnl }: { unrealizedPnl: number; resolvedPnl: number }) {
+function LeveragedSection({ positions }: { positions: any[] }) {
+  if (!positions || positions.length === 0) return null;
+  return (
+    <section>
+      <SectionLabel>Leveraged Positions</SectionLabel>
+      <div style={{ borderRadius: 12, overflow: 'hidden', boxShadow: '0 1px 3px rgba(0,0,0,0.06)', background: COLOR.surface }}>
+        {positions.map((lp, i) => (
+          <LeveragedRow key={lp.id ?? i} lp={lp} />
+        ))}
+      </div>
+    </section>
+  );
+}
+
+function LeveragedRow({ lp }: { lp: any }) {
+  const router = useRouter();
+  const [hover, setHover] = useState(false);
+  const atRisk = Boolean(lp.is_at_risk);
+  const lev = Number(lp.leverage ?? 2);
+  const netValue = Number(lp.net_value ?? 0);
+  const pnl = Number(lp.unrealized_pnl ?? 0);
+  const collateral = Number(lp.collateral_usdc ?? 0);
+  const borrowed = Number(lp.borrowed_usdc ?? 0);
+  const interestAccrued = Number(lp.interest_accrued ?? 0);
+  const dailyInterest = Number(lp.daily_interest ?? 0);
+  const liqNav = Number(lp.liquidation_nav ?? 0);
+  const pnlPct = collateral > 0 ? (pnl / collateral) * 100 : 0;
+  const fmtSmall = (v: number) => (v < 0.01 && v > 0 ? `$${v.toFixed(4)}` : formatUsd(v));
+
+  return (
+    <div
+      onClick={() => lp.id && router.push(`/leverage/${lp.id}`)}
+      onMouseEnter={() => setHover(true)}
+      onMouseLeave={() => setHover(false)}
+      style={{ padding: '16px 24px', borderBottom: `1px solid ${COLOR.hairline}`, background: hover || atRisk ? '#FFF7ED' : COLOR.surface, cursor: lp.id ? 'pointer' : 'default', transition: 'background 120ms ease-out' }}
+    >
+      <div style={{ display: 'flex', justifyContent: 'space-between', alignItems: 'flex-start' }}>
+        <div style={{ display: 'flex', alignItems: 'center', gap: 12 }}>
+          <Dot color={LEVERAGE_ORANGE} />
+          <div>
+            <div style={{ display: 'flex', alignItems: 'center', gap: 8 }}>
+              <span style={{ fontFamily: SANS, fontSize: 15, fontWeight: 500, color: COLOR.text }}>{lp.basket_name ?? 'Basket'}</span>
+              <span style={{ fontSize: 11, fontWeight: 600, color: '#C2410C', background: '#FFF7ED', border: '1px solid #FED7AA', padding: '1px 7px', borderRadius: 10 }}>{lev}x</span>
+            </div>
+            <div style={{ fontSize: 11, color: COLOR.muted, fontFamily: SANS, marginTop: 2 }}>
+              Collateral: {formatUsd(collateral)} · Borrowed: {formatUsd(borrowed)}
+            </div>
+          </div>
+        </div>
+        <div style={{ textAlign: 'right' }}>
+          <div className="font-num" style={{ fontSize: 16, color: COLOR.text }}>{formatUsd(netValue)}</div>
+          <div className="font-num" style={{ fontSize: 12, color: pnl >= 0 ? COLOR.profit : COLOR.loss, marginTop: 2 }}>
+            {pnl >= 0 ? '+' : '−'}{formatUsd(Math.abs(pnl))} ({pnl >= 0 ? '+' : '−'}{Math.abs(pnlPct).toFixed(1)}%)
+          </div>
+          <div style={{ fontSize: 11, color: atRisk ? '#C2410C' : COLOR.muted, marginTop: 2 }} className="font-num">
+            {atRisk ? '⚠ ' : ''}Liq. NAV: ${liqNav.toFixed(4)}
+          </div>
+        </div>
+      </div>
+      {atRisk && (
+        <div style={{ fontSize: 11, color: '#C2410C', fontFamily: SANS, marginTop: 6 }}>Position approaching liquidation</div>
+      )}
+      <div style={{ fontSize: 11, color: COLOR.muted, fontFamily: SANS, marginTop: 6 }}>
+        Interest accrued: {fmtSmall(interestAccrued)} · {fmtSmall(dailyInterest)}/day
+      </div>
+    </div>
+  );
+}
+
+function LeverageTab({ positions }: { positions: any[] }) {
+  const router = useRouter();
+  if (!positions || positions.length === 0) {
+    return (
+      <CenteredCard>
+        <div style={{ fontSize: 18, fontWeight: 300, color: COLOR.body, fontFamily: SANS }}>No leveraged positions open</div>
+        <div style={{ fontSize: 13, color: COLOR.muted, fontFamily: SANS }}>Open a leveraged position from any basket page</div>
+      </CenteredCard>
+    );
+  }
+  const cols = ['BASKET', 'LEVERAGE', 'COLLATERAL', 'BORROWED', 'EXPOSURE', 'CURRENT NAV', 'LIQ. NAV', 'HEALTH', 'INTEREST', 'DAILY', 'OPENED'];
+  const grid = '1.3fr 0.7fr 1fr 1fr 1fr 1fr 1fr 0.8fr 1fr 1fr 1.1fr';
+  const totalBorrowed = positions.reduce((s, p) => s + Number(p.borrowed_usdc ?? 0), 0);
+  const totalInterest = positions.reduce((s, p) => s + Number(p.interest_accrued ?? 0), 0);
+  const totalDaily = positions.reduce((s, p) => s + Number(p.daily_interest ?? 0), 0);
+  const fmtSmall = (v: number) => (v > 0 && v < 0.01 ? `$${v.toFixed(4)}` : formatUsd(v));
+  const healthColor = (h: number) => (h > 60 ? COLOR.profit : h >= 40 ? '#C2410C' : COLOR.loss);
+  const fmtDate = (iso: string) => { if (!iso) return '—'; const d = new Date(iso); return Number.isNaN(d.valueOf()) ? '—' : d.toLocaleDateString(undefined, { month: 'short', day: 'numeric', year: 'numeric' }); };
+
+  return (
+    <section>
+      <SectionLabel>Open Leveraged Positions</SectionLabel>
+      <div style={{ background: COLOR.surface, borderRadius: 12, boxShadow: '0 1px 3px rgba(0,0,0,0.06)', overflow: 'hidden' }}>
+        <div style={{ display: 'grid', gridTemplateColumns: grid, gap: 12, padding: '14px 20px', borderBottom: `1px solid ${COLOR.hairline}`, fontSize: 10, color: COLOR.muted, textTransform: 'uppercase', letterSpacing: '0.06em', fontFamily: SANS }}>
+          {cols.map((c, i) => <span key={c} style={{ textAlign: i === 0 ? 'left' : 'right' }}>{c}</span>)}
+        </div>
+        {positions.map((p, idx) => {
+          const lev = Number(p.leverage ?? 2);
+          const curNav = Number(p.current_nav ?? 1);
+          const liqNav = Number(p.liquidation_nav ?? 0);
+          const health = Number(p.health_pct ?? 0);
+          const liqClose = liqNav > 0 && curNav <= liqNav * 1.2;
+          return (
+            <div
+              key={p.id ?? idx}
+              onClick={() => router.push(`/leverage/${p.id}`)}
+              style={{ display: 'grid', gridTemplateColumns: grid, gap: 12, padding: '14px 20px', borderBottom: `1px solid ${COLOR.hairline}`, alignItems: 'center', cursor: 'pointer', fontFamily: '"IBM Plex Mono", monospace', fontSize: 12, color: COLOR.text }}
+            >
+              <span style={{ fontFamily: SANS, fontWeight: 500 }}>{p.basket_name ?? 'Basket'}</span>
+              <span style={{ textAlign: 'right' }}><span style={{ fontSize: 11, fontWeight: 600, color: '#C2410C', background: '#FFF7ED', border: '1px solid #FED7AA', padding: '1px 7px', borderRadius: 10 }}>{lev}x</span></span>
+              <span style={{ textAlign: 'right' }}>{formatUsd(Number(p.collateral_usdc ?? 0))}</span>
+              <span style={{ textAlign: 'right' }}>{formatUsd(Number(p.borrowed_usdc ?? 0))}</span>
+              <span style={{ textAlign: 'right' }}>{formatUsd(Number(p.total_exposure ?? 0))}</span>
+              <span style={{ textAlign: 'right' }}>${curNav.toFixed(4)}</span>
+              <span style={{ textAlign: 'right', color: liqClose ? COLOR.loss : COLOR.text }}>${liqNav.toFixed(4)}</span>
+              <span style={{ textAlign: 'right', color: healthColor(health) }}>{health.toFixed(0)}%</span>
+              <span style={{ textAlign: 'right' }}>{fmtSmall(Number(p.interest_accrued ?? 0))}</span>
+              <span style={{ textAlign: 'right' }}>{fmtSmall(Number(p.daily_interest ?? 0))}/day</span>
+              <span style={{ textAlign: 'right', fontFamily: SANS }}>{fmtDate(p.opened_at)}</span>
+            </div>
+          );
+        })}
+        <div style={{ padding: '12px 20px', fontSize: 12, color: COLOR.body, fontFamily: SANS }}>
+          Total borrowed: {formatUsd(totalBorrowed)} · Total interest owed: {fmtSmall(totalInterest)} · Total daily: {fmtSmall(totalDaily)}/day
+        </div>
+      </div>
+    </section>
+  );
+}
+
+function PerformanceSection({ unrealizedPnl, resolvedPnl, leveragedPnl }: { unrealizedPnl: number; resolvedPnl: number; leveragedPnl: number }) {
   return (
     <section>
       <div
@@ -802,9 +970,10 @@ function PerformanceSection({ unrealizedPnl, resolvedPnl }: { unrealizedPnl: num
         }}
       >
         <SectionLabel>Performance</SectionLabel>
-        <div style={{ display: 'grid', gridTemplateColumns: '1fr 1fr', gap: 48 }}>
+        <div style={{ display: 'grid', gridTemplateColumns: '1fr 1fr 1fr', gap: 48 }}>
           <PerfCell label="Unrealized P&L" value={unrealizedPnl} />
           <PerfCell label="Resolved P&L" value={resolvedPnl} />
+          <PerfCell label="Leveraged P&L" value={leveragedPnl} />
         </div>
         <div style={{ marginTop: 16, fontSize: 11, color: COLOR.muted, fontFamily: SANS }}>
           Positions resolve as prediction market legs close
@@ -1045,7 +1214,7 @@ function HistoryRow({ row }: { row: TxRow }) {
       <span className="font-num" style={{ textAlign: 'right', fontSize: 13, color: COLOR.body }}>
         {tokens > 0 && row.basketName ? `${tokens.toFixed(4)} ${row.basketName}` : '—'}
       </span>
-      <span style={{ textAlign: 'right', fontSize: 13, color: COLOR.body }}>1x</span>
+      <span style={{ textAlign: 'right', fontSize: 13, color: COLOR.body }}>{Math.max(1, Math.round((row.leverageBps || 10000) / 10000))}x</span>
       <span style={{ textAlign: 'right' }}>
         <a
           href={explorerUrl}

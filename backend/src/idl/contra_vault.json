@@ -217,6 +217,13 @@
           "writable": true
         },
         {
+          "name": "fee_treasury",
+          "docs": [
+            "Authority's USDC ATA — receives the 0.5% protocol fee on deposit."
+          ],
+          "writable": true
+        },
+        {
           "name": "token_program",
           "address": "TokenkegQfeZyiNwAJbNbGKPFXCWuBvf9Ss623VQ5DA"
         }
@@ -802,6 +809,141 @@
         {
           "name": "outcome",
           "type": "u8"
+        }
+      ]
+    },
+    {
+      "name": "withdraw",
+      "docs": [
+        "Mark-to-market withdraw on an Active/Resolving vault. The current NAV",
+        "(USDC per CTRS, RATIO_SCALE-scaled) is supplied by the backend and the",
+        "authority co-signs to attest it — the program cannot read live market",
+        "prices. Burns exactly `amount_tokens`, returns",
+        "amount_tokens × nav × (1 − fee) to the user and routes the 0.5% fee to",
+        "the fee treasury. payout = gross; both legs are paid out of vault USDC."
+      ],
+      "discriminator": [
+        183,
+        18,
+        70,
+        156,
+        148,
+        109,
+        161,
+        34
+      ],
+      "accounts": [
+        {
+          "name": "vault",
+          "writable": true,
+          "pda": {
+            "seeds": [
+              {
+                "kind": "const",
+                "value": [
+                  118,
+                  97,
+                  117,
+                  108,
+                  116
+                ]
+              },
+              {
+                "kind": "account",
+                "path": "vault.basket_uuid",
+                "account": "Vault"
+              }
+            ]
+          }
+        },
+        {
+          "name": "contra_mint",
+          "writable": true,
+          "pda": {
+            "seeds": [
+              {
+                "kind": "const",
+                "value": [
+                  99,
+                  111,
+                  110,
+                  116,
+                  114,
+                  97,
+                  95,
+                  109,
+                  105,
+                  110,
+                  116
+                ]
+              },
+              {
+                "kind": "account",
+                "path": "vault"
+              }
+            ]
+          }
+        },
+        {
+          "name": "vault_usdc_account",
+          "writable": true,
+          "pda": {
+            "seeds": [
+              {
+                "kind": "const",
+                "value": [
+                  118,
+                  97,
+                  117,
+                  108,
+                  116,
+                  95,
+                  117,
+                  115,
+                  100,
+                  99
+                ]
+              },
+              {
+                "kind": "account",
+                "path": "vault"
+              }
+            ]
+          }
+        },
+        {
+          "name": "user",
+          "writable": true,
+          "signer": true
+        },
+        {
+          "name": "user_contra_account",
+          "writable": true
+        },
+        {
+          "name": "user_usdc_account",
+          "writable": true
+        },
+        {
+          "name": "fee_treasury",
+          "docs": [
+            "Authority's USDC ATA — receives the 0.5% protocol fee on withdraw."
+          ],
+          "writable": true
+        },
+        {
+          "name": "token_program",
+          "address": "TokenkegQfeZyiNwAJbNbGKPFXCWuBvf9Ss623VQ5DA"
+        }
+      ],
+      "args": [
+        {
+          "name": "amount_tokens",
+          "type": "u64"
+        },
+        {
+          "name": "nav_scaled",
+          "type": "u64"
         }
       ]
     }

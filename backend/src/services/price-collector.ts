@@ -36,6 +36,7 @@ import {
   listLegs,
   listTrackedMarkets,
   recordPricePoint,
+  setScoredMarketStatus,
   updateTrackedMarket,
   type Leg,
   type TrackedMarket,
@@ -119,6 +120,35 @@ export interface CollectAllSummary {
   skipped_too_soon: number; // matched but cadence interval not elapsed
   skipped_no_match: number; // tracked market not in the Gamma batch
   errors: number;
+  flagged: Array<{ condition_id: string; price: number; reason: string }>;
+}
+
+/**
+ * If a live price has moved out of the actionable longshot range, flag the
+ * scored market so it leaves the basket-eligible set. Returns a reason
+ * string when flagged, or null. Self-adjusts the model to live moves.
+ */
+async function flagIfMoved(conditionId: string, price: number): Promise<string | null> {
+  let signal: string | null | undefined;
+  let reason: string | null = null;
+  if (price >= 0.8) {
+    signal = 'resolved_likely';
+    reason = `moved to ${price.toFixed(3)} — flagged as resolved_likely`;
+  } else if (price <= 0.01) {
+    signal = 'resolved_likely';
+    reason = `moved to ${price.toFixed(3)} — flagged as resolved_likely`;
+  } else if (price > 0.15) {
+    reason = `moved above ceiling to ${price.toFixed(3)}`;
+  } else {
+    return null; // still in band
+  }
+  try {
+    await setScoredMarketStatus(conditionId, { include_in_basket: false, ...(signal !== undefined ? { signal } : {}) });
+    console.info(`[price-collector] market ${conditionId} ${reason}`);
+  } catch (e) {
+    console.warn(`[price-collector] flag failed ${conditionId}: ${(e as Error).message}`);
+  }
+  return reason;
 }
 
 /**
@@ -202,6 +232,7 @@ export async function collectAllPrices(): Promise<CollectAllSummary> {
   let tooSoon = 0;
   let noMatch = 0;
   let errors = 0;
+  const flagged: Array<{ condition_id: string; price: number; reason: string }> = [];
 
   for (const m of tracked) {
     const price = priceById.get(m.condition_id);
@@ -209,6 +240,11 @@ export async function collectAllPrices(): Promise<CollectAllSummary> {
       noMatch += 1;
       continue;
     }
+
+    // Self-adjusting: flag markets whose live price has left the longshot
+    // band, regardless of the recording cadence below.
+    const reason = await flagIfMoved(m.condition_id, price);
+    if (reason) flagged.push({ condition_id: m.condition_id, price, reason });
 
     const days = daysToCloseFromIso(m.resolution_date);
     const interval = TIER_INTERVAL_MS[tierForDays(days)];
@@ -251,6 +287,10 @@ export async function collectAllPrices(): Promise<CollectAllSummary> {
     );
   }
 
+  if (flagged.length > 0) {
+    console.info(`[price-collector] flagged ${flagged.length} market(s) as moved/resolved_likely`);
+  }
+
   return {
     total: tracked.length,
     fetched: gamma.length,
@@ -258,7 +298,34 @@ export async function collectAllPrices(): Promise<CollectAllSummary> {
     skipped_too_soon: tooSoon,
     skipped_no_match: noMatch,
     errors,
+    flagged,
   };
+}
+
+/**
+ * Collect prices for tracked Kalshi markets (source='kalshi', unresolved).
+ * One GET /markets/{ticker} per market, 500ms apart. Writes to
+ * market_price_history. No-op while no Kalshi markets are tracked.
+ */
+export async function collectKalshiPrices(): Promise<{ total: number; collected: number }> {
+  const { getKalshiMarketPrice } = await import('./kalshi');
+  const tracked = (await listTrackedMarkets({ onlyOpen: true }).catch(() => []))
+    .filter((t) => t.source === 'kalshi');
+  let collected = 0;
+  for (const t of tracked) {
+    try {
+      const px = await getKalshiMarketPrice(t.condition_id);
+      if (px) {
+        await recordPricePoint({ condition_id: t.condition_id, source: 'kalshi', price: px.p_market, days_to_close: null });
+        collected += 1;
+      }
+    } catch (e) {
+      console.warn(`[price-collector] kalshi ${t.condition_id} failed: ${(e as Error).message}`);
+    }
+    await new Promise((r) => setTimeout(r, 500));
+  }
+  if (tracked.length > 0) console.info(`[price-collector] Kalshi: ${collected}/${tracked.length} markets updated`);
+  return { total: tracked.length, collected };
 }
 
 /**

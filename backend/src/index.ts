@@ -28,6 +28,7 @@ import { idlsAvailable, hasAuthority } from './solana/client';
 
 import { basketsRouter } from './routes/baskets';
 import { depositRouter } from './routes/deposit';
+import { redeemRouter } from './routes/redeem';
 import { marketsRouter } from './routes/markets';
 import { scannerRouter } from './routes/scanner';
 import { leverageRouter } from './routes/leverage';
@@ -69,6 +70,7 @@ app.get('/health', async (_req, res) => {
 
 app.use('/api/baskets', basketsRouter);
 app.use('/api/deposit', depositRouter);
+app.use('/api/redeem', redeemRouter);
 app.use('/api/markets', marketsRouter);
 app.use('/api/scanner', scannerRouter);
 app.use('/api/leverage', leverageRouter);

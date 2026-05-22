@@ -34,6 +34,7 @@ import {
   getScreenedMarket,
   getScoredMarket,
   listRecentlyExcluded,
+  getLatestPricesMap,
   type ScreenedMarket,
   type TrackedMarket,
 } from '../db/queries';
@@ -57,6 +58,8 @@ interface ScannerMarketRow {
   question: string;
   source: string;
   p_market: number;
+  /** Original screened price (set at screening time, never updated). */
+  p_market_screened: number;
   p_model: number;
   adjusted_edge: number;
   edge: number; // raw base edge (p_market - p_model), legacy alias for raw_edge
@@ -72,6 +75,7 @@ interface ScannerMarketRow {
   screened: boolean;
   excluded: boolean;
   impossible: boolean;
+  constitutional: boolean;
   exclusion_reason: string | null;
   include_in_basket: boolean;
   model_version: string | null;
@@ -81,6 +85,23 @@ interface ScannerMarketRow {
   is_tournament_market: boolean;
   normalized_p_market: number | null;
   is_favorite: boolean;
+  /**
+   * Three-zone pricing model (computed from the LIVE p_market):
+   *   1 = classic longshot (2-10%, SHORT, overpriced) → blue
+   *   2 = underpriced contender (10-20%, LONG, underpriced) → green
+   *   3 = near-certain (90%+, LONG; the NO side is overpriced) → amber
+   *   4 = fair value (20-89%) — excluded from default view
+   *   0 = too small (<2%) — excluded
+   */
+  zone: 0 | 1 | 2 | 3 | 4;
+  /** Badge label by edge SIGN (not zone): >0 overpriced, <0 underpriced, ~0 fair value. */
+  badge: 'overpriced' | 'underpriced' | 'fair value';
+  /** Zone-3 only: 1 − p_market (how overpriced the NO side is). */
+  residual: number | null;
+  /** True when the live price has diverged >20pts from the screened price. */
+  model_stale: boolean;
+  /** Stored signal == 'resolved_likely' (price collector flagged it). */
+  resolved_likely: boolean;
   /**
    * True when this row is sourced from the live-Polymarket ephemeral
    * favorites cache (i.e. NOT in `scored_markets`). The default scanner
@@ -112,7 +133,22 @@ async function buildScoredRows(): Promise<ScannerMarketRow[]> {
   const trackedById = new Map<string, TrackedMarket>();
   for (const t of tracked) trackedById.set(t.condition_id, t);
 
-  const rows: ScannerMarketRow[] = scored.map((sd) => {
+  // LIVE prices from market_price_history (written every 15 min by the price
+  // collector). The scanner displays these instead of the stale screened
+  // price; p_model stays fixed and edge/signal are recomputed on the fly.
+  const livePrices = await getLatestPricesMap(scored.map((s) => s.condition_id)).catch(
+    () => new Map<string, { price: number; recorded_at: string }>(),
+  );
+
+  const rows: ScannerMarketRow[] = scored
+    // Drop markets that have resolved — once tracked_markets.resolved_at is
+    // stamped (by the resolution monitor / daily sweep) the market leaves the
+    // live scanner pool and the next-best in its category takes the slot.
+    .filter((sd) => {
+      const tm = trackedById.get(sd.condition_id);
+      return !(tm && tm.resolved_at);
+    })
+    .map((sd) => {
     const sc = screenedById.get(sd.condition_id) ?? null;
     const tm = trackedById.get(sd.condition_id) ?? null;
 
@@ -131,8 +167,9 @@ async function buildScoredRows(): Promise<ScannerMarketRow[]> {
       if (!Number.isNaN(t)) days = Math.max(0, Math.round((t - Date.now()) / 86_400_000));
     }
 
+    const screenedPrice = sd.p_market ?? 0;
     const layered = computeLayeredScore({
-      p_market: sd.p_market ?? 0,
+      p_market: screenedPrice,
       question: sd.question,
       isImpossible: impossible,
       excludedByScreener,
@@ -141,17 +178,42 @@ async function buildScoredRows(): Promise<ScannerMarketRow[]> {
       category: sd.category ?? null,
     });
 
+    // Live price overrides the screened price for display + edge/signal.
+    // p_model stays fixed (the model estimate); edge = live − model.
+    const live = livePrices.get(sd.condition_id);
+    const livePrice = live && Number.isFinite(live.price) ? live.price : screenedPrice;
+    const zone = computeZone(livePrice);
+
+    // Zone 3 (90%+): the model says this WILL happen → p_model = 1.0, the NO
+    // side (residual = 1 − p_market) is what's overpriced; edge is negative.
+    let pModel = layered.p_model;
+    let liveRawEdge = impossible ? livePrice : livePrice - layered.p_model;
+    let residual: number | null = null;
+    if (zone === 3) {
+      pModel = 1.0;
+      liveRawEdge = livePrice - 1.0;
+      residual = 1 - livePrice;
+    }
+    const liveAdjEdge = liveRawEdge * layered.time_factor * layered.volume_factor;
+    const liveSignal: Signal =
+      zone === 3
+        ? classifySignal(liveRawEdge)
+        : impossible
+        ? (liveRawEdge > 0 ? 'strong_short' : classifySignal(liveRawEdge))
+        : classifySignal(liveRawEdge);
+
     return {
       condition_id: sd.condition_id,
       marketId: sd.condition_id,
       question: sd.question,
       source: sd.source,
-      p_market: sd.p_market ?? 0,
-      p_model: layered.p_model,
-      adjusted_edge: layered.adjusted_edge,
-      edge: layered.raw_edge,
-      raw_edge: layered.raw_edge,
-      signal: layered.signal,
+      p_market: livePrice,
+      p_market_screened: screenedPrice,
+      p_model: pModel,
+      adjusted_edge: liveAdjEdge,
+      edge: liveRawEdge,
+      raw_edge: liveRawEdge,
+      signal: liveSignal,
       time_factor: layered.time_factor,
       category_factor: layered.category_factor,
       volume_factor: layered.volume_factor,
@@ -161,14 +223,22 @@ async function buildScoredRows(): Promise<ScannerMarketRow[]> {
       volume,
       screened: Boolean(sc),
       excluded: excludedByScreener,
-      impossible,
-      exclusion_reason: sc?.exclusion_reason ?? null,
+      impossible: impossible || layered.constitutional,
+      constitutional: layered.constitutional,
+      exclusion_reason: layered.constitutional
+        ? 'Constitutional constraint (22nd Amendment — no third term)'
+        : sc?.exclusion_reason ?? null,
       include_in_basket: layered.include_in_basket,
       model_version: sd.model_version ?? null,
       tournament_group: detectTournamentGroup(sd.question),
       is_tournament_market: false,
       normalized_p_market: null,
       is_favorite: false,
+      zone,
+      badge: computeBadge(liveRawEdge),
+      residual,
+      model_stale: Math.abs(livePrice - screenedPrice) > 0.2,
+      resolved_likely: sd.signal === 'resolved_likely',
       is_ephemeral: false,
     };
   });
@@ -188,6 +258,7 @@ async function buildScoredRows(): Promise<ScannerMarketRow[]> {
       question: f.question,
       source: f.source,
       p_market: f.p_market,
+      p_market_screened: f.p_market,
       p_model: f.p_model,
       raw_edge: f.raw_edge,
       edge: f.raw_edge,
@@ -203,6 +274,7 @@ async function buildScoredRows(): Promise<ScannerMarketRow[]> {
       screened: false,
       excluded: false,
       impossible: false,
+      constitutional: false,
       exclusion_reason: null,
       include_in_basket: false,
       model_version: f.model_version,
@@ -214,6 +286,11 @@ async function buildScoredRows(): Promise<ScannerMarketRow[]> {
       // rows whose raw_edge ended up positive (tournament longshots
       // sitting above the screener ceiling) are NOT tagged as favorites.
       is_favorite: (f as { is_favorite?: boolean }).is_favorite ?? f.raw_edge <= 0,
+      zone: computeZone(f.normalized_p_market ?? f.p_market, true),
+      badge: computeBadge(f.raw_edge),
+      residual: null,
+      model_stale: false,
+      resolved_likely: false,
       is_ephemeral: true,
     });
   }
@@ -270,6 +347,8 @@ function applyTournamentNormalizationInPlace(rows: ScannerMarketRow[]): void {
       m.edge = newRawEdge;
       m.adjusted_edge = newAdjEdge;
       m.signal = classifySignal(newRawEdge);
+      m.badge = computeBadge(newRawEdge);
+      m.zone = computeZone(newPMarket, true); // tournament → wider zone-2 ceiling
       // Tournament longshot threshold (0.02) is looser than the standard
       // EDGE_INCLUDE_THRESHOLD because normalized edges sit closer to 0.
       m.include_in_basket = newRawEdge > TOURNAMENT_EDGE_INCLUDE_THRESHOLD;
@@ -289,6 +368,51 @@ function categoryScore(row: ScannerMarketRow): number {
   const rawEdge = Math.abs(Number(row.raw_edge ?? row.edge ?? 0));
   const volume = Math.max(Number(row.volume ?? 10_000), 1);
   return rawEdge * Math.log10(volume + 1);
+}
+
+/** Badge label purely from edge SIGN (not zone). */
+function computeBadge(rawEdge: number): 'overpriced' | 'underpriced' | 'fair value' {
+  if (!Number.isFinite(rawEdge) || Math.abs(rawEdge) < 0.01) return 'fair value';
+  return rawEdge > 0 ? 'overpriced' : 'underpriced';
+}
+
+/**
+ * Range/bracket markets are not binary yes/no — exclude them. Matches
+ * "between X and/&  Y" where Y carries a %/$/B/T unit.
+ * e.g. "between $1T and $1.25T", "CPI between 2.5% and 3.0%".
+ */
+export function isRangeMarket(question: string): boolean {
+  const q = (question || '').toLowerCase();
+  if (!/\bbetween\b/.test(q)) return false;
+  if (!/\band\b|&/.test(q)) return false;
+  return /[%$]|\d\s*[bt]\b/.test(q);
+}
+
+/**
+ * Three-zone classification. Tournament favorites get a wider zone-2 ceiling
+ * (25% vs 20%) — a World Cup favorite at 20-25% (e.g. France 20.3%) is still
+ * a legitimately interesting underpriced market.
+ */
+function computeZone(p: number, isTournament = false): 0 | 1 | 2 | 3 | 4 {
+  if (!Number.isFinite(p) || p < 0.02) return 0; // too small
+  if (p < 0.1) return 1; // classic longshot (short)
+  if (p <= (isTournament ? 0.25 : 0.2)) return 2; // underpriced contender (long)
+  if (p >= 0.9) return 3; // near-certain (long, NO side overpriced)
+  return 4; // fair value — excluded from default
+}
+
+/** Default-view eligibility: zones 1/2/3 only, not resolved/near-closed. */
+function isZoneEligible(r: ScannerMarketRow): boolean {
+  if (r.resolved_likely) return false;
+  if (r.days_to_close != null && r.days_to_close < 3) return false;
+  return r.zone === 1 || r.zone === 2 || r.zone === 3;
+}
+
+/** Ranking score that mixes zones: zone 3 by residual, else by edge×liquidity. */
+function zonedScore(r: ScannerMarketRow): number {
+  const volume = Math.max(Number(r.volume ?? 10_000), 1);
+  if (r.zone === 3) return Number(r.residual ?? 0) * Math.log10(volume + 1);
+  return categoryScore(r);
 }
 
 const CATEGORY_ORDER: Array<'politics' | 'sports' | 'macro' | 'crypto' | 'other'> = [
@@ -349,74 +473,98 @@ function pickEligibleFirst(rows: ScannerMarketRow[], n: number): ScannerMarketRo
   return [...tier1, ...tier2, ...tier3].slice(0, n);
 }
 
-function getCategoryTopMarkets(
-  curated: ScannerMarketRow[],
-  fullPool: ScannerMarketRow[],
-): CategoryGroup[] {
-  const bucketize = (rows: ScannerMarketRow[]) => {
-    const m = new Map<string, ScannerMarketRow[]>();
-    for (const r of rows) {
-      const cat = (r.category ?? 'other').toLowerCase();
-      const bucket = CATEGORY_ORDER.includes(cat as typeof CATEGORY_ORDER[number])
-        ? cat
-        : 'other';
-      const arr = m.get(bucket) ?? [];
-      arr.push(r);
-      m.set(bucket, arr);
-    }
-    return m;
-  };
+// Filler words dropped before similarity so phrasing differences ("hit" vs
+// "reach", "will … by") don't hide genuine duplicates.
+const DEDUP_STOPWORDS = new Set([
+  'will', 'the', 'by', 'win', 'wins', 'hit', 'hits', 'reach', 'reaches', 'be', 'get', 'gets',
+  'and', 'for', 'this', 'that', 'year', 'end', 'before', 'after', 'than', 'over', 'under',
+]);
 
-  const curatedByCat = bucketize(curated);
-  // For sports longs we tap the full pool (curated + ephemeral tournament
-  // favorites). Other categories stay on the curated pool only.
-  const fullByCat = bucketize(fullPool);
+function tokenize(s: string): Set<string> {
+  // Normalize numbers so "$150k" and "150,000" collapse to the same token —
+  // otherwise "Bitcoin hit $150k" and "Bitcoin reach $150,000" look distinct.
+  const normalized = (s || '')
+    .toLowerCase()
+    .replace(/(\d),(\d)/g, '$1$2') // strip thousands separators: 150,000 → 150000
+    .replace(/(\d+)k\b/g, (_m, n) => String(Number(n) * 1000)) // 150k → 150000
+    .replace(/[^a-z0-9 ]/g, ' ');
+  return new Set(normalized.split(/\s+/).filter((t) => t.length > 2 && !DEDUP_STOPWORDS.has(t)));
+}
+function jaccard(a: Set<string>, b: Set<string>): number {
+  if (!a.size || !b.size) return 0;
+  let inter = 0;
+  for (const t of a) if (b.has(t)) inter++;
+  return inter / (a.size + b.size - inter);
+}
+
+/** Drop near-duplicate questions (>80% token similarity), keeping higher volume. */
+function dedupeSimilar(rows: ScannerMarketRow[]): ScannerMarketRow[] {
+  const byVol = [...rows].sort((a, b) => Number(b.volume ?? 0) - Number(a.volume ?? 0));
+  const kept: Array<{ r: ScannerMarketRow; toks: Set<string> }> = [];
+  for (const r of byVol) {
+    const toks = tokenize(r.question);
+    if (kept.some((k) => jaccard(k.toks, toks) > 0.8)) continue;
+    kept.push({ r, toks });
+  }
+  return kept.map((k) => k.r);
+}
+
+const ELIGIBLE_MIN_VOLUME = 50_000;
+const AUTO_DISCOVERY_MIN_VOLUME = 100_000;
+
+/** Tier-1 volume bar: auto-discovered (un-Anthropic-screened) markets need a
+ *  higher $100k bar; weekly-screened markets keep the $50k floor. */
+function tier1MinVolume(r: ScannerMarketRow): number {
+  return r.model_version === 'auto_discovery' ? AUTO_DISCOVERY_MIN_VOLUME : ELIGIBLE_MIN_VOLUME;
+}
+
+/**
+ * Tiered eligible-first selection (applies to ALL categories):
+ *   Tier 1: 3-365d AND volume ≥ $50k ($100k for auto-discovered)
+ *   Tier 2: 3-365d AND below the tier-1 bar (near-term, thin liquidity)
+ *   Tier 3: days > 365 / unknown        (2028 elections, far-future)
+ * Within each tier, sort by zonedScore. Fill 5 from T1, then T2, then T3 —
+ * so far-future markets only appear when <5 near-term ones exist.
+ */
+function tieredPick(rows: ScannerMarketRow[], n: number): ScannerMarketRow[] {
+  const byScore = (a: ScannerMarketRow, b: ScannerMarketRow) => zonedScore(b) - zonedScore(a);
+  const t1 = rows.filter((r) => isInBasketWindow(r) && Number(r.volume ?? 0) >= tier1MinVolume(r)).sort(byScore);
+  const t2 = rows.filter((r) => isInBasketWindow(r) && Number(r.volume ?? 0) < tier1MinVolume(r)).sort(byScore);
+  const t3 = rows.filter((r) => !isInBasketWindow(r)).sort(byScore);
+  return [...t1, ...t2, ...t3].slice(0, n);
+}
+
+function getCategoryTopMarkets(pool: ScannerMarketRow[]): CategoryGroup[] {
+  const byCat = new Map<string, ScannerMarketRow[]>();
+  for (const r of pool) {
+    if (!isZoneEligible(r)) continue; // zones 1/2/3 only; excludes fair (4), tiny (0), resolved, <3d
+    if (isRangeMarket(r.question)) continue; // FIX 1: no range/bracket markets
+    const cat = (r.category ?? 'other').toLowerCase();
+    const bucket = CATEGORY_ORDER.includes(cat as typeof CATEGORY_ORDER[number]) ? cat : 'other';
+    const arr = byCat.get(bucket) ?? [];
+    arr.push(r);
+    byCat.set(bucket, arr);
+  }
 
   const groups: CategoryGroup[] = [];
   for (const cat of CATEGORY_ORDER) {
-    const curatedCat = curatedByCat.get(cat) ?? [];
-    let picked: ScannerMarketRow[];
-    let longStart: number | null = null;
-    let shortCount = 0;
-    let longCount = 0;
-
-    if (cat === 'sports') {
-      // Sports shorts come from the curated pool with eligible-first
-      // ranking — same as every other category.
-      const shorts = pickEligibleFirst(
-        curatedCat.filter((r) => isShortSignal(r.signal)),
-        3,
-      );
-      // Sports longs come from the FULL pool because tournament favorites
-      // (France, OKC Thunder, Carolina Hurricanes etc.) live in the
-      // ephemeral cache. Per spec, LONG slots are allowed to use
-      // ephemeral rows regardless of basket eligibility — they're
-      // surfaced for the long-basket product, not for the short basket.
-      const fullCat = fullByCat.get(cat) ?? [];
-      const longs = fullCat
-        .filter((r) => isLongSignal(r.signal) && !isNearClosed(r))
-        .sort((a, b) => categoryScore(b) - categoryScore(a))
-        .slice(0, 2);
-      picked = [...shorts, ...longs];
-      shortCount = shorts.length;
-      longCount = longs.length;
-      longStart = shorts.length > 0 && longs.length > 0 ? shorts.length : null;
-    } else {
-      // Politics / macro / crypto / other: 5 slots filled eligible-first.
-      // 2028-election questions only appear when fewer than 5 near-term
-      // basket-eligible rows exist in the category.
-      picked = pickEligibleFirst(curatedCat, 5);
-      shortCount = picked.filter((r) => isShortSignal(r.signal)).length;
-      longCount = picked.filter((r) => isLongSignal(r.signal)).length;
+    const cands = byCat.get(cat) ?? [];
+    // Dedupe by condition_id (a favorite can appear in both pools) keeping higher vol.
+    const seen = new Map<string, ScannerMarketRow>();
+    for (const r of cands) {
+      const prev = seen.get(r.condition_id);
+      if (!prev || Number(r.volume ?? 0) > Number(prev.volume ?? 0)) seen.set(r.condition_id, r);
     }
-
-    const enriched = picked.map((r) => ({ ...r, score: Number(categoryScore(r).toFixed(6)) }));
+    // FIX 3: collapse near-duplicate questions; FIX 4/5: tiered eligible-first.
+    const deduped = dedupeSimilar([...seen.values()]);
+    const picked = tieredPick(deduped, 5);
+    const enriched = picked.map((r) => ({ ...r, score: Number(zonedScore(r).toFixed(6)) }));
     groups.push({
       category: cat,
       markets: enriched,
-      short_count: shortCount,
-      long_count: longCount,
-      long_section_start: longStart,
+      short_count: picked.filter((r) => r.zone === 1).length,
+      long_count: picked.filter((r) => r.zone === 2 || r.zone === 3).length,
+      long_section_start: null,
     });
   }
   return groups;
@@ -447,8 +595,10 @@ scannerRouter.get('/markets', async (req, res) => {
     }
     const all = scoredCache!.rows;
 
-    const polymarket = all.filter((r) => r.source === 'polymarket').length;
-    const kalshi = all.filter((r) => r.source === 'kalshi').length;
+    // Source totals reflect the curated scored_markets pool only — ephemeral
+    // tournament favorites are NOT counted (they'd inflate "from Polymarket").
+    const polymarket = all.filter((r) => r.source === 'polymarket' && !r.is_ephemeral).length;
+    const kalshi = all.filter((r) => r.source === 'kalshi' && !r.is_ephemeral).length;
 
     // Curated-pool count for the default-view label. Ephemeral tournament
     // rows (live favorites cached separately) are excluded — they only
@@ -490,7 +640,10 @@ scannerRouter.get('/markets', async (req, res) => {
     // favorites — they sit above the screener's 0.10 ceiling so they
     // never appear in scored_markets, but they ARE the long candidates.
     if (!search) {
-      const grouped = getCategoryTopMarkets(filtered, all);
+      // Pass the FULL pool (incl. ephemeral tournament favorites) so zone-2
+      // contenders like France 16.9% are eligible; zone filtering keeps the
+      // 0.1% noise out.
+      const grouped = getCategoryTopMarkets(all);
       res.json({
         at: scoredCache!.at,
         count: all.length,

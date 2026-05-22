@@ -89,7 +89,7 @@ function Hero() {
               margin: 0,
             }}
           >
-            Longshots lose. We bet on that.
+            Bet against the obvious.
           </h1>
           <p
             style={{
@@ -101,18 +101,52 @@ function Hero() {
               lineHeight: 1.65,
             }}
           >
-            Humans are wired to overpay for unlikely outcomes. A 3% chance feels like a lottery ticket.
-            People buy it anyway. That mispricing is systematic, documented, and until now nobody built
-            infrastructure to profit from it at scale.
+            Humans are wired to overpay for unlikely outcomes. A 3% chance feels like a lottery ticket,
+            so people buy it anyway. Contra packages the other side of that bias into tokenized short
+            baskets you can hold to resolution.
           </p>
           <div className="flex" style={{ gap: 12, marginTop: 32 }}>
             <HoverButton href="/baskets" variant="filled">View Baskets</HoverButton>
             <HoverButton href="#how-it-works" variant="outline">How It Works</HoverButton>
           </div>
+          <LiveStatsBar />
         </div>
         <div aria-hidden />
       </div>
     </section>
+  );
+}
+
+// Live stats bar — real data from the API, no fabricated numbers.
+function LiveStatsBar() {
+  const [stats, setStats] = useState<{ markets: number; baskets: number; avgNav: number } | null>(null);
+  useEffect(() => {
+    let cancelled = false;
+    (async () => {
+      try {
+        const [scan, bk] = await Promise.all([
+          api.scanner.markets({ min: 0.02, max: 0.2 }).catch(() => null),
+          api.baskets.list().catch(() => null),
+        ]);
+        if (cancelled) return;
+        const baskets = bk?.baskets ?? [];
+        const navs = baskets.map((b: any) => Number(b.nav ?? b.current_nav ?? 1)).filter((n: number) => Number.isFinite(n));
+        const avgNav = navs.length ? navs.reduce((s: number, n: number) => s + n, 0) / navs.length : 1;
+        const markets = Number((scan as any)?.watched_count ?? (scan as any)?.count ?? 0);
+        setStats({ markets, baskets: baskets.length, avgNav });
+      } catch { /* leave null */ }
+    })();
+    return () => { cancelled = true; };
+  }, []);
+  if (!stats) return null;
+  return (
+    <div style={{ marginTop: 24, fontSize: 13, color: '#6B6B6B', fontFamily: '"IBM Plex Mono", monospace' }}>
+      {stats.markets} markets tracked
+      <span style={{ color: '#C0C0C0', margin: '0 8px' }}>·</span>
+      {stats.baskets} active baskets
+      <span style={{ color: '#C0C0C0', margin: '0 8px' }}>·</span>
+      ${stats.avgNav.toFixed(2)} avg NAV
+    </div>
   );
 }
 
@@ -157,18 +191,18 @@ function StatsStrip({ count, onCount }: { count: number | null; onCount: (n: num
     let cancelled = false;
     (async () => {
       try {
-        const r = await api.scanner.markets(0.02, 0.15);
+        const r = await api.scanner.markets({ min: 0.02, max: 0.15 });
         if (!cancelled && typeof r.count === 'number') onCount(r.count);
       } catch { /* leave count null */ }
     })();
     return () => { cancelled = true; };
   }, [count, onCount]);
 
-  const liveCount = count != null ? `${count}` : '—';
+  const liveCount = count != null ? `${count}` : '…';
   const stats = [
-    { value: '$40M+', label: 'extracted from Polymarket in 12 months by systematic traders' },
-    { value: '94%',   label: 'of longshot markets resolve exactly as expected' },
     { value: liveCount, label: 'mispriced markets identified right now' },
+    { value: 'Devnet', label: 'live today on Solana devnet' },
+    { value: 'v5.1', label: 'calibration model screening every market' },
   ];
   return (
     <section
@@ -206,9 +240,9 @@ function StatsStrip({ count, onCount }: { count: number | null; onCount: (n: num
 // ============== PROBLEM ==============
 function ProblemSection() {
   const FACTS = [
-    '7,000+ documented mispricings on Polymarket in 2024-2025',
-    '$40M+ extracted by arbitrageurs in one year',
-    'Longshot bias holds across every market category',
+    'Documented across decades of behavioral economics research',
+    'Persists in elections, sports, crypto, and macro markets',
+    'Now shortable, systematically, on-chain',
   ];
   return (
     <section className="bg-white" style={{ padding: '48px 80px' }}>

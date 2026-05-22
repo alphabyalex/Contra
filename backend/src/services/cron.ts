@@ -14,25 +14,26 @@
 
 import cron from 'node-cron';
 import { snapshotAllActive } from './nav';
-import { refreshHealthAll } from './leverage';
+import { checkLeverageHealth } from './leverage';
 import {
   scanLongshots as scanPoly,
   getAllActiveMarkets as getAllPoly,
   flattenOutcomes as flattenPoly,
   daysToClose,
 } from './polymarket';
-import { scanLongshots as scanKalshi } from './kalshi';
+import { scanLongshots as scanKalshi, fetchKalshiMarkets } from './kalshi';
 import { scoreMany, type ScorableMarket } from './mispricing';
-import { batchScreenMarkets, type MarketToScreen } from './screener';
+import { batchScreenMarkets, discoverNewMarkets, promoteDiscoveredMarkets, isRangeMarket, type MarketToScreen } from './screener';
 import {
   scoreAllMarkets,
   rescoreAllStored,
+  rescoreMovedMarkets,
   getPModel,
   getEdge,
   type MarketToScore,
 } from './ml-scorer';
-import { collectAllPrices } from './price-collector';
-import { checkResolutions } from './resolution-monitor';
+import { collectAllPrices, collectKalshiPrices } from './price-collector';
+import { checkResolutions, checkAllMarketResolutions } from './resolution-monitor';
 import { checkAutoRotation } from './basket-builder';
 import { updateMomentum } from './momentum';
 import {
@@ -54,9 +55,12 @@ export function startCron(): void {
   cron.schedule('*/2 * * * *', async () => {
     try {
       const n = await snapshotAllActive();
-      const hr = await refreshHealthAll();
-      const liq = hr.filter((r) => r.liquidatable);
-      if (liq.length > 0) console.info(`[cron] ${liq.length} liquidatable position(s)`);
+      // Health monitor: marks-to-market + liquidates any position below the
+      // liquidation threshold (Phase 5).
+      const lh = await checkLeverageHealth();
+      if (lh.liquidated > 0) {
+        console.info(`[cron] leverage health: ${lh.liquidated}/${lh.checked} position(s) liquidated`);
+      }
       console.info(`[cron] snapshot ${n} basket NAV(s)`);
     } catch (e) {
       console.error('[cron] 2min job failed:', (e as Error).message);
@@ -94,6 +98,9 @@ export function startCron(): void {
       console.info(
         `[cron] Weekly screen complete: ${summary.screened} new markets screened, ${summary.excluded} excluded, ${summary.scored} scored, ${summary.tracked} tracked`,
       );
+      // Deep-screen auto-discovered markets (>7d old, not yet Anthropic-screened).
+      const deep = await promoteDiscoveredMarkets();
+      console.info(`[cron] deep screen: ${deep.screened} screened, ${deep.impossibles} impossibles, ${deep.promoted} promoted`);
     } catch (e) {
       console.error('[cron] weekly screener failed:', (e as Error).message);
     }
@@ -105,6 +112,7 @@ export function startCron(): void {
   cron.schedule('*/15 * * * *', async () => {
     try {
       await collectAllPrices();
+      await collectKalshiPrices();
     } catch (e) {
       console.error('[cron] price collector failed:', (e as Error).message);
     }
@@ -120,6 +128,40 @@ export function startCron(): void {
       }
     } catch (e) {
       console.error('[cron] resolution monitor failed:', (e as Error).message);
+    }
+  });
+
+  // Daily full resolution sweep — 06:00. Checks EVERY open tracked market
+  // against Polymarket, resolves + removes any that have settled so the
+  // scanner pool stays current (Phase 8).
+  cron.schedule('0 6 * * *', async () => {
+    try {
+      const s = await checkAllMarketResolutions();
+      console.info(`[cron] daily resolution sweep: ${s.resolved} resolved/removed of ${s.checked} checked`);
+    } catch (e) {
+      console.error('[cron] daily resolution sweep failed:', (e as Error).message);
+    }
+  });
+
+  // Market discovery — every 2 hours. Pulls live Polymarket markets, adds
+  // new zone-1/2/3 candidates to the scanner pool (no Anthropic call).
+  cron.schedule('0 */2 * * *', async () => {
+    try {
+      const s = await discoverNewMarkets();
+      console.info(`[cron] discovery: ${s.candidates} candidates, ${s.added} added of ${s.checked} checked`);
+    } catch (e) {
+      console.error('[cron] discovery failed:', (e as Error).message);
+    }
+  });
+
+  // Auto-rescore movers — every 6 hours. Reruns the ML scorer for any
+  // market whose live price drifted >5pts from its stored value.
+  cron.schedule('0 */6 * * *', async () => {
+    try {
+      const s = await rescoreMovedMarkets();
+      console.info(`[cron] rescore movers: ${s.rescored} rescored of ${s.moved} moved (${s.checked} checked)`);
+    } catch (e) {
+      console.error('[cron] rescore movers failed:', (e as Error).message);
     }
   });
 
@@ -205,7 +247,7 @@ export async function weeklyScreener(): Promise<WeeklyScreenSummary> {
   const outcomes = markets.flatMap(flattenPoly);
 
   const candidates = outcomes.filter(
-    (o) => o.pMarket >= SCREEN_MIN_P && o.pMarket <= SCREEN_MAX_P && o.volumeUsd >= SCREEN_MIN_VOLUME,
+    (o) => o.pMarket >= SCREEN_MIN_P && o.pMarket <= SCREEN_MAX_P && o.volumeUsd >= SCREEN_MIN_VOLUME && !isRangeMarket(o.question),
   );
 
   // Polymarket gives one row per outcome but condition_id is per-market.
@@ -284,12 +326,53 @@ export async function weeklyScreener(): Promise<WeeklyScreenSummary> {
     }
   }
 
+  // ---- Kalshi (Artemis Track #2) ----
+  // Fetch + screen + score Kalshi longshots through the same pipeline.
+  // Currently most open Kalshi markets in the band are zero-volume sports
+  // parlays, so this typically adds 0 — but the pipeline is ready for when
+  // liquid Kalshi longshots exist.
+  let kalshiFetched = 0;
+  let kalshiAdded = 0;
+  try {
+    const kalshi = await fetchKalshiMarkets();
+    kalshiFetched = kalshi.length;
+    if (kalshi.length > 0) {
+      const cachedK = await getScreenedByConditionIds(kalshi.map((k) => k.ticker));
+      const toScreenK: MarketToScreen[] = kalshi
+        .filter((k) => !cachedK.has(k.ticker))
+        .map((k) => ({ condition_id: k.ticker, source: 'kalshi' as const, question: k.title, p_market: k.p_market }));
+      const screenK = await batchScreenMarkets(toScreenK);
+      const screenedKById = new Map([...cachedK.values(), ...screenK.results].map((s) => [s.condition_id, s]));
+      const toScoreK: MarketToScore[] = kalshi
+        .filter((k) => { const s = screenedKById.get(k.ticker); return s && !s.excluded; })
+        .map((k) => ({ screened: screenedKById.get(k.ticker)!, volume: k.volume, days_to_close: k.days_to_close, category: null }));
+      await scoreAllMarkets(toScoreK);
+      for (const k of kalshi) {
+        const s = screenedKById.get(k.ticker);
+        if (!s || (s.excluded && !s.impossible)) continue;
+        try {
+          if (await getTrackedMarket(k.ticker)) continue;
+          await upsertTrackedMarket({
+            condition_id: k.ticker, source: 'kalshi', question: k.title, token_id: null,
+            category: null, p_market_initial: k.p_market, p_model_initial: getPModel(k.p_market),
+            edge_initial: getEdge(k.p_market, getPModel(k.p_market)),
+            resolution_date: null, in_basket: false, outcome: null, resolved_at: null,
+          });
+          kalshiAdded += 1;
+        } catch (e) { console.warn(`[screener] kalshi track failed ${k.ticker}: ${(e as Error).message}`); }
+      }
+    }
+    console.info(`[screener] Kalshi: ${kalshiFetched} markets passed filter, ${kalshiAdded} added to tracker`);
+  } catch (e) {
+    console.warn('[screener] Kalshi integration failed:', (e as Error).message);
+  }
+
   return {
     candidates: deduped.length,
     screened: screen.newlyScreened,
     excluded: screen.excluded,
     scored: score.scored.length,
-    tracked: trackedAdded,
+    tracked: trackedAdded + kalshiAdded,
     errors: screen.errors.length,
   };
 }

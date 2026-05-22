@@ -33,6 +33,9 @@ pub const PRICE_SCALE: u32 = 1_000_000;
 pub const MAX_LEGS: u16 = 256;
 pub const BPS_DENOMINATOR: u64 = 10_000;
 pub const DEFAULT_EXIT_FEE_BPS: u16 = 30;
+/// Protocol fee taken on deposit and on NAV-based withdraw (0.5%). Routed
+/// to the authority's USDC fee treasury rather than kept in the vault.
+pub const PROTOCOL_FEE_BPS: u64 = 50;
 
 #[program]
 pub mod contra_vault {
@@ -163,6 +166,30 @@ pub mod contra_vault {
             ContraError::DepositsClosed
         );
 
+        // 0.5% protocol fee skimmed to the fee treasury; the remainder is
+        // the net deposit that actually enters the vault and backs shares.
+        let fee = (amount_usdc as u128)
+            .checked_mul(PROTOCOL_FEE_BPS as u128)
+            .ok_or(ContraError::MathOverflow)?
+            .checked_div(BPS_DENOMINATOR as u128)
+            .ok_or(ContraError::MathOverflow)? as u64;
+        let net = amount_usdc.checked_sub(fee).ok_or(ContraError::MathOverflow)?;
+        require!(net > 0, ContraError::ZeroAmount);
+
+        // fee: user → fee_treasury (user-signed)
+        if fee > 0 {
+            let fee_accounts = Transfer {
+                from: ctx.accounts.user_usdc_account.to_account_info(),
+                to: ctx.accounts.fee_treasury.to_account_info(),
+                authority: ctx.accounts.user.to_account_info(),
+            };
+            token::transfer(
+                CpiContext::new(ctx.accounts.token_program.to_account_info(), fee_accounts),
+                fee,
+            )?;
+        }
+
+        // net: user → vault (user-signed)
         let cpi_accounts = Transfer {
             from: ctx.accounts.user_usdc_account.to_account_info(),
             to: ctx.accounts.vault_usdc_account.to_account_info(),
@@ -170,11 +197,12 @@ pub mod contra_vault {
         };
         token::transfer(
             CpiContext::new(ctx.accounts.token_program.to_account_info(), cpi_accounts),
-            amount_usdc,
+            net,
         )?;
 
-        // 1:1 share minting during Active. payout_ratio is applied at redeem.
-        let shares_to_mint = amount_usdc;
+        // 1:1 share minting on the NET deposit during Active. payout_ratio
+        // (or mark-to-market nav at withdraw) is applied on the way out.
+        let shares_to_mint = net;
 
         let basket_uuid = vault.basket_uuid;
         let bump = vault.bump;
@@ -196,12 +224,106 @@ pub mod contra_vault {
 
         vault.total_deposited = vault
             .total_deposited
-            .checked_add(amount_usdc)
+            .checked_add(net)
             .ok_or(ContraError::MathOverflow)?;
         vault.total_shares = vault
             .total_shares
             .checked_add(shares_to_mint)
             .ok_or(ContraError::MathOverflow)?;
+
+        Ok(())
+    }
+
+    /// Mark-to-market withdraw on an Active/Resolving vault. The current NAV
+    /// (USDC per CTRS, RATIO_SCALE-scaled) is supplied by the backend and the
+    /// authority co-signs to attest it — the program cannot read live market
+    /// prices. Burns exactly `amount_tokens`, returns
+    /// amount_tokens × nav × (1 − fee) to the user and routes the 0.5% fee to
+    /// the fee treasury. payout = gross; both legs are paid out of vault USDC.
+    pub fn withdraw(ctx: Context<Withdraw>, amount_tokens: u64, nav_scaled: u64) -> Result<()> {
+        require!(amount_tokens > 0, ContraError::ZeroAmount);
+        require!(nav_scaled > 0, ContraError::InvalidPrice);
+        let vault = &mut ctx.accounts.vault;
+        require!(
+            vault.status == VaultStatus::Active as u8
+                || vault.status == VaultStatus::Resolving as u8,
+            ContraError::WrongStatus
+        );
+        require!(vault.total_shares >= amount_tokens, ContraError::NoShares);
+
+        let gross = (amount_tokens as u128)
+            .checked_mul(nav_scaled as u128)
+            .ok_or(ContraError::MathOverflow)?
+            .checked_div(RATIO_SCALE as u128)
+            .ok_or(ContraError::MathOverflow)?;
+        let fee = gross
+            .checked_mul(PROTOCOL_FEE_BPS as u128)
+            .ok_or(ContraError::MathOverflow)?
+            .checked_div(BPS_DENOMINATOR as u128)
+            .ok_or(ContraError::MathOverflow)?;
+        let net = gross.checked_sub(fee).ok_or(ContraError::MathOverflow)?;
+        require!(gross <= u64::MAX as u128, ContraError::MathOverflow);
+        let gross_u64 = gross as u64;
+        let net_u64 = net as u64;
+        let fee_u64 = fee as u64;
+
+        // Burn the user's CTRS first (user-signed).
+        let cpi_accounts = Burn {
+            mint: ctx.accounts.contra_mint.to_account_info(),
+            from: ctx.accounts.user_contra_account.to_account_info(),
+            authority: ctx.accounts.user.to_account_info(),
+        };
+        token::burn(
+            CpiContext::new(ctx.accounts.token_program.to_account_info(), cpi_accounts),
+            amount_tokens,
+        )?;
+
+        let basket_uuid = vault.basket_uuid;
+        let bump = vault.bump;
+        let signer_seeds: &[&[&[u8]]] = &[&[VAULT_SEED, &basket_uuid, &[bump]]];
+
+        // net → user (vault-signed)
+        if net_u64 > 0 {
+            let to_user = Transfer {
+                from: ctx.accounts.vault_usdc_account.to_account_info(),
+                to: ctx.accounts.user_usdc_account.to_account_info(),
+                authority: vault.to_account_info(),
+            };
+            token::transfer(
+                CpiContext::new_with_signer(
+                    ctx.accounts.token_program.to_account_info(),
+                    to_user,
+                    signer_seeds,
+                ),
+                net_u64,
+            )?;
+        }
+
+        // fee → fee_treasury (vault-signed)
+        if fee_u64 > 0 {
+            let to_fee = Transfer {
+                from: ctx.accounts.vault_usdc_account.to_account_info(),
+                to: ctx.accounts.fee_treasury.to_account_info(),
+                authority: vault.to_account_info(),
+            };
+            token::transfer(
+                CpiContext::new_with_signer(
+                    ctx.accounts.token_program.to_account_info(),
+                    to_fee,
+                    signer_seeds,
+                ),
+                fee_u64,
+            )?;
+        }
+
+        vault.total_shares = vault
+            .total_shares
+            .checked_sub(amount_tokens)
+            .ok_or(ContraError::MathOverflow)?;
+        // Decrement the USDC actually paid out of the vault (gross). If the
+        // mark-to-market gross exceeds par accounting, saturate at 0 so the
+        // counter never underflows on a profitable withdraw.
+        vault.total_deposited = vault.total_deposited.saturating_sub(gross_u64);
 
         Ok(())
     }
@@ -533,6 +655,59 @@ pub struct Deposit<'info> {
         constraint = user_contra_account.owner == user.key() @ ContraError::Unauthorized,
     )]
     pub user_contra_account: Account<'info, TokenAccount>,
+    /// Authority's USDC ATA — receives the 0.5% protocol fee on deposit.
+    #[account(
+        mut,
+        constraint = fee_treasury.mint == vault.usdc_mint @ ContraError::WrongMint,
+        constraint = fee_treasury.owner == vault.authority @ ContraError::Unauthorized,
+    )]
+    pub fee_treasury: Account<'info, TokenAccount>,
+    pub token_program: Program<'info, Token>,
+}
+
+#[derive(Accounts)]
+pub struct Withdraw<'info> {
+    #[account(
+        mut,
+        seeds = [VAULT_SEED, vault.basket_uuid.as_ref()],
+        bump = vault.bump,
+    )]
+    pub vault: Account<'info, Vault>,
+    #[account(
+        mut,
+        seeds = [MINT_SEED, vault.key().as_ref()],
+        bump = vault.mint_bump,
+        address = vault.contra_mint @ ContraError::WrongMint,
+    )]
+    pub contra_mint: Account<'info, Mint>,
+    #[account(
+        mut,
+        seeds = [VAULT_USDC_SEED, vault.key().as_ref()],
+        bump = vault.vault_token_bump,
+        address = vault.vault_usdc_account @ ContraError::WrongVaultAccount,
+    )]
+    pub vault_usdc_account: Account<'info, TokenAccount>,
+    #[account(mut)]
+    pub user: Signer<'info>,
+    #[account(
+        mut,
+        constraint = user_contra_account.mint == vault.contra_mint @ ContraError::WrongMint,
+        constraint = user_contra_account.owner == user.key() @ ContraError::Unauthorized,
+    )]
+    pub user_contra_account: Account<'info, TokenAccount>,
+    #[account(
+        mut,
+        constraint = user_usdc_account.mint == vault.usdc_mint @ ContraError::WrongMint,
+        constraint = user_usdc_account.owner == user.key() @ ContraError::Unauthorized,
+    )]
+    pub user_usdc_account: Account<'info, TokenAccount>,
+    /// Authority's USDC ATA — receives the 0.5% protocol fee on withdraw.
+    #[account(
+        mut,
+        constraint = fee_treasury.mint == vault.usdc_mint @ ContraError::WrongMint,
+        constraint = fee_treasury.owner == vault.authority @ ContraError::Unauthorized,
+    )]
+    pub fee_treasury: Account<'info, TokenAccount>,
     pub token_program: Program<'info, Token>,
 }
 

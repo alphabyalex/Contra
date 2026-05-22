@@ -23,7 +23,10 @@ export interface RawPolymarketMarket {
   clobTokenIds?: string | string[];
   volume?: string | number;
   volumeNum?: number;
+  volumeClob?: string | number;
+  volume24hr?: string | number;
   liquidity?: string | number;
+  liquidityNum?: number;
   endDate?: string;
   endDateIso?: string;
   category?: string;
@@ -121,7 +124,14 @@ export function flattenOutcomes(m: RawPolymarketMarket): PolymarketOutcome[] {
   const prices = parseOutcomePrices(m.outcomePrices);
   const tokens = parseStringArray(m.clobTokenIds);
   if (outcomes.length === 0 || prices.length === 0) return [];
-  const vol = Number(m.volumeNum ?? m.volume ?? 0) || 0;
+  // Gamma exposes total volume under several keys depending on the market
+  // type; CLOB markets carry it in volumeClob. Prefer the richest non-zero.
+  const vol =
+    Number(m.volumeNum ?? 0) ||
+    Number(m.volumeClob ?? 0) ||
+    Number(m.volume ?? 0) ||
+    Number(m.volume24hr ?? 0) ||
+    0;
   return outcomes.map((label, i) => ({
     conditionId: m.conditionId,
     question: m.question,

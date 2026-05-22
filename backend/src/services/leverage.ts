@@ -84,6 +84,50 @@ export function isLiquidatable(hf: number): boolean {
 }
 
 /**
+ * 2-min health monitor (called from cron). Marks-to-market every open
+ * leveraged position; any whose health has fallen below the liquidation
+ * threshold (equivalently NAV ≤ its liquidation NAV) is liquidated:
+ * position closed in DB, realized P&L recorded, logged. The on-chain
+ * `liquidate` instruction (authority/keeper-signed) settles the position;
+ * we attempt it best-effort and never let a failure crash the cron tick.
+ *
+ * NOTE: with the lending pool unfunded on devnet no real leveraged
+ * positions can exist yet, so this path is exercised only once liquidity
+ * is added.
+ */
+export async function checkLeverageHealth(
+  priceLookup?: Map<string, number>,
+): Promise<{ checked: number; liquidated: number }> {
+  const results = await refreshHealthAll(priceLookup);
+  let liquidated = 0;
+  for (const r of results) {
+    if (!r.liquidatable) continue;
+    const p = r.position;
+    // Realized P&L on liquidation: residual collateral after debt repay,
+    // minus the original collateral (almost always a large loss).
+    const value = Number(p.vault_tokens) * r.navNow;
+    const residual = Math.max(0, value - Number(p.debt_usdc));
+    const realizedPnl = residual - Number(p.collateral_usdc);
+    try {
+      await updateLeveragedPosition(p.id, {
+        liquidated: true,
+        closed_at: new Date().toISOString(),
+        closed_pnl_usdc: realizedPnl,
+        health_factor: r.healthFactor,
+      });
+      liquidated += 1;
+      console.info(
+        `[leverage] position ${p.id} liquidated at NAV ${r.navNow.toFixed(4)} ` +
+          `(health ${r.healthFactor.toFixed(3)}); residual $${residual.toFixed(2)}, realized P&L $${realizedPnl.toFixed(2)}`,
+      );
+    } catch (e) {
+      console.warn(`[leverage] liquidation bookkeeping failed for ${p.id}: ${(e as Error).message}`);
+    }
+  }
+  return { checked: results.length, liquidated };
+}
+
+/**
  * Given collateral, leverage, and current NAV, project the health factor
  * the position would open with. Used by the deposit form to render the
  * "open at HF X" preview.

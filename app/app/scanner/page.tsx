@@ -14,6 +14,7 @@
  */
 
 import React, { useCallback, useEffect, useMemo, useRef, useState } from 'react';
+import { createPortal } from 'react-dom';
 import { api } from '../_lib/api';
 import { useInView } from '../_lib/useInView';
 
@@ -44,6 +45,12 @@ interface Row {
   is_favorite?: boolean;
   is_ephemeral?: boolean;
   score?: number;
+  p_market_screened?: number;
+  zone?: 0 | 1 | 2 | 3 | 4;
+  badge?: 'overpriced' | 'underpriced' | 'fair value';
+  residual?: number | null;
+  model_stale?: boolean;
+  resolved_likely?: boolean;
 }
 
 interface ScannerGroup {
@@ -138,6 +145,7 @@ export default function ScannerPage() {
 
   const isSearching = query.trim().length > 0;
   const visible = useMemo(() => rows, [rows]);
+  const hasZone3 = useMemo(() => visible.some((r: Row) => r.zone === 3), [visible]);
   const secondsAgo = updatedAt ? Math.max(0, Math.floor((Date.now() - updatedAt) / 1000)) : null;
   void tick;
 
@@ -184,20 +192,43 @@ export default function ScannerPage() {
             </div>
           </div>
 
-          {/* Search bar */}
-          <div style={{ padding: '20px 36px', borderBottom: '1px solid #E5E5E3' }}>
-            <input
-              value={query}
-              onChange={(e) => setQuery(e.target.value)}
-              placeholder="Search across all watched markets..."
-              style={{
-                width: '100%', background: '#FFFFFF', border: '1px solid #E5E5E3', borderRadius: 3,
-                padding: '12px 14px', fontSize: 15, color: '#0A0A0A',
-                fontFamily: '"DM Sans", sans-serif', outline: 'none',
-              }}
-              onFocus={(e) => (e.currentTarget.style.borderColor = '#1A56DB')}
-              onBlur={(e) => (e.currentTarget.style.borderColor = '#E5E5E3')}
-            />
+          {/* Search bar + sort tabs */}
+          <div style={{ padding: '20px 36px', borderBottom: '1px solid #E5E5E3', display: 'flex', alignItems: 'center', gap: 20 }}>
+            <div style={{ position: 'relative', flex: 1 }}>
+              <svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="#9B9B9B" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round"
+                style={{ position: 'absolute', left: 14, top: '50%', transform: 'translateY(-50%)', pointerEvents: 'none' }}>
+                <circle cx="11" cy="11" r="8" /><line x1="21" y1="21" x2="16.65" y2="16.65" />
+              </svg>
+              <input
+                value={query}
+                onChange={(e) => setQuery(e.target.value)}
+                placeholder="Search markets..."
+                style={{
+                  width: '100%', height: 44, background: '#FFFFFF', border: '1px solid #E5E5E3', borderRadius: 8,
+                  padding: '0 40px', fontSize: 14, color: '#0A0A0A', fontFamily: '"DM Sans", sans-serif', outline: 'none',
+                  transition: 'border-color 120ms, box-shadow 120ms', boxSizing: 'border-box',
+                }}
+                onFocus={(e) => { e.currentTarget.style.borderColor = '#1A56DB'; e.currentTarget.style.boxShadow = '0 0 0 3px rgba(26,86,219,0.1)'; }}
+                onBlur={(e) => { e.currentTarget.style.borderColor = '#E5E5E3'; e.currentTarget.style.boxShadow = 'none'; }}
+              />
+              {query && (
+                <button type="button" onClick={() => setQuery('')}
+                  style={{ position: 'absolute', right: 12, top: '50%', transform: 'translateY(-50%)', background: 'none', border: 'none', cursor: 'pointer', color: '#9B9B9B', fontSize: 18, lineHeight: 1, padding: 4 }}>×</button>
+              )}
+            </div>
+            <div style={{ display: 'flex', gap: 20 }}>
+              {([['edge', 'Edge'], ['volume', 'Volume'], ['days', 'Days']] as const).map(([f, label]) => {
+                const active = sortField === f;
+                return (
+                  <button key={f} type="button" onClick={() => setSortField(f as SortField)}
+                    style={{ background: 'none', border: 'none', cursor: 'pointer', fontFamily: '"DM Sans", sans-serif', fontSize: 13,
+                      fontWeight: active ? 500 : 400, color: active ? '#0A0A0A' : '#9B9B9B',
+                      borderBottom: `2px solid ${active ? '#1A56DB' : 'transparent'}`, padding: '4px 0' }}>
+                    {label}
+                  </button>
+                );
+              })}
+            </div>
           </div>
 
           {/* States */}
@@ -211,8 +242,15 @@ export default function ScannerPage() {
             </div>
           )}
           {!loading && !error && visible.length === 0 && (
-            <div style={{ padding: 56, textAlign: 'center', color: '#9B9B9B', fontSize: 15 }}>
-              {isSearching ? `No markets matching "${query.trim()}"` : 'No markets in the longshot range right now.'}
+            <div style={{ padding: 56, textAlign: 'center' }}>
+              {isSearching ? (
+                <>
+                  <div style={{ fontSize: 16, color: '#6B6B6B' }}>No markets found for &ldquo;{query.trim()}&rdquo;</div>
+                  <div style={{ fontSize: 13, color: '#9B9B9B', marginTop: 8 }}>Try a broader term, like a country, team, or topic.</div>
+                </>
+              ) : (
+                <div style={{ fontSize: 15, color: '#9B9B9B' }}>No markets in the longshot range right now.</div>
+              )}
             </div>
           )}
 
@@ -223,15 +261,15 @@ export default function ScannerPage() {
                 <thead>
                   <tr>
                     <Th>Market</Th>
-                    <Th>Source</Th>
+                    <Th></Th>
                     <Th align="right" sortable active={sortField === 'p_market'} onClick={() => setSortField('p_market')}>P_market</Th>
-                    <Th align="right">P_model</Th>
+                    <Th align="right">{hasZone3 ? 'P_model / Residual' : 'P_model'}</Th>
                     <Th
                       align="right"
                       sortable
                       active={sortField === 'edge'}
                       onClick={() => setSortField('edge')}
-                      tooltip="raw_edge = p_market − p_model. Always shown regardless of time-decay or volume filters. adj_edge (raw_edge × time × volume) is used internally for basket inclusion."
+                      tooltip="Model's estimated probability vs market implied probability. Positive: model sees overpricing. Negative: model sees underpricing. Not financial advice."
                     >
                       Edge
                     </Th>
@@ -265,7 +303,6 @@ export default function ScannerPage() {
 
 function CategorySection({ group, firstSection }: { group: ScannerGroup; firstSection: boolean }) {
   const colSpan = 7;
-  const sportsSplit = group.category === 'sports' && group.long_section_start != null && group.long_section_start > 0;
   return (
     <>
       <tr>
@@ -280,31 +317,16 @@ function CategorySection({ group, firstSection }: { group: ScannerGroup; firstSe
           fontFamily: '"DM Sans", sans-serif',
           fontWeight: 500,
         }}>
-          {group.category}
+          <span style={{ display: 'inline-flex', alignItems: 'center', gap: 8 }}>
+            {group.category}
+            <span style={{ fontSize: 10, color: '#6B6B6B', background: '#F3F4F6', borderRadius: 8, padding: '1px 7px', letterSpacing: 0, fontWeight: 500 }}>
+              {group.markets.length}
+            </span>
+          </span>
         </td>
       </tr>
-      {group.markets.map((r, i) => (
-        <React.Fragment key={`${r.source}-${r.marketId}`}>
-          {sportsSplit && i === group.long_section_start && (
-            <tr>
-              <td colSpan={colSpan} style={{
-                padding: '10px 18px',
-                borderBottom: '1px solid #E5E5E3',
-                borderTop: '1px solid #E5E5E3',
-                fontSize: 9,
-                color: '#9B9B9B',
-                textAlign: 'center',
-                textTransform: 'uppercase',
-                letterSpacing: '0.16em',
-                fontFamily: '"DM Sans", sans-serif',
-                background: '#FCFFFC',
-              }}>
-                Long Opportunities ↓
-              </td>
-            </tr>
-          )}
-          <ScannerRow row={r} />
-        </React.Fragment>
+      {group.markets.map((r) => (
+        <ScannerRow key={`${r.source}-${r.marketId}`} row={r} />
       ))}
     </>
   );
@@ -337,14 +359,32 @@ function ScannerRow({ row }: { row: Row }) {
   const isImpossible = Boolean(row.impossible);
   const isExcluded = Boolean(row.excluded) && !isImpossible;
   const isTournament = Boolean(row.is_tournament_market);
-  const isFavorite = isTournament && Boolean(row.is_favorite);
+  // Only badge real favorites (France/Spain/England level). Teams sitting
+  // at 0.1–0.3% normalized are not meaningful favorites — hide the badge
+  // below an 8% normalized-probability floor.
+  const isFavorite =
+    isTournament &&
+    Boolean(row.is_favorite) &&
+    (row.normalized_p_market ?? 0) > 0.08;
   const hasModelData =
     !isExcluded && !isImpossible && (row.p_model != null || row.signal != null);
 
-  const pModelDisplay = isImpossible
-    ? '0.0%'
-    : isExcluded
+  const zone = row.zone ?? 0;
+  const modelStale = Boolean(row.model_stale);
+  const residual = row.residual ?? (zone === 3 ? 1 - row.p_market : null);
+
+  // p_model display rules (Phase 3):
+  //   zone 3 (90%+)  → show RESIDUAL (how overpriced the NO side is)
+  //   model stale    → '—' (live price diverged >20pts from screened)
+  //   zone 1/2       → p_model (calibration / tournament normalization valid)
+  const pModelDisplay = isExcluded
     ? '—'
+    : zone === 3
+    ? (residual != null ? formatPct(residual) : '~100%')
+    : modelStale
+    ? '—'
+    : isImpossible
+    ? '0.0%'
     : row.p_model != null
     ? formatPct(row.p_model)
     : isFavorite
@@ -357,11 +397,11 @@ function ScannerRow({ row }: { row: Row }) {
   // intentionally not shown in this column.
   const rawEdge = row.raw_edge ?? row.edge ?? null;
   const edgeDisplay = isImpossible
-    ? formatPct(row.p_market)
+    ? signedPct(row.p_market)
     : isExcluded
     ? '—'
     : rawEdge != null && hasModelData
-    ? formatPct(rawEdge)
+    ? signedPct(rawEdge)
     : '—';
 
   const isLong = row.signal === 'long' || row.signal === 'strong_long';
@@ -375,18 +415,23 @@ function ScannerRow({ row }: { row: Row }) {
   const pMarketColor = isLong
     ? '#0A0A0A'
     : '#CC2936';
-  const pModelColor = isImpossible
+  const pModelColor = zone === 3
+    ? '#D97706' // amber — residual (NO side overpriced)
+    : isImpossible
     ? '#00875A'
     : !hasModelData
     ? '#9B9B9B'
     : isLong
     ? '#00875A'
     : '#0A0A0A';
+  // Directional context without badges: negative edge (model thinks the
+  // market is underpriced) shows green; positive edge (overpriced) blue.
+  const rawEdgeVal = Number(row.raw_edge ?? row.edge ?? 0);
   const edgeColor = isImpossible
-    ? '#00875A'
+    ? '#1A56DB'
     : !hasModelData
     ? '#9B9B9B'
-    : isLong
+    : rawEdgeVal < 0
     ? '#00875A'
     : '#1A56DB';
 
@@ -395,10 +440,8 @@ function ScannerRow({ row }: { row: Row }) {
   const daysColor = isIneligible
     ? '#C0C0C0'
     : days == null ? '#9B9B9B'
-    : days < 30 ? '#00875A'
-    : days <= 90 ? '#0A0A0A'
-    : days <= 180 ? '#6B6B6B'
-    : '#9B9B9B';
+    : days < 14 ? '#CC2936'
+    : '#6B6B6B';
 
   // Hover tint: green for longs, light blue/grey for everything else.
   const hoverBg = isLong ? '#F0FDF4' : '#F7F8FF';
@@ -411,30 +454,13 @@ function ScannerRow({ row }: { row: Row }) {
       onMouseLeave={() => setHover(false)}
       style={{ borderBottom: '1px solid #E5E5E3', background: hover ? hoverBg : '#FFFFFF', transition: 'background 150ms ease-out' }}
     >
-      <td style={{ padding: '16px 18px', verticalAlign: 'top' }}>
-        <div style={{ fontSize: 15, color: '#0A0A0A', display: 'flex', alignItems: 'center', gap: 8, flexWrap: 'wrap' }} title={row.question}>
-          <span>{truncated}</span>
-          {row.signal && <SignalBadge signal={row.signal} />}
-          {isFavorite && <TournamentBadge tone="favorite" />}
-          {isTournament && !isFavorite && <TournamentBadge tone="longshot" />}
+      <td style={{ padding: '16px 18px', verticalAlign: 'top' }} colSpan={2}>
+        <div style={{ fontSize: 14, fontWeight: 400, color: '#0A0A0A', fontFamily: '"DM Sans", sans-serif', lineHeight: 1.4 }} title={row.question}>
+          {truncated}
+          {zone === 4 && <span style={{ fontSize: 10, color: '#9B9B9B', marginLeft: 8 }}>Outside model range</span>}
         </div>
-        <div style={{ marginTop: 8, height: 4, width: 600, maxWidth: '100%', background: '#F0F0EE', borderRadius: 2 }}>
-          <div
-            style={{
-              height: '100%',
-              width: inView ? targetW : 0,
-              background: barColor,
-              borderRadius: 2,
-              transition: 'width 700ms cubic-bezier(0.2, 0.8, 0.2, 1)',
-            }}
-          />
-        </div>
-        <div className="font-num" style={{ fontSize: 11, color: '#9B9B9B', marginTop: 6 }}>
-          {isTournament ? 'normalized: ' : 'market: '}{formatPct(displayPMarket)}
-        </div>
-      </td>
-      <td style={{ padding: '16px 18px', verticalAlign: 'top' }}>
-        <div style={{ display: 'flex', flexDirection: 'column', gap: 6, alignItems: 'flex-start' }}>
+        <div style={{ display: 'flex', alignItems: 'center', gap: 8, marginTop: 8, flexWrap: 'wrap' }}>
+          <EdgeBadge rawEdge={row.raw_edge ?? row.edge} badge={row.badge} />
           <SourcePill source={row.source} />
           <CategoryPill category={row.category} />
         </div>
@@ -471,6 +497,11 @@ function formatPct(v: number): string {
   return `${(v * 100).toFixed(1)}%`;
 }
 
+/** Always-signed percentage: "+6.2%" / "-7.5%". */
+function signedPct(v: number): string {
+  return `${v >= 0 ? '+' : '−'}${Math.abs(v * 100).toFixed(1)}%`;
+}
+
 function formatVolume(v: number): string {
   if (v >= 1_000_000) return `$${(v / 1_000_000).toFixed(1)}M`;
   if (v >= 1_000) return `$${(v / 1_000).toFixed(0)}K`;
@@ -480,7 +511,7 @@ function formatVolume(v: number): string {
 function Th({
   children, align = 'left', sortable, active, onClick, tooltip,
 }: {
-  children: React.ReactNode;
+  children?: React.ReactNode;
   align?: 'left' | 'right';
   sortable?: boolean;
   active?: boolean;
@@ -488,12 +519,20 @@ function Th({
   tooltip?: string;
 }) {
   const [hover, setHover] = useState(false);
+  // Fixed-position tooltip coords computed from the ⓘ's bounding rect, so the
+  // tooltip escapes the table's overflow:hidden / overflow-x:auto containers.
+  const [tipPos, setTipPos] = useState<{ top: number; left: number } | null>(null);
+  const iconRef = useRef<HTMLSpanElement>(null);
+
+  const showTip = () => {
+    const r = iconRef.current?.getBoundingClientRect();
+    if (r) setTipPos({ top: r.bottom + 8, left: r.left - 100 });
+  };
   return (
     <th
       onClick={sortable ? onClick : undefined}
       onMouseEnter={() => setHover(true)}
       onMouseLeave={() => setHover(false)}
-      title={tooltip}
       style={{
         textAlign: align,
         fontSize: 11,
@@ -509,6 +548,30 @@ function Th({
       }}
     >
       {children}
+      {tooltip && (
+        <span
+          ref={iconRef}
+          onMouseEnter={(e) => { e.stopPropagation(); showTip(); }}
+          onMouseLeave={() => setTipPos(null)}
+          style={{ marginLeft: 5, color: '#9B9B9B', cursor: 'help', fontSize: 11 }}
+        >
+          ⓘ
+        </span>
+      )}
+      {tooltip && tipPos && typeof document !== 'undefined' && createPortal(
+        <div
+          style={{
+            position: 'fixed', top: tipPos.top, left: tipPos.left,
+            background: '#FFFFFF', border: '1px solid #E5E5E3', borderRadius: 8, padding: 12,
+            fontSize: 12, fontFamily: '"DM Sans", sans-serif', color: '#0A0A0A', maxWidth: 240,
+            whiteSpace: 'normal', textTransform: 'none', letterSpacing: 0, lineHeight: 1.5, fontWeight: 400,
+            boxShadow: '0 4px 12px rgba(0,0,0,0.08)', zIndex: 9999, pointerEvents: 'none', textAlign: 'left',
+          }}
+        >
+          {tooltip}
+        </div>,
+        document.body,
+      )}
       {sortable && active && (
         <span className="font-num" style={{ marginLeft: 6, color: '#1A56DB' }}>
           ↓
@@ -569,80 +632,45 @@ function SkeletonRows({ count }: { count: number }) {
   );
 }
 
-function SignalBadge({ signal }: { signal: NonNullable<Row['signal']> }) {
-  // strong_short / short / weak_short are red shades.
-  // long / strong_long are green shades.
-  // fair_value is grey.
-  const palette: Record<string, { fg: string; bg: string; label: string }> = {
-    strong_short: { fg: '#9F1239', bg: '#FECDD3', label: 'SHORT ↑↑' },
-    short:        { fg: '#CC2936', bg: '#FCE9EC', label: 'SHORT ↑' },
-    weak_short:   { fg: '#CC2936', bg: '#FEF2F2', label: 'SHORT' },
-    fair_value:   { fg: '#6B6B6B', bg: '#F0F0EE', label: 'FAIR' },
-    long:         { fg: '#00875A', bg: '#F0FDF4', label: 'LONG ↓' },
-    strong_long:  { fg: '#005C3D', bg: '#D1FAE5', label: 'LONG ↓↓' },
-  };
-  const p = palette[signal] ?? palette.fair_value;
-  return (
-    <span
-      style={{
-        fontSize: 9,
-        fontWeight: 600,
-        color: p.fg,
-        background: p.bg,
-        padding: '2px 6px',
-        borderRadius: 3,
-        textTransform: 'uppercase',
-        letterSpacing: '0.06em',
-        fontFamily: '"DM Sans", sans-serif',
-        whiteSpace: 'nowrap',
-      }}
-    >
-      {p.label}
-    </span>
-  );
-}
+const PILL_BASE: React.CSSProperties = {
+  fontFamily: '"IBM Plex Mono", monospace',
+  fontSize: 10,
+  letterSpacing: '0.06em',
+  fontWeight: 500,
+  height: 20,
+  lineHeight: '18px',
+  padding: '0 8px',
+  borderRadius: 10,
+  display: 'inline-flex',
+  alignItems: 'center',
+  whiteSpace: 'nowrap',
+  boxSizing: 'border-box',
+};
 
-function TournamentBadge({ tone }: { tone: 'favorite' | 'longshot' }) {
-  // Favorite: the market UNDERPRICES this team (edge ≤ 0 after group
-  // renorm) — interesting for the long basket product. Gold/amber.
-  // Longshot: market OVERPRICES this team — short candidate. Red.
-  const isFav = tone === 'favorite';
-  return (
-    <span
-      style={{
-        fontSize: 9,
-        fontWeight: 600,
-        letterSpacing: '0.08em',
-        textTransform: 'uppercase',
-        padding: '2px 6px',
-        borderRadius: 3,
-        background: isFav ? '#FEF3C7' : '#FCE9EC',
-        color: isFav ? '#D97706' : '#CC2936',
-        fontFamily: '"DM Sans", sans-serif',
-      }}
-      title={isFav
-        ? 'Underpriced — tournament normalization marks this side as a favorite (potential long candidate).'
-        : 'Overpriced — tournament normalization marks this side as a longshot (short candidate).'}
-    >
-      {isFav ? 'FAVORITE' : 'LONGSHOT'}
-    </span>
-  );
+// Badge label is purely the SIGN of raw_edge (not the zone):
+//   raw_edge > 0  → "overpriced"  (blue)
+//   raw_edge < 0  → "underpriced" (green)
+//   |raw_edge|<1% → "fair value"  (grey)
+function EdgeBadge({ rawEdge, badge }: { rawEdge?: number | null; badge?: string }) {
+  const label = badge ?? (() => {
+    const e = Number(rawEdge ?? 0);
+    return Math.abs(e) < 0.01 ? 'fair value' : e > 0 ? 'overpriced' : 'underpriced';
+  })();
+  const map: Record<string, { bg: string; fg: string; bd: string }> = {
+    overpriced: { bg: '#EFF6FF', fg: '#1D4ED8', bd: '#BFDBFE' },
+    underpriced: { bg: '#F0FDF4', fg: '#15803D', bd: '#BBF7D0' },
+    'fair value': { bg: '#F3F4F6', fg: '#6B6B6B', bd: '#E5E7EB' },
+  };
+  const c = map[label] ?? map['fair value'];
+  return <span style={{ ...PILL_BASE, background: c.bg, color: c.fg, border: `1px solid ${c.bd}` }}>{label}</span>;
 }
 
 function SourcePill({ source }: { source: 'kalshi' | 'polymarket' }) {
   const isKalshi = source === 'kalshi';
-  return (
-    <span
-      style={{
-        fontSize: 11, padding: '4px 10px', borderRadius: 10,
-        background: isKalshi ? '#EBF0FF' : '#F5F5F5',
-        color: isKalshi ? '#1A56DB' : '#6B6B6B',
-        fontFamily: '"DM Sans", sans-serif', fontWeight: 500, letterSpacing: '0.02em',
-      }}
-    >
-      {isKalshi ? 'Kalshi' : 'Polymarket'}
-    </span>
-  );
+  const style = isKalshi
+    ? { background: '#F0FDF4', color: '#15803D', border: '1px solid #BBF7D0' }
+    : { background: '#EFF6FF', color: '#1D4ED8', border: '1px solid #BFDBFE' };
+  return <span style={{ ...PILL_BASE, ...style }}>{isKalshi ? 'Kalshi' : 'Polymarket'}</span>;
 }
 
 const CATEGORY_PALETTE: Record<string, { bg: string; fg: string }> = {

@@ -20,6 +20,10 @@ interface ConfirmationDetails {
   leverage: 1 | 2 | 3;
   tokens: number;
   entryNav: number;
+  borrowed?: number;
+  totalExposure?: number;
+  liquidationNav?: number;
+  dailyInterest?: number;
 }
 
 // Rough liquidation NAV per leverage tier, expressed as a multiple of entry
@@ -67,12 +71,25 @@ export function DepositForm({ basketId, basketName, avgEdge, entryNav, onConfirm
     setBusy(true);
     try {
       if (!Number.isFinite(amt) || amt <= 0) throw new Error('Enter a positive USDC amount');
-      if (leverage !== 1) throw new Error('Leverage paths land in the next build pass — please use 1x for now.');
-      const { signature } = await depositToBasket({ wallet, basketId, amountUsdc: amt });
-      // CTRS minted 1:1 against USDC at entry NAV during the active phase.
-      const tokens = amt / safeEntryNav;
-      setConfirmation({ signature, amount: amt, leverage, tokens, entryNav: safeEntryNav });
-      onConfirmed?.(signature);
+      const res = await depositToBasket({ wallet, basketId, amountUsdc: amt, leverage });
+      if (res.leveraged) {
+        setConfirmation({
+          signature: res.signature,
+          amount: amt,
+          leverage,
+          tokens: res.vaultTokens ?? (amt * leverage * 0.995) / safeEntryNav,
+          entryNav: safeEntryNav,
+          borrowed: res.borrowed,
+          totalExposure: res.totalExposure,
+          liquidationNav: res.liquidationNav,
+          dailyInterest: res.dailyInterest,
+        });
+      } else {
+        // CTRS minted on the net (post-fee) deposit at entry NAV.
+        const tokens = (amt * 0.995) / safeEntryNav;
+        setConfirmation({ signature: res.signature, amount: amt, leverage, tokens, entryNav: safeEntryNav });
+      }
+      onConfirmed?.(res.signature);
     } catch (e) {
       setErr((e as Error).message);
     } finally {
@@ -139,6 +156,12 @@ export function DepositForm({ basketId, basketName, avgEdge, entryNav, onConfirm
             entryNav={safeEntryNav}
           />
 
+          <FeeBreakdown
+            depositUsdc={safeAmt}
+            entryNav={safeEntryNav}
+            basketName={basketName ?? 'CTRA'}
+          />
+
           <button
             type="button"
             onClick={submit}
@@ -156,7 +179,7 @@ export function DepositForm({ basketId, basketName, avgEdge, entryNav, onConfirm
               opacity: busy ? 0.5 : 1,
             }}
           >
-            {busy ? 'Confirming…' : 'Open short position'}
+            {busy ? 'Confirming…' : 'Open position'}
           </button>
 
           {err && <div style={{ color: '#CC2936', fontSize: 12 }}>{err}</div>}
@@ -225,12 +248,14 @@ function LeverageInfo({
     ? { background: '#FFF1F2', border: '1px solid #FECDD3' }
     : { background: '#FFF7ED', border: '1px solid #FED7AA' };
   const iconColor = isHigh ? '#CC2936' : '#C2410C';
-  // Max loss is the user's deposited collateral — leveraged positions are
-  // closed by the liquidator at the liquidation NAV, so the user can never
-  // owe more than what they put in.
   const navStr = `$${liqNav.toFixed(4)}`;
+
+  // Leverage economics: borrow (leverage−1)× the collateral from the pool.
+  const borrowed = depositUsdc * (leverage - 1);
+  const totalExposure = depositUsdc * leverage;
+  const dailyInterest = (borrowed * 0.05) / 365;
   const warning = isHigh
-    ? `Higher leverage means liquidation triggers sooner. If NAV drops to ${navStr} your position closes automatically. Maximum loss is your deposited collateral.`
+    ? `Higher leverage means liquidation triggers sooner. If NAV drops to ${navStr} your position liquidates automatically. Maximum loss is your deposited collateral.`
     : `If NAV drops to ${navStr} your position will be liquidated automatically. Maximum loss is your deposited collateral.`;
 
   return (
@@ -244,7 +269,10 @@ function LeverageInfo({
         lineHeight: 1.5,
       }}
     >
-      <div>{retLine}</div>
+      <div className="font-num">Collateral: {formatUsd(depositUsdc)}</div>
+      <div className="font-num">Borrowed from pool: {formatUsd(borrowed)}</div>
+      <div className="font-num">Total exposure: {formatUsd(totalExposure)}</div>
+      <div style={{ marginTop: 6 }}>{retLine}</div>
       <div className="font-num" style={{ marginTop: 6 }}>
         Liquidation NAV: <span style={{ color: iconColor }}>{navStr}</span>
       </div>
@@ -252,7 +280,53 @@ function LeverageInfo({
         <WarningIcon />
         <span>{warning}</span>
       </div>
+      <div className="font-num" style={{ marginTop: 6 }}>
+        Interest: 5% APY on borrowed amount (~{formatInterest(dailyInterest)}/day)
+      </div>
       <LeverageFootnote />
+    </div>
+  );
+}
+
+// =====================================================================
+// Fee breakdown (reactive)
+// =====================================================================
+
+const PROTOCOL_FEE_RATE = 0.005; // 0.5%
+
+function FeeBreakdown({
+  depositUsdc, entryNav, basketName,
+}: { depositUsdc: number; entryNav: number; basketName: string }) {
+  const fee = depositUsdc * PROTOCOL_FEE_RATE;
+  const net = depositUsdc - fee;
+  const tokens = entryNav > 0 ? net / entryNav : 0;
+  return (
+    <div style={{ background: '#F7F7F5', borderRadius: 6, padding: 12, marginTop: 8 }}>
+      <FeeRow label="Deposit amount" value={`$${depositUsdc.toFixed(2)}`} />
+      <FeeRow label="Protocol fee (0.5%)" value={`-$${fee.toFixed(2)}`} valueColor="#CC2936" />
+      <FeeRow label="Net position" value={`$${net.toFixed(2)}`} bold />
+      <FeeRow label="CTRA tokens received" value={`${tokens.toFixed(4)} ${basketName}`} />
+    </div>
+  );
+}
+
+function FeeRow({
+  label, value, valueColor, bold,
+}: { label: string; value: string; valueColor?: string; bold?: boolean }) {
+  return (
+    <div className="flex items-center justify-between" style={{ padding: '3px 0' }}>
+      <span style={{ fontSize: 11, color: '#9B9B9B', fontFamily: '"DM Sans", sans-serif' }}>{label}</span>
+      <span
+        className="font-num"
+        style={{
+          fontSize: 13,
+          fontFamily: '"IBM Plex Mono", monospace',
+          color: valueColor ?? '#0A0A0A',
+          fontWeight: bold ? 700 : 400,
+        }}
+      >
+        {value}
+      </span>
     </div>
   );
 }
@@ -336,16 +410,28 @@ function ConfirmationModal({
         <div className="flex items-center gap-3" style={{ marginBottom: 20 }}>
           <CheckCircle />
           <h2 style={{ fontSize: 20, fontWeight: 500, color: '#0A0A0A', margin: 0, fontFamily: '"DM Sans", sans-serif' }}>
-            Position Opened
+            {details.leverage > 1 ? `Position Opened (${details.leverage}x Leverage)` : 'Position Opened'}
           </h2>
         </div>
 
         <div style={{ background: '#F7F7F5', borderRadius: 8, padding: 16, marginBottom: 16 }}>
           <ModalRow label="Basket" value={basketName} />
-          <ModalRow label="Amount Deposited" value={`${formatUsd(details.amount)} USDC`} mono />
-          <ModalRow label="Leverage" value={`${details.leverage}x`} mono />
-          <ModalRow label="CTRA Tokens Received" value={`${details.tokens.toFixed(4)} ${basketName}`} mono />
-          <ModalRow label="Entry NAV" value={`$${details.entryNav.toFixed(4)}`} mono />
+          {details.leverage > 1 ? (
+            <>
+              <ModalRow label="Collateral Deposited" value={`${formatUsd(details.amount)} USDC`} mono />
+              <ModalRow label="Borrowed From Pool" value={`${formatUsd(details.borrowed ?? 0)} USDC`} mono />
+              <ModalRow label="Total Exposure" value={`${formatUsd(details.totalExposure ?? 0)} USDC`} mono />
+              <ModalRow label="CTRA Tokens Received" value={`${details.tokens.toFixed(4)} ${basketName}`} mono />
+              <ModalRow label="Liquidation NAV" value={`$${(details.liquidationNav ?? 0).toFixed(4)}`} mono />
+              <ModalRow label="Daily Interest" value={`${formatInterest(details.dailyInterest ?? 0)}/day`} mono />
+            </>
+          ) : (
+            <>
+              <ModalRow label="Amount Deposited" value={`${formatUsd(details.amount)} USDC`} mono />
+              <ModalRow label="CTRA Tokens Received" value={`${details.tokens.toFixed(4)} ${basketName}`} mono />
+              <ModalRow label="Entry NAV" value={`$${details.entryNav.toFixed(4)}`} mono />
+            </>
+          )}
           <ModalRow
             label="Transaction"
             value={(
@@ -456,6 +542,13 @@ function formatUsd(v: number): string {
   const abs = Math.abs(v);
   if (abs >= 1000) return `$${v.toLocaleString(undefined, { maximumFractionDigits: 0 })}`;
   return `$${v.toFixed(2)}`;
+}
+
+// Daily interest is often sub-cent (e.g. $5 borrowed → $0.0007/day), so show
+// 4 decimals below $0.01 instead of rounding to $0.00.
+function formatInterest(v: number): string {
+  if (!Number.isFinite(v) || v <= 0) return '$0.0000';
+  return v < 0.01 ? `$${v.toFixed(4)}` : `$${v.toFixed(2)}`;
 }
 
 const labelStyle: React.CSSProperties = {

@@ -433,6 +433,16 @@ export async function listPositionsByWallet(wallet: string): Promise<Position[]>
   return [...mem.positions.values()].filter((p) => p.wallet === wallet);
 }
 
+export async function listPositionsByBasket(basketId: string): Promise<Position[]> {
+  const sb = getSupabase();
+  if (sb) {
+    const { data, error } = await sb.from('positions').select('*').eq('basket_id', basketId);
+    if (error) throw error;
+    return (data ?? []) as Position[];
+  }
+  return [...mem.positions.values()].filter((p) => p.basket_id === basketId);
+}
+
 // ---------- leveraged positions --------------------------------------
 
 export async function insertLeveragedPosition(p: Omit<LeveragedPosition, 'id' | 'opened_at'>): Promise<LeveragedPosition> {
@@ -455,6 +465,16 @@ export async function listLeveragedByWallet(wallet: string): Promise<LeveragedPo
     return (data ?? []) as LeveragedPosition[];
   }
   return [...mem.leveraged.values()].filter((l) => l.wallet === wallet);
+}
+
+export async function getLeveragedPositionById(id: string): Promise<LeveragedPosition | null> {
+  const sb = getSupabase();
+  if (sb) {
+    const { data, error } = await sb.from('leveraged_positions').select('*').eq('id', id).maybeSingle();
+    if (error) throw error;
+    return (data ?? null) as LeveragedPosition | null;
+  }
+  return mem.leveraged.get(id) ?? null;
 }
 
 export async function listLiquidatablePositions(threshold = 1.15): Promise<LeveragedPosition[]> {
@@ -1107,6 +1127,50 @@ export async function updateTrackedMarket(
   return cur;
 }
 
+/**
+ * Mark a scored market inactive so it drops out of the scanner pool and
+ * basket-eligible set. Used when a market resolves — the next-best market
+ * in its category then surfaces automatically (Phase 9).
+ */
+export async function deactivateScoredMarket(conditionId: string): Promise<void> {
+  const sb = getSupabase();
+  if (sb) {
+    const { error } = await sb
+      .from('scored_markets')
+      .update({ include_in_basket: false, signal: null })
+      .eq('condition_id', conditionId);
+    if (error) throw error;
+    return;
+  }
+  const cur = mem.scored.get(conditionId);
+  if (cur) {
+    cur.include_in_basket = false;
+    cur.signal = null;
+  }
+}
+
+/**
+ * Update a scored market's signal + basket inclusion in place. Used by the
+ * price collector to flag markets that have moved out of the actionable
+ * range (e.g. signal='resolved_likely', include_in_basket=false).
+ */
+export async function setScoredMarketStatus(
+  conditionId: string,
+  patch: { signal?: string | null; include_in_basket?: boolean },
+): Promise<void> {
+  const sb = getSupabase();
+  if (sb) {
+    const { error } = await sb.from('scored_markets').update(patch).eq('condition_id', conditionId);
+    if (error) throw error;
+    return;
+  }
+  const cur = mem.scored.get(conditionId);
+  if (cur) {
+    if (patch.signal !== undefined) cur.signal = patch.signal;
+    if (patch.include_in_basket !== undefined) cur.include_in_basket = patch.include_in_basket;
+  }
+}
+
 // ---------- market_price_history ------------------------------------
 
 export async function recordPricePoint(
@@ -1153,6 +1217,44 @@ export async function getLatestPricePoint(conditionId: string): Promise<MarketPr
   const arr = mem.prices.get(conditionId);
   if (!arr || arr.length === 0) return null;
   return arr[arr.length - 1];
+}
+
+/**
+ * Latest price per condition_id for a set of markets, in one query. Used by
+ * the scanner to show LIVE p_market instead of the stale screened value.
+ * Orders by recorded_at DESC and keeps the first (latest) row seen per id.
+ */
+export async function getLatestPricesMap(
+  conditionIds: string[],
+): Promise<Map<string, { price: number; recorded_at: string }>> {
+  const out = new Map<string, { price: number; recorded_at: string }>();
+  if (conditionIds.length === 0) return out;
+  const sb = getSupabase();
+  if (sb) {
+    // Chunk the IN list to stay well under URL limits; 100 ids per call.
+    for (let i = 0; i < conditionIds.length; i += 100) {
+      const chunk = conditionIds.slice(i, i + 100);
+      const { data, error } = await sb
+        .from('market_price_history')
+        .select('condition_id, price, recorded_at')
+        .in('condition_id', chunk)
+        .order('recorded_at', { ascending: false })
+        .limit(5000);
+      if (error) throw error;
+      for (const r of (data ?? []) as Array<{ condition_id: string; price: number; recorded_at: string }>) {
+        if (!out.has(r.condition_id)) out.set(r.condition_id, { price: Number(r.price), recorded_at: r.recorded_at });
+      }
+    }
+    return out;
+  }
+  for (const id of conditionIds) {
+    const arr = mem.prices.get(id);
+    if (arr && arr.length > 0) {
+      const last = arr[arr.length - 1];
+      out.set(id, { price: Number(last.price), recorded_at: last.recorded_at });
+    }
+  }
+  return out;
 }
 
 export async function getPriceHistory(conditionId: string): Promise<MarketPricePoint[]> {

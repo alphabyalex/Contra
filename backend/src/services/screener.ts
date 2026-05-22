@@ -15,8 +15,14 @@
 import {
   getScreenedMarket,
   upsertScreenedMarket,
+  upsertScoredMarket,
+  upsertTrackedMarket,
+  listTrackedMarkets,
+  listScoredMarkets,
   type ScreenedMarket,
 } from '../db/queries';
+import { getAllActiveMarkets, flattenOutcomes, daysToClose } from './polymarket';
+import { computeLayeredScore } from './ml-scorer';
 
 const ANTHROPIC_URL = 'https://api.anthropic.com/v1/messages';
 const MODEL = 'claude-sonnet-4-20250514';
@@ -193,4 +199,154 @@ export async function batchScreenMarkets(markets: MarketToScreen[]): Promise<{
 
   const excluded = results.filter((r) => r.excluded).length;
   return { results, newlyScreened, excluded, errors };
+}
+
+// =====================================================================
+// Automated market discovery (no Anthropic call — volume/probability +
+// ML scoring only). New markets appear in the scanner next cycle.
+// =====================================================================
+
+export interface DiscoverySummary {
+  checked: number;
+  candidates: number;
+  added: number;
+}
+
+/** Range/bracket markets ("between $1T and $1.25T") are not binary — skip. */
+export function isRangeMarket(question: string): boolean {
+  const q = (question || '').toLowerCase();
+  if (!/\bbetween\b/.test(q)) return false;
+  if (!/\band\b|&/.test(q)) return false;
+  return /[%$]|\d\s*[bt]\b/.test(q);
+}
+
+/**
+ * Lightweight discovery: pull live Polymarket markets, keep zone-1/2/3
+ * candidates not already tracked, ML-score them, and persist to
+ * screened_markets (FK parent) + scored_markets + tracked_markets.
+ * scored_markets.model_version = 'auto_discovery' marks them as
+ * not-yet-Anthropic-screened (the Sunday deep screen promotes them).
+ */
+export async function discoverNewMarkets(): Promise<DiscoverySummary> {
+  const markets = await getAllActiveMarkets(5).catch((e) => {
+    console.warn('[discovery] Polymarket fetch failed:', (e as Error).message);
+    return [] as Awaited<ReturnType<typeof getAllActiveMarkets>>;
+  });
+  const tracked = await listTrackedMarkets().catch(() => []);
+  const known = new Set(tracked.map((t) => t.condition_id));
+
+  let candidates = 0;
+  let added = 0;
+  const seen = new Set<string>();
+
+  for (const m of markets) {
+    const outs = flattenOutcomes(m);
+    const yes = outs.find((o) => /^yes$/i.test(o.outcomeLabel ?? '')) ?? outs[0];
+    if (!yes) continue;
+    const id = yes.conditionId;
+    if (!id || seen.has(id) || known.has(id)) continue;
+
+    if (isRangeMarket(yes.question)) continue; // FIX 1: no range/bracket markets
+    const p = yes.pMarket;
+    const inZone = (p >= 0.02 && p <= 0.2) || p >= 0.9; // zones 1, 2, 3
+    if (!inZone) continue;
+    if ((yes.volumeUsd ?? 0) < 50_000) continue; // FIX 4: $50k min (was $10k)
+    const days = daysToClose(yes.endDateIso);
+    if (days == null || days < 3 || days > 365) continue;
+
+    candidates += 1;
+    seen.add(id);
+    const dRounded = Math.round(days);
+    try {
+      // FK: screened_markets row must exist before scored_markets.
+      await upsertScreenedMarket({
+        condition_id: id, source: 'polymarket', question: yes.question, p_market: p,
+        impossible: false, already_resolved: false, ambiguous: false, excluded: false,
+        exclusion_reason: null, screening_model: 'auto_discovery',
+      });
+      const l = computeLayeredScore({
+        p_market: p, question: yes.question, volume: yes.volumeUsd,
+        days_to_close: dRounded, category: yes.category ?? null,
+      });
+      await upsertScoredMarket({
+        condition_id: id, source: 'polymarket', question: yes.question,
+        p_market: p, p_model: l.p_model, edge: l.raw_edge, raw_edge: l.raw_edge,
+        signal: l.signal, adjusted_edge: l.adjusted_edge, time_factor: l.time_factor,
+        category_factor: l.category_factor, volume_factor: l.volume_factor, volume: yes.volumeUsd,
+        days_to_close: dRounded, category: l.category, include_in_basket: l.include_in_basket,
+        impossible_edge: false, model_version: 'auto_discovery', momentum_factor: 1.0,
+        tournament_group: null, is_tournament_market: false, normalized_p_market: null, is_favorite: false,
+      } as any);
+      const existing = tracked.find((t) => t.condition_id === id);
+      if (!existing) {
+        await upsertTrackedMarket({
+          condition_id: id, source: 'polymarket', question: yes.question, token_id: yes.tokenId ?? null,
+          category: yes.category ?? null, p_market_initial: p, p_model_initial: l.p_model,
+          edge_initial: l.raw_edge, resolution_date: yes.endDateIso ?? null,
+          in_basket: false, outcome: null, resolved_at: null,
+        });
+      }
+      added += 1;
+    } catch (e) {
+      console.warn(`[discovery] add failed ${id}: ${(e as Error).message}`);
+    }
+  }
+
+  console.info(`[discovery] checked ${markets.length} markets, ${candidates} new candidates found, ${added} added`);
+  return { checked: markets.length, candidates, added };
+}
+
+/**
+ * CRON 3 (Sunday) deep screen: run the Anthropic impossibility check on
+ * auto-discovered markets that are >7 days old and not yet Anthropic-
+ * screened. Impossibles get p_model=0 + impossible_edge=true; all promoted
+ * markets have model_version flipped from 'auto_discovery' to the live
+ * calibration version (our proxy for anthropic_screened=true, since the DB
+ * column can't be ALTERed via the JS client). Capped per run.
+ */
+export async function promoteDiscoveredMarkets(maxToScreen = 50): Promise<{ screened: number; impossibles: number; promoted: number }> {
+  const scored = await listScoredMarkets();
+  const cutoff = Date.now() - 7 * 86_400_000;
+  const discovered = scored
+    .filter((s) => s.model_version === 'auto_discovery' && (!s.scored_at || Date.parse(s.scored_at) < cutoff))
+    .slice(0, maxToScreen);
+
+  let screened = 0;
+  let impossibles = 0;
+  let promoted = 0;
+  for (const sd of discovered) {
+    try {
+      const verdict = await screenMarket({
+        condition_id: sd.condition_id,
+        source: (sd.source === 'kalshi' ? 'kalshi' : 'polymarket') as 'kalshi' | 'polymarket',
+        question: sd.question,
+        p_market: sd.p_market,
+      });
+      screened += 1;
+      const isImp = verdict.impossible;
+      if (isImp) impossibles += 1;
+      await upsertScoredMarket({
+        condition_id: sd.condition_id, source: sd.source, question: sd.question,
+        p_market: sd.p_market ?? 0,
+        p_model: isImp ? 0 : (sd.p_model ?? 0),
+        edge: isImp ? (sd.p_market ?? 0) : (sd.edge ?? 0),
+        raw_edge: isImp ? (sd.p_market ?? 0) : ((sd as { raw_edge?: number | null }).raw_edge ?? sd.edge ?? 0),
+        signal: (sd as { signal?: string | null }).signal ?? null,
+        adjusted_edge: sd.adjusted_edge ?? 0, time_factor: sd.time_factor ?? 1,
+        category_factor: sd.category_factor ?? 1, volume_factor: sd.volume_factor ?? 1,
+        volume: sd.volume ?? null, days_to_close: sd.days_to_close ?? null, category: sd.category ?? null,
+        include_in_basket: isImp ? false : (sd.include_in_basket ?? false),
+        impossible_edge: isImp, model_version: 'calibration_v5_1', momentum_factor: sd.momentum_factor ?? 1,
+        tournament_group: (sd as { tournament_group?: string | null }).tournament_group ?? null,
+        is_tournament_market: (sd as { is_tournament_market?: boolean }).is_tournament_market ?? false,
+        normalized_p_market: (sd as { normalized_p_market?: number | null }).normalized_p_market ?? null,
+        is_favorite: (sd as { is_favorite?: boolean }).is_favorite ?? false,
+      } as Parameters<typeof upsertScoredMarket>[0]);
+      promoted += 1;
+    } catch (e) {
+      console.warn(`[deep-screen] failed ${sd.condition_id}: ${(e as Error).message}`);
+    }
+  }
+  console.info(`[deep-screen] ${screened} discovered markets screened, ${impossibles} impossibles flagged, ${promoted} promoted`);
+  return { screened, impossibles, promoted };
 }

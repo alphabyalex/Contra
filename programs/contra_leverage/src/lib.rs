@@ -41,7 +41,7 @@ pub const LIQUIDATOR_BONUS_BPS: u64 = 500;            // 5%
 pub const BPS_DENOM: u64 = 10_000;
 pub const MAX_LEVERAGE_BPS: u64 = 30_000;             // 3.00x
 pub const MIN_LEVERAGE_BPS: u64 = 10_000;             // 1.00x
-pub const MIN_USER_COLLATERAL_BPS: u64 = 4_000;       // 40%
+pub const MIN_USER_COLLATERAL_BPS: u64 = 3_000;       // 30% — permits up to 3.33x
 pub const NAV_SCALE: u64 = 1_000_000;
 
 #[program]
@@ -169,6 +169,7 @@ pub mod contra_leverage {
                     user: ctx.accounts.position.to_account_info(),
                     user_usdc_account: ctx.accounts.position_usdc_account.to_account_info(),
                     user_contra_account: ctx.accounts.position_ctrs_account.to_account_info(),
+                    fee_treasury: ctx.accounts.fee_treasury.to_account_info(),
                     token_program: ctx.accounts.token_program.to_account_info(),
                 },
                 pos_signer,
@@ -497,17 +498,24 @@ pub struct OpenPosition<'info> {
     )]
     pub position: Account<'info, Position>,
 
+    // Heavy accounts (the 43-leg Vault Vec + the Pool + token accounts) are
+    // Boxed onto the heap — keeping them on the 4KB BPF stack overflows it
+    // (open_position has the largest Accounts struct in the program).
     #[account(mut)]
-    pub vault: Account<'info, contra_vault::Vault>,
+    pub vault: Box<Account<'info, contra_vault::Vault>>,
     #[account(mut, address = vault.contra_mint @ LeverageError::WrongMint)]
-    pub contra_mint: Account<'info, Mint>,
+    pub contra_mint: Box<Account<'info, Mint>>,
     #[account(mut, address = vault.vault_usdc_account @ LeverageError::WrongVaultAccount)]
-    pub vault_usdc_account: Account<'info, TokenAccount>,
+    pub vault_usdc_account: Box<Account<'info, TokenAccount>>,
+    /// Authority's USDC ATA — receives the vault's 0.5% deposit fee on the
+    /// leveraged deposit CPI. The vault enforces owner == vault.authority.
+    #[account(mut)]
+    pub fee_treasury: Box<Account<'info, TokenAccount>>,
 
     #[account(mut)]
-    pub lending_pool: Account<'info, contra_lending::Pool>,
+    pub lending_pool: Box<Account<'info, contra_lending::Pool>>,
     #[account(mut, address = lending_pool.pool_usdc_account @ LeverageError::WrongVaultAccount)]
-    pub lending_pool_usdc: Account<'info, TokenAccount>,
+    pub lending_pool_usdc: Box<Account<'info, TokenAccount>>,
     #[account(seeds = [BORROWER_AUTH_SEED], bump = borrower_authority.bump)]
     pub borrower_authority: Account<'info, BorrowerAuthority>,
 
@@ -516,13 +524,13 @@ pub struct OpenPosition<'info> {
         seeds = [POSITION_USDC_SEED, position.key().as_ref()],
         bump = position.usdc_bump,
     )]
-    pub position_usdc_account: Account<'info, TokenAccount>,
+    pub position_usdc_account: Box<Account<'info, TokenAccount>>,
     #[account(
         mut,
         seeds = [POSITION_CTRS_SEED, position.key().as_ref()],
         bump = position.ctrs_bump,
     )]
-    pub position_ctrs_account: Account<'info, TokenAccount>,
+    pub position_ctrs_account: Box<Account<'info, TokenAccount>>,
 
     #[account(mut)]
     pub user: Signer<'info>,
@@ -530,7 +538,7 @@ pub struct OpenPosition<'info> {
         mut,
         constraint = user_usdc_account.owner == user.key() @ LeverageError::Unauthorized,
     )]
-    pub user_usdc_account: Account<'info, TokenAccount>,
+    pub user_usdc_account: Box<Account<'info, TokenAccount>>,
 
     pub contra_vault_program: Program<'info, ContraVault>,
     pub contra_lending_program: Program<'info, ContraLending>,

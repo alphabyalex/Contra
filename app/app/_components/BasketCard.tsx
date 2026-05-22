@@ -11,6 +11,7 @@ interface Props {
   leverage: string;
   source: string;
   category?: string;
+  description?: string | null;
 }
 
 /**
@@ -36,7 +37,7 @@ function leverageNum(s: string | undefined): number {
   return m ? parseInt(m[1], 10) : 1;
 }
 
-export function BasketCard({ id, name, nav, avgEdge, legs, leverage, source, category }: Props) {
+export function BasketCard({ id, name, nav, avgEdge, legs, leverage, source, category, description }: Props) {
   const isUp = nav >= 1;
   const subtitle = basketSubtitle(name, category);
   const lev = leverageNum(leverage);
@@ -85,11 +86,15 @@ export function BasketCard({ id, name, nav, avgEdge, legs, leverage, source, cat
         <Value color={isUp ? '#00875A' : '#CC2936'}>${nav.toFixed(3)}</Value>
         <Label>Est. Edge</Label>
         <Value color="#0A0A0A">+{(avgEdge * 100).toFixed(1)}%</Value>
-        <Label>Legs</Label>
-        <Value color="#0A0A0A">{legs}</Value>
         <Label>Source</Label>
         <Value color="#0A0A0A">{source}</Value>
       </div>
+
+      {description && (
+        <div style={{ fontSize: 12, color: '#6B6B6B', fontFamily: '"DM Sans", sans-serif', lineHeight: 1.4, marginTop: 12 }}>
+          {description.length > 120 ? description.slice(0, 120).trimEnd() + '…' : description}
+        </div>
+      )}
     </Link>
   );
 }

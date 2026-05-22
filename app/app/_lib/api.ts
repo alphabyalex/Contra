@@ -36,6 +36,11 @@ export interface ScannerRowAPI {
   normalized_p_market?: number | null;
   is_favorite?: boolean;
   is_ephemeral?: boolean;
+  p_market_screened?: number;
+  zone?: 0 | 1 | 2 | 3 | 4;
+  residual?: number | null;
+  model_stale?: boolean;
+  resolved_likely?: boolean;
   /** raw_edge × log10(volume + 1) — set on category-grouped responses. */
   score?: number;
 }
@@ -70,20 +75,73 @@ export const api = {
   },
 
   deposit: {
-    prepare: (input: { basketId: string; walletAddress: string; amountUsdc: number }) =>
+    prepare: (input: { basketId: string; walletAddress: string; amountUsdc: number; leverage?: 1 | 2 | 3 }) =>
       jsonRequest<{
         transactionBase64: string;
         recentBlockhash: string;
         lastValidBlockHeight: number;
-        vaultPda: string;
-        contraMint: string;
-        amountRaw: string;
+        vaultPda?: string;
+        contraMint?: string;
+        amountRaw?: string;
+        leveraged?: boolean;
+        leverage?: 1 | 2 | 3;
+        positionPda?: string;
+        collateral?: number;
+        borrowed?: number;
+        total_exposure?: number;
+        liquidation_nav?: number;
+        interest_rate?: number;
+        daily_interest?: number;
+        entry_nav?: number;
       }>('/api/deposit/prepare', { method: 'POST', body: JSON.stringify(input) }),
-    confirm: (input: { basketId: string; walletAddress: string; amountUsdc: number; signature: string }) =>
-      jsonRequest<{ status: string; signature: string }>('/api/deposit/confirm', {
+    confirm: (input: {
+      basketId: string;
+      walletAddress: string;
+      amountUsdc: number;
+      signature: string;
+      leverage?: 1 | 2 | 3;
+      positionPda?: string;
+    }) =>
+      jsonRequest<{
+        status: string;
+        signature: string;
+        leveraged?: boolean;
+        collateral?: number;
+        borrowed?: number;
+        total_exposure?: number;
+        vault_tokens?: number;
+        liquidation_nav?: number;
+        daily_interest?: number;
+      }>('/api/deposit/confirm', {
         method: 'POST',
         body: JSON.stringify(input),
       }),
+  },
+
+  redeem: {
+    prepare: (input: {
+      basketId: string;
+      walletAddress: string;
+      tokenAmount?: number;
+      usdcAmount?: number;
+    }) =>
+      jsonRequest<{
+        transaction_b64: string;
+        recentBlockhash: string;
+        lastValidBlockHeight: number;
+        tokenAmount: number;
+        gross_usdc: number;
+        fee: number;
+        net_usdc: number;
+        current_nav: number;
+        vault_pda: string;
+        contra_mint: string;
+      }>('/api/redeem/prepare', { method: 'POST', body: JSON.stringify(input) }),
+    confirm: (input: { signature: string; walletAddress: string; basketId: string; tokenAmount: number }) =>
+      jsonRequest<{ success: boolean; net_usdc: number; realized_pnl: number; closed: boolean }>(
+        '/api/redeem/confirm',
+        { method: 'POST', body: JSON.stringify(input) },
+      ),
   },
 
   markets: {
@@ -163,5 +221,16 @@ export const api = {
 
   leverage: {
     list: (wallet: string) => jsonRequest<{ positions: any[] }>(`/api/leverage/${wallet}`),
+    get: (id: string) => jsonRequest<{ position: any }>(`/api/leverage/${id}`),
+    close: (id: string, body: { tokenAmount?: number; usdcAmount?: number }) =>
+      jsonRequest<{ position: any; preview: { tokensClosed: number; gross: number; repay: number; interest: number; fee: number; net: number } }>(
+        `/api/leverage/${id}/close`,
+        { method: 'POST', body: JSON.stringify(body) },
+      ),
+    confirm: (id: string, body: { signature: string; tokenAmount?: number }) =>
+      jsonRequest<{ success: boolean; net_usdc: number; closed: boolean }>(`/api/leverage/${id}/confirm`, {
+        method: 'POST',
+        body: JSON.stringify(body),
+      }),
   },
 };

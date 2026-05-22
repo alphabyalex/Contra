@@ -2,9 +2,10 @@
 
 import { useEffect, useState } from 'react';
 import Link from 'next/link';
+import { useRouter } from 'next/navigation';
+import { AreaChart, Area, ResponsiveContainer } from 'recharts';
 import { api } from '../_lib/api';
 import { MOCK_BASKETS } from '../_lib/tokens';
-import { BasketCard } from '../_components/BasketCard';
 
 function BasketCardSkeleton() {
   return (
@@ -36,6 +37,7 @@ interface BasketRow {
   num_legs: number;
   nav?: number;
   avg_edge?: number;
+  description?: string | null;
 }
 
 /**
@@ -92,10 +94,13 @@ export default function BasketsPage() {
         // `leverage_type` column tracks short/mid term, not multiplier.
         leverage: deriveLeverageFromName(b.name),
         source: 'Both',
+        description: b.description ?? null,
+        status: (b as any).status ?? 'active',
       }));
 
   return (
-    <div style={{ background: '#F7F7F5', minHeight: 'calc(100vh - 56px)' }}>
+    <div style={{ background: 'linear-gradient(135deg, #F7F7F5 0%, #F0F4FF 50%, #F7F7F5 100%)', backgroundSize: '400% 400%', animation: 'gradientShift 8s ease infinite', minHeight: 'calc(100vh - 56px)' }}>
+      <style>{`@keyframes gradientShift { 0% { background-position: 0% 50% } 50% { background-position: 100% 50% } 100% { background-position: 0% 50% } }`}</style>
       {usingMock && (
         <div
           style={{
@@ -112,55 +117,167 @@ export default function BasketsPage() {
         </div>
       )}
 
-      <div className="max-w-[1400px] mx-auto px-6 py-8 space-y-6">
-        <div className="flex items-end justify-between">
+      <div style={{ maxWidth: 1200, margin: '0 auto', padding: '0 24px' }}>
+        <div style={{ padding: '48px 0 32px', display: 'flex', alignItems: 'flex-end', justifyContent: 'space-between' }}>
           <div>
-            <h1 style={{ fontSize: 28, fontWeight: 300, color: '#0A0A0A', margin: 0 }}>Baskets</h1>
-            <div style={{ fontSize: 11, color: '#9B9B9B', marginTop: 6 }}>
-              {display.length} short baskets across Kalshi and Polymarket
+            <h1 style={{ fontSize: 40, fontWeight: 200, color: '#0A0A0A', margin: 0, fontFamily: '"DM Sans", sans-serif' }}>Baskets</h1>
+            <div style={{ fontSize: 15, color: '#6B6B6B', marginTop: 8, fontFamily: '"DM Sans", sans-serif' }}>
+              {(() => {
+                const longN = display.filter(isLongBasket).length;
+                const shortN = display.length - longN;
+                return `${shortN} short · ${longN} long · across Kalshi and Polymarket`;
+              })()}
             </div>
           </div>
-          <Link
-            href="/scanner"
-            style={{
-              border: '1px solid #1A56DB',
-              color: '#1A56DB',
-              padding: '8px 18px',
-              borderRadius: 3,
-              fontSize: 11,
-              fontWeight: 500,
-              textTransform: 'uppercase',
-              letterSpacing: '0.04em',
-            }}
-          >
+          <Link href="/scanner" style={{ border: '1px solid #1A56DB', color: '#1A56DB', padding: '8px 18px', borderRadius: 6, fontSize: 12, fontWeight: 500, fontFamily: '"DM Sans", sans-serif' }}>
             View Scanner
           </Link>
         </div>
 
-        {loading ? (
-          <div className="grid grid-cols-1 md:grid-cols-2 lg:grid-cols-3 xl:grid-cols-4 gap-4">
-            {Array.from({ length: 8 }).map((_, i) => (
-              <BasketCardSkeleton key={i} />
-            ))}
-          </div>
-        ) : (
-          <div className="grid grid-cols-1 md:grid-cols-2 lg:grid-cols-3 xl:grid-cols-4 gap-4">
-            {display.map((b) => (
-              <BasketCard
-                key={b.id}
-                id={b.id}
-                name={b.name}
-                nav={b.nav}
-                avgEdge={b.avg_edge}
-                legs={b.num_legs}
-                leverage={b.leverage}
-                source={b.source}
-                category={b.category ?? undefined}
-              />
-            ))}
-          </div>
-        )}
+        <div style={{ display: 'grid', gridTemplateColumns: 'repeat(auto-fill, minmax(min(100%, 480px), 1fr))', gap: 24, paddingBottom: 48 }}>
+          {loading
+            ? Array.from({ length: 4 }).map((_, i) => (
+                <div key={i} className="skeleton" style={{ height: 280, borderRadius: 16 }} />
+              ))
+            : display.map((b) => <BasketCardPremium key={b.id} b={b} />)}
+        </div>
       </div>
+    </div>
+  );
+}
+
+function isLongBasket(b: any): boolean {
+  return /^CTRA-L/i.test(b.name ?? '') || /long exposure/i.test(b.description ?? '') || b.type === 'long';
+}
+
+const PILL: React.CSSProperties = {
+  fontFamily: '"IBM Plex Mono", monospace', fontSize: 10, letterSpacing: '0.06em', fontWeight: 500,
+  height: 20, lineHeight: '18px', padding: '0 8px', borderRadius: 10, display: 'inline-flex', alignItems: 'center', whiteSpace: 'nowrap',
+};
+const STAT_LABEL: React.CSSProperties = {
+  fontSize: 10, color: '#9B9B9B', textTransform: 'uppercase', letterSpacing: '0.08em', fontFamily: '"DM Sans", sans-serif',
+};
+
+function timeAgo(iso?: string | null): string {
+  if (!iso) return 'never';
+  const ms = Date.now() - Date.parse(iso);
+  if (!Number.isFinite(ms) || ms < 0) return 'just now';
+  const m = Math.floor(ms / 60000);
+  if (m < 1) return 'just now';
+  if (m < 60) return `${m} min ago`;
+  const h = Math.floor(m / 60);
+  if (h < 24) return `${h}h ago`;
+  return `${Math.floor(h / 24)}d ago`;
+}
+
+function BasketCardPremium({ b }: { b: any }) {
+  const router = useRouter();
+  const [hover, setHover] = useState(false);
+  const [navHistory, setNavHistory] = useState<{ nav: number }[]>([]);
+  const [updatedAt, setUpdatedAt] = useState<string | null>(null);
+
+  useEffect(() => {
+    let cancelled = false;
+    api.baskets.nav(b.id)
+      .then((r: any) => {
+        if (cancelled) return;
+        const all = r.history ?? [];
+        setNavHistory(all.slice(-50).map((h: any) => ({ nav: Number(h.nav ?? 1) })));
+        const last = all[all.length - 1];
+        setUpdatedAt(last?.snapshotted_at ?? last?.created_at ?? null);
+      })
+      .catch(() => {});
+    return () => { cancelled = true; };
+  }, [b.id]);
+
+  const long = isLongBasket(b);
+  const edge = Number(b.avg_edge ?? 0);
+  const nav = Number(b.nav ?? 1);
+  const navChange = (nav - 1) * 100;
+  const status = String(b.status ?? 'active').toLowerCase();
+  const desc = b.description ?? '';
+  const accent = long ? '#00875A' : '#1A56DB';
+  const fillId = `nav-fill-${b.id}`;
+  const statusPill =
+    status === 'finalized' ? { t: 'Finalized', bg: '#F3F4F6', fg: '#6B6B6B', bd: '#E5E7EB' }
+    : status === 'resolving' ? { t: 'Resolving', bg: '#FFFBEB', fg: '#B45309', bd: '#FDE68A' }
+    : { t: 'Active', bg: '#F0FDF4', fg: '#15803D', bd: '#BBF7D0' };
+  const spark = navHistory.length >= 2 ? navHistory : [{ nav }, { nav }];
+
+  return (
+    <div
+      onClick={() => router.push(`/baskets/${b.id}`)}
+      onMouseEnter={() => setHover(true)}
+      onMouseLeave={() => setHover(false)}
+      style={{
+        background: '#FFF', borderRadius: 20, padding: 32, cursor: 'pointer', borderTop: `3px solid ${accent}`,
+        boxShadow: hover ? '0 12px 32px rgba(0,0,0,0.14)' : '0 4px 16px rgba(0,0,0,0.08)',
+        transform: hover ? 'translateY(-4px)' : 'none',
+        transition: 'all 250ms cubic-bezier(0.34, 1.56, 0.64, 1)',
+      }}
+    >
+      <div style={{ display: 'flex', justifyContent: 'space-between', alignItems: 'flex-start' }}>
+        <div>
+          <div style={{ fontSize: 24, fontWeight: 600, color: '#0A0A0A', fontFamily: '"IBM Plex Mono", monospace' }}>{b.name}</div>
+          <div style={{ display: 'flex', gap: 8, marginTop: 12 }}>
+            {/* Outlined type pill — more refined than a filled chip. */}
+            <span style={{ height: 24, padding: '0 10px', borderRadius: 12, display: 'inline-flex', alignItems: 'center', background: '#FFF', border: `1.5px solid ${accent}`, color: accent, fontSize: 12, fontWeight: 500, fontFamily: '"DM Sans", sans-serif' }}>
+              {long ? 'Long' : 'Short'}
+            </span>
+            <span style={{ height: 24, padding: '0 10px', borderRadius: 12, display: 'inline-flex', alignItems: 'center', background: statusPill.bg, color: statusPill.fg, fontSize: 12, fontWeight: 500, fontFamily: '"DM Sans", sans-serif' }}>
+              {statusPill.t}
+            </span>
+          </div>
+        </div>
+        <div style={{ textAlign: 'right' }}>
+          <div className="font-num" style={{ fontSize: 32, fontWeight: 200, color: '#0A0A0A', lineHeight: 1.1 }}>${nav.toFixed(4)}</div>
+          <div className="font-num" style={{ fontSize: 14, color: navChange >= 0 ? '#00875A' : '#CC2936', marginTop: 4 }}>
+            {navChange >= 0 ? '+' : '−'}{Math.abs(navChange).toFixed(1)}%
+          </div>
+        </div>
+      </div>
+
+      <div style={{ height: 1, background: '#F0F0F0', margin: '20px 0' }} />
+
+      {/* stats grid with a centered vertical divider */}
+      <div style={{ display: 'grid', gridTemplateColumns: '1fr 1px 1fr', gap: 20, alignItems: 'start' }}>
+        <div>
+          <div style={STAT_LABEL}>Avg Edge</div>
+          <div className="font-num" style={{ fontSize: 18, color: edge >= 0 ? '#1A56DB' : '#00875A', marginTop: 2 }}>
+            {edge >= 0 ? '+' : '−'}{Math.abs(edge * 100).toFixed(1)}%
+          </div>
+          <div style={{ ...STAT_LABEL, marginTop: 16 }}>Sources</div>
+          <div style={{ fontSize: 13, color: '#6B6B6B', marginTop: 2, fontFamily: '"DM Sans", sans-serif' }}>Polymarket · Kalshi</div>
+        </div>
+        <div style={{ width: 1, height: 40, background: '#F0F0F0', alignSelf: 'center' }} />
+        <div>
+          <div style={STAT_LABEL}>Status</div>
+          <div style={{ fontSize: 13, color: '#0A0A0A', marginTop: 2, fontFamily: '"DM Sans", sans-serif' }}>{statusPill.t}</div>
+          <div style={{ ...STAT_LABEL, marginTop: 16 }}>Updated</div>
+          <div style={{ fontSize: 13, color: '#6B6B6B', marginTop: 2, fontFamily: '"DM Sans", sans-serif' }}>{timeAgo(updatedAt)}</div>
+        </div>
+      </div>
+
+      <div style={{ marginTop: 16, height: 56, width: '100%' }}>
+        <ResponsiveContainer width="100%" height={56}>
+          <AreaChart data={spark} margin={{ top: 4, bottom: 4, left: 0, right: 0 }}>
+            <defs>
+              <linearGradient id={fillId} x1="0" y1="0" x2="0" y2="1">
+                <stop offset="0%" stopColor={accent} stopOpacity={0.18} />
+                <stop offset="100%" stopColor={accent} stopOpacity={0} />
+              </linearGradient>
+            </defs>
+            <Area type="monotone" dataKey="nav" stroke={accent} strokeWidth={2} fill={`url(#${fillId})`} dot={false} isAnimationActive={false} />
+          </AreaChart>
+        </ResponsiveContainer>
+      </div>
+
+      {desc && (
+        <div style={{ fontSize: 13, color: '#6B6B6B', marginTop: 16, fontFamily: '"DM Sans", sans-serif', lineHeight: 1.5, display: '-webkit-box', WebkitLineClamp: 2, WebkitBoxOrient: 'vertical', overflow: 'hidden' }}>
+          {desc}
+        </div>
+      )}
+      <div style={{ fontSize: 10, color: '#C0C0C0', marginTop: 8, fontFamily: '"DM Sans", sans-serif' }}>Model-driven · Solana devnet</div>
     </div>
   );
 }

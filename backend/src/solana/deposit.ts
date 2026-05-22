@@ -27,11 +27,27 @@ import {
   getAssociatedTokenAddressSync,
 } from '@solana/spl-token';
 import { BN } from '@coral-xyz/anchor';
-import { getConnection, getVaultProgram, usdcMint } from './client';
+import {
+  getConnection,
+  getVaultProgram,
+  getLeverageProgram,
+  getAuthorityKeypair,
+  usdcMint,
+} from './client';
+import { SystemProgram, SYSVAR_RENT_PUBKEY } from '@solana/web3.js';
 import {
   deriveContraMint,
   deriveVaultPda,
   deriveVaultUsdc,
+  derivePosition,
+  derivePositionUsdc,
+  derivePositionCtrs,
+  deriveLendingPool,
+  derivePoolUsdc,
+  deriveBorrowerAuthority,
+  contraVaultProgramId,
+  contraLendingProgramId,
+  uuidToBytes,
 } from './pda';
 
 export interface PrepareDepositInput {
@@ -75,6 +91,11 @@ export async function buildDepositTransaction(
   const userUsdcAta = getAssociatedTokenAddressSync(usdc, user);
   const userCtrsAta = getAssociatedTokenAddressSync(contraMint, user);
 
+  // Fee treasury = authority's USDC ATA. The vault deposit ix enforces
+  // fee_treasury.owner == vault.authority, so this must be the authority.
+  const authority = getAuthorityKeypair().publicKey;
+  const feeTreasuryAta = getAssociatedTokenAddressSync(usdc, authority);
+
   const amountRaw = toRawUsdc(input.amountUsdc);
 
   const instructions: TransactionInstruction[] = [
@@ -85,6 +106,13 @@ export async function buildDepositTransaction(
       userCtrsAta,
       user,
       contraMint,
+    ),
+    // Idempotent — ensures the fee treasury ATA exists (payer = user).
+    createAssociatedTokenAccountIdempotentInstruction(
+      user,
+      feeTreasuryAta,
+      authority,
+      usdc,
     ),
   ];
 
@@ -97,6 +125,7 @@ export async function buildDepositTransaction(
       user,
       userUsdcAccount: userUsdcAta,
       userContraAccount: userCtrsAta,
+      feeTreasury: feeTreasuryAta,
       tokenProgram: TOKEN_PROGRAM_ID,
     })
     .instruction();
@@ -117,6 +146,136 @@ export async function buildDepositTransaction(
     vaultPda: vaultPda.toBase58(),
     contraMint: contraMint.toBase58(),
     amountRaw: amountRaw.toString(),
+  };
+}
+
+// =====================================================================
+// Leveraged deposit (contra_leverage.open_position)
+// =====================================================================
+
+export interface PrepareLeverageInput {
+  basketUuid: string;
+  walletAddress: string;
+  collateralUsdc: number; // human-readable USDC the user puts in
+  leverage: 2 | 3;
+}
+
+export interface PrepareLeverageResult {
+  transactionBase64: string;
+  recentBlockhash: string;
+  lastValidBlockHeight: number;
+  positionPda: string;
+  collateralUsdc: number;
+  borrowedUsdc: number;
+  totalExposureUsdc: number;
+  leverageBps: number;
+}
+
+/**
+ * Builds the single user-signed VersionedTransaction that opens a leveraged
+ * position: init_position → init_position_tokens → open_position. The
+ * leverage program borrows from the lending pool (its borrower-authority PDA
+ * signs that CPI internally) and deposits the total exposure into the vault,
+ * minting CTRS to the position's PDA token account. No authority co-sign.
+ *
+ * NOTE: requires the lending pool to hold ≥ borrowedUsdc of liquidity;
+ * otherwise open_position fails with InsufficientLiquidity on-chain.
+ */
+export async function buildLeveragedTransaction(
+  input: PrepareLeverageInput,
+): Promise<PrepareLeverageResult> {
+  const conn = getConnection();
+  const leverage = getLeverageProgram();
+  const user = new PublicKey(input.walletAddress);
+  const usdc = usdcMint();
+  const uuidBytes = uuidToBytes(input.basketUuid);
+
+  const collateralRaw = toRawUsdc(input.collateralUsdc);
+  const leverageBps = input.leverage * 10_000;
+  const totalRaw = (collateralRaw * BigInt(leverageBps)) / 10_000n;
+  const borrowedRaw = totalRaw - collateralRaw;
+
+  const [vaultPda] = deriveVaultPda(input.basketUuid);
+  const [contraMint] = deriveContraMint(vaultPda);
+  const [vaultUsdc] = deriveVaultUsdc(vaultPda);
+  const [position] = derivePosition(input.basketUuid, user);
+  const [positionUsdc] = derivePositionUsdc(position);
+  const [positionCtrs] = derivePositionCtrs(position);
+  const [pool] = deriveLendingPool();
+  const [poolUsdc] = derivePoolUsdc(pool);
+  const [borrowerAuth] = deriveBorrowerAuthority();
+
+  const userUsdcAta = getAssociatedTokenAddressSync(usdc, user);
+  const feeTreasuryAta = getAssociatedTokenAddressSync(usdc, getAuthorityKeypair().publicKey);
+
+  const initPositionIx = await leverage.methods
+    .initPosition([...uuidBytes] as number[])
+    .accounts({ vault: vaultPda, position, user, systemProgram: SystemProgram.programId })
+    .instruction();
+
+  const initTokensIx = await leverage.methods
+    .initPositionTokens()
+    .accounts({
+      position,
+      vault: vaultPda,
+      usdcMint: usdc,
+      contraMint,
+      positionUsdc,
+      positionCtrs,
+      user,
+      tokenProgram: TOKEN_PROGRAM_ID,
+      systemProgram: SystemProgram.programId,
+      rent: SYSVAR_RENT_PUBKEY,
+    })
+    .instruction();
+
+  const openIx = await leverage.methods
+    .openPosition(new BN(collateralRaw.toString()), new BN(leverageBps))
+    .accounts({
+      position,
+      vault: vaultPda,
+      contraMint,
+      vaultUsdcAccount: vaultUsdc,
+      feeTreasury: feeTreasuryAta,
+      lendingPool: pool,
+      lendingPoolUsdc: poolUsdc,
+      borrowerAuthority: borrowerAuth,
+      positionUsdcAccount: positionUsdc,
+      positionCtrsAccount: positionCtrs,
+      user,
+      userUsdcAccount: userUsdcAta,
+      contraVaultProgram: contraVaultProgramId(),
+      contraLendingProgram: contraLendingProgramId(),
+      tokenProgram: TOKEN_PROGRAM_ID,
+    })
+    .instruction();
+
+  const instructions: TransactionInstruction[] = [
+    ComputeBudgetProgram.setComputeUnitLimit({ units: 600_000 }),
+    // Ensure the fee treasury exists (open_position's vault deposit CPI skims the fee there).
+    createAssociatedTokenAccountIdempotentInstruction(user, feeTreasuryAta, getAuthorityKeypair().publicKey, usdc),
+    initPositionIx,
+    initTokensIx,
+    openIx,
+  ];
+
+  const { blockhash, lastValidBlockHeight } = await conn.getLatestBlockhash('confirmed');
+  const message = new TransactionMessage({
+    payerKey: user,
+    recentBlockhash: blockhash,
+    instructions,
+  }).compileToV0Message();
+  const tx = new VersionedTransaction(message);
+
+  return {
+    transactionBase64: Buffer.from(tx.serialize()).toString('base64'),
+    recentBlockhash: blockhash,
+    lastValidBlockHeight,
+    positionPda: position.toBase58(),
+    collateralUsdc: input.collateralUsdc,
+    borrowedUsdc: Number(borrowedRaw) / 1e6,
+    totalExposureUsdc: Number(totalRaw) / 1e6,
+    leverageBps,
   };
 }
 

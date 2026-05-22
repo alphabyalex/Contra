@@ -13,15 +13,31 @@
 
 import { Router } from 'express';
 import { z } from 'zod';
-import { buildDepositTransaction, confirmSignature } from '../solana/deposit';
-import { getBasket, getLatestNavSnapshot, recordTransaction, upsertPosition } from '../db/queries';
+import { buildDepositTransaction, buildLeveragedTransaction, confirmSignature } from '../solana/deposit';
+import {
+  getBasket,
+  getLatestNavSnapshot,
+  recordTransaction,
+  upsertPosition,
+  insertLeveragedPosition,
+} from '../db/queries';
 
 export const depositRouter: Router = Router();
+
+const INTEREST_APY = 0.05; // 5% flat APY on borrowed amount
+// Liquidation NAV as a fraction of entry NAV, per leverage tier.
+const LIQ_NAV_FACTOR: Record<2 | 3, number> = { 2: 0.52, 3: 0.68 };
+
+async function entryNavFor(basketId: string): Promise<number> {
+  const snap = await getLatestNavSnapshot(basketId).catch(() => null);
+  return snap && Number.isFinite(Number(snap.nav)) && Number(snap.nav) > 0 ? Number(snap.nav) : 1;
+}
 
 const prepareSchema = z.object({
   basketId: z.string().uuid(),
   walletAddress: z.string().min(32),
   amountUsdc: z.number().positive(),
+  leverage: z.union([z.literal(1), z.literal(2), z.literal(3)]).optional(),
 });
 
 depositRouter.post('/prepare', async (req, res) => {
@@ -38,13 +54,53 @@ depositRouter.post('/prepare', async (req, res) => {
     if (!basket.vault_pda) {
       return res.status(409).json({ error: 'vault_not_initialized' });
     }
+
+    const leverage = parsed.data.leverage ?? 1;
+
+    // Leveraged path: borrow (leverage−1)× from the lending pool and deposit
+    // the total exposure via contra_leverage.open_position.
+    if (leverage > 1) {
+      const lev = leverage as 2 | 3;
+      const built = await buildLeveragedTransaction({
+        basketUuid: basket.id,
+        walletAddress: parsed.data.walletAddress,
+        collateralUsdc: parsed.data.amountUsdc,
+        leverage: lev,
+      });
+      const entryNav = await entryNavFor(basket.id);
+      const liquidationNav = LIQ_NAV_FACTOR[lev] * entryNav;
+      const dailyInterest = (built.borrowedUsdc * INTEREST_APY) / 365;
+      return res.json({
+        ...built,
+        leverage: lev,
+        leveraged: true,
+        entry_nav: entryNav,
+        collateral: built.collateralUsdc,
+        borrowed: built.borrowedUsdc,
+        total_exposure: built.totalExposureUsdc,
+        liquidation_nav: liquidationNav,
+        interest_rate: INTEREST_APY,
+        daily_interest: dailyInterest,
+      });
+    }
+
     // basket.id is the basket UUID — same value used as on-chain basket_uuid seed.
     const result = await buildDepositTransaction({
       basketUuid: basket.id,
       walletAddress: parsed.data.walletAddress,
       amountUsdc: parsed.data.amountUsdc,
     });
-    res.json(result);
+    const fee = parsed.data.amountUsdc * 0.005;
+    const net = parsed.data.amountUsdc - fee;
+    res.json({
+      ...result,
+      transaction_b64: result.transactionBase64, // snake_case alias
+      leveraged: false,
+      leverage: 1,
+      deposit_amount: parsed.data.amountUsdc,
+      fee,
+      net,
+    });
   } catch (e) {
     res.status(500).json({ error: (e as Error).message });
   }
@@ -55,6 +111,8 @@ const confirmSchema = z.object({
   walletAddress: z.string().min(32),
   amountUsdc: z.number().positive(),
   signature: z.string().min(32),
+  leverage: z.union([z.literal(1), z.literal(2), z.literal(3)]).optional(),
+  positionPda: z.string().optional(),
 });
 
 depositRouter.post('/confirm', async (req, res) => {
@@ -77,6 +135,50 @@ depositRouter.post('/confirm', async (req, res) => {
       await new Promise((r) => setTimeout(r, 1500));
     }
     if (!confirmed) return res.status(202).json({ status: 'pending' });
+
+    const leverage = parsed.data.leverage ?? 1;
+
+    // Leveraged path: record the leveraged_positions row. The CTRS are held
+    // by the position PDA, not the user's wallet ATA.
+    if (leverage > 1) {
+      const lev = leverage as 2 | 3;
+      const entryNav = await entryNavFor(parsed.data.basketId);
+      const total = parsed.data.amountUsdc * lev;
+      const borrowed = total - parsed.data.amountUsdc;
+      // Net (post 0.5% vault fee) exposure mints CTRS at entry NAV.
+      const vaultTokens = (total * 0.995) / entryNav;
+      const healthFactor = borrowed > 0 ? (total * entryNav) / borrowed : Number.POSITIVE_INFINITY;
+      await insertLeveragedPosition({
+        basket_id: parsed.data.basketId,
+        wallet: parsed.data.walletAddress,
+        position_pda: parsed.data.positionPda ?? null,
+        collateral_usdc: parsed.data.amountUsdc,
+        debt_usdc: borrowed,
+        vault_tokens: vaultTokens,
+        leverage: lev,
+        health_factor: Number.isFinite(healthFactor) ? healthFactor : 999,
+        liquidated: false,
+      });
+      await recordTransaction({
+        basket_id: parsed.data.basketId,
+        wallet: parsed.data.walletAddress,
+        type: 'leverage_open',
+        usdc_delta: -parsed.data.amountUsdc,
+        tokens_delta: vaultTokens,
+        tx_signature: parsed.data.signature,
+      });
+      return res.json({
+        status: 'confirmed',
+        signature: parsed.data.signature,
+        leveraged: true,
+        collateral: parsed.data.amountUsdc,
+        borrowed,
+        total_exposure: total,
+        vault_tokens: vaultTokens,
+        liquidation_nav: LIQ_NAV_FACTOR[lev] * entryNav,
+        daily_interest: (borrowed * INTEREST_APY) / 365,
+      });
+    }
 
     // Tokens minted at the current NAV: tokens = usdc / current_nav.
     // First-deposit / pre-snapshot fallback: NAV = 1.0 (Active phase

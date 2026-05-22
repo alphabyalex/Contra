@@ -14,12 +14,15 @@ import { Router, Request, Response, NextFunction } from 'express';
 import { z } from 'zod';
 import {
   getBasket,
+  listBaskets,
   listLegs,
   listScreenedMarkets,
   resolveLegRow,
   updateBasket,
   recordTransaction,
+  getLatestNavSnapshot,
 } from '../db/queries';
+import { computeBasketNav } from '../services/nav';
 import {
   sendAddLeg,
   sendActivateVault,
@@ -54,6 +57,35 @@ function requireAdmin(req: Request, res: Response, next: NextFunction) {
 }
 
 adminRouter.use(requireAdmin);
+
+/** GET /api/admin/baskets — all baskets with leg count + current NAV. */
+adminRouter.get('/baskets', async (_req, res) => {
+  try {
+    const baskets = await listBaskets();
+    const out = await Promise.all(
+      baskets.map(async (b) => {
+        const [legs, snap] = await Promise.all([
+          listLegs(b.id).catch(() => []),
+          getLatestNavSnapshot(b.id).catch(() => null),
+        ]);
+        const nav = snap ? Number(snap.nav) : (legs.length ? computeBasketNav(legs).nav : 1);
+        return {
+          id: b.id,
+          name: b.name,
+          status: b.status,
+          num_legs: b.num_legs,
+          legs_count: legs.length,
+          current_nav: nav,
+          vault_pda: b.vault_pda ?? null,
+          contra_mint: b.contra_mint ?? null,
+        };
+      }),
+    );
+    res.json({ baskets: out });
+  } catch (e) {
+    res.status(500).json({ error: (e as Error).message });
+  }
+});
 
 /**
  * Multi-tx orchestration. Caller is expected to have already deposited

@@ -337,6 +337,64 @@ export async function getAllOpenMarkets(maxPages = 10): Promise<RawKalshiMarket[
   return all;
 }
 
+export interface KalshiScreenerMarket {
+  ticker: string;
+  title: string;
+  p_market: number;
+  volume: number;
+  days_to_close: number | null;
+  source: 'kalshi';
+}
+
+/**
+ * Fetch + filter Kalshi markets for the screener (Artemis Track #2).
+ * Paginates open markets, applies the same longshot band as the Polymarket
+ * screener (0.02 ≤ p ≤ 0.12, volume ≥ $100k, resolves within 365d), skips
+ * non-binary spread/range markets. Returns one row per market (YES side).
+ */
+export async function fetchKalshiMarkets(maxPages = 10): Promise<KalshiScreenerMarket[]> {
+  const out: KalshiScreenerMarket[] = [];
+  const seen = new Set<string>();
+  let cursor: string | undefined;
+  let fetched = 0;
+
+  for (let page = 0; page < maxPages; page++) {
+    if (page > 0) await sleep(500); // avoid rate limits
+    const search = new URLSearchParams({ limit: '200', status: 'open', with_nested_markets: 'true' });
+    if (cursor) search.set('cursor', cursor);
+    const r = await getJson<MarketsResponse>('/markets', search);
+    if (r.status === 429) { console.info('[kalshi] fetchKalshiMarkets throttled, stopping'); break; }
+    const markets = r.data?.markets ?? [];
+    if (markets.length === 0) break;
+    fetched += markets.length;
+
+    for (const m of markets) {
+      if (seen.has(m.ticker)) continue;
+      seen.add(m.ticker);
+      const title = m.title ?? '';
+      if (/\b(spread|range)\b/i.test(title)) continue; // non-binary
+      const p = yesProb(m);
+      if (p == null || p < 0.02 || p > 0.12) continue;
+      // Kalshi volume_fp is CONTRACT COUNT (not USD). 500 contracts is a
+      // reasonable price-discovery floor for the longshot band.
+      const vol = volumeUsd(m);
+      if (vol < 500) continue;
+      let days: number | null = null;
+      if (m.close_time) {
+        const t = Date.parse(m.close_time);
+        if (!Number.isNaN(t)) days = Math.round((t - Date.now()) / 86_400_000);
+      }
+      if (days != null && (days < 0 || days > 365)) continue;
+      out.push({ ticker: m.ticker, title, p_market: p, volume: vol, days_to_close: days, source: 'kalshi' });
+    }
+
+    if (!r.data?.cursor) break;
+    cursor = r.data.cursor;
+  }
+  console.info(`[kalshi] fetchKalshiMarkets: ${fetched} fetched, ${out.length} passed filter`);
+  return out;
+}
+
 export function flattenOutcomes(m: RawKalshiMarket): KalshiOutcome[] {
   const yesPrice = yesProb(m);
   if (yesPrice == null) return [];
@@ -372,6 +430,18 @@ export async function scanLongshots(
   return flat
     .filter((o) => o.pMarket > 0 && o.pMarket <= threshold && o.volumeUsd >= minVolumeUsd)
     .sort((a, b) => a.pMarket - b.pMarket);
+}
+
+/** Single-market YES probability + volume for the price collector. */
+export async function getKalshiMarketPrice(
+  ticker: string,
+): Promise<{ p_market: number; volume: number } | null> {
+  const r = await getJson<{ market?: RawKalshiMarket }>(`/markets/${encodeURIComponent(ticker)}`);
+  const m = r.data?.market;
+  if (!m) return null;
+  const p = yesProb(m);
+  if (p == null) return null;
+  return { p_market: p, volume: volumeUsd(m) };
 }
 
 export async function getOrderbook(ticker: string): Promise<unknown | null> {

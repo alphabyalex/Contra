@@ -1,10 +1,11 @@
 'use client';
 
 import { useEffect, useState } from 'react';
-import { useParams } from 'next/navigation';
+import { useParams, useSearchParams } from 'next/navigation';
 import { api } from '../../_lib/api';
 import { NavChart, type NavPoint } from '../../_components/NavChart';
 import { DepositForm } from '../../_components/DepositForm';
+import { RedeemForm } from '../../_components/RedeemForm';
 
 interface Leg {
   leg_index: number;
@@ -37,7 +38,12 @@ function basketTermLabel(basket: { name: string; leverage_type?: string; type?: 
 
 export default function BasketDetail() {
   const params = useParams<{ id: string }>();
+  const searchParams = useSearchParams();
   const id = params?.id ?? '';
+  const [tab, setTab] = useState<'buy' | 'sell'>('buy');
+  useEffect(() => {
+    if (searchParams?.get('tab') === 'sell') setTab('sell');
+  }, [searchParams]);
   const [data, setData] = useState<any>(null);
   const [history, setHistory] = useState<NavPoint[]>([]);
   // condition_id → volume, sourced from the live scanner so we can
@@ -105,7 +111,15 @@ export default function BasketDetail() {
           <div>
             <h1 style={{ fontSize: 28, fontWeight: 300, color: '#0A0A0A', margin: 0 }}>{basket.name}</h1>
             <div style={{ fontSize: 10, color: '#9B9B9B', textTransform: 'uppercase', letterSpacing: '0.08em', marginTop: 8 }}>
-              {basketTermLabel(basket)} · {basket.category ?? 'mixed'} · {basket.num_legs} legs · status {basket.status}
+              {basketTermLabel(basket)} · status {basket.status}
+            </div>
+            {basket.description && (
+              <div style={{ fontSize: 14, color: '#6B6B6B', fontFamily: '"DM Sans", sans-serif', marginTop: 12, maxWidth: 640, lineHeight: 1.5 }}>
+                {basket.description}
+              </div>
+            )}
+            <div style={{ fontSize: 11, color: '#9B9B9B', fontFamily: '"DM Sans", sans-serif', marginTop: 8 }}>
+              Not financial advice. Prediction markets involve risk of loss.
             </div>
           </div>
           <div style={{ textAlign: 'right' }}>
@@ -128,12 +142,42 @@ export default function BasketDetail() {
             <FeaturedMarkets featured={featured} remaining={remaining} />
           </div>
           <div className="space-y-4">
-            <DepositForm
-              basketId={basket.id}
-              basketName={basket.name}
-              avgEdge={avgEdge}
-              entryNav={Number(nav) || 1}
-            />
+            <div className="bg-white" style={{ border: '1px solid #E5E5E3', borderBottom: 'none', display: 'flex', gap: 24, padding: '0 20px' }}>
+              {(['buy', 'sell'] as const).map((t) => {
+                const active = tab === t;
+                return (
+                  <button
+                    key={t}
+                    type="button"
+                    onClick={() => setTab(t)}
+                    style={{
+                      background: 'transparent',
+                      border: 'none',
+                      padding: '12px 0',
+                      fontFamily: '"DM Sans", sans-serif',
+                      fontSize: 13,
+                      fontWeight: 500,
+                      color: active ? '#0A0A0A' : '#9B9B9B',
+                      borderBottom: `2px solid ${active ? '#1A56DB' : 'transparent'}`,
+                      marginBottom: -1,
+                      cursor: 'pointer',
+                    }}
+                  >
+                    {t === 'buy' ? 'Buy' : 'Sell'}
+                  </button>
+                );
+              })}
+            </div>
+            {tab === 'buy' ? (
+              <DepositForm
+                basketId={basket.id}
+                basketName={basket.name}
+                avgEdge={avgEdge}
+                entryNav={Number(nav) || 1}
+              />
+            ) : (
+              <RedeemForm basketId={basket.id} basketName={basket.name} currentNav={Number(nav) || 1} />
+            )}
             <div style={{ fontSize: 10, color: '#9B9B9B', lineHeight: 1.5 }}>
               Edge is model-estimated. Past performance does not guarantee future results.
             </div>
@@ -189,7 +233,7 @@ function FeaturedMarkets({ featured, remaining }: { featured: Leg[]; remaining: 
         <span>Source</span>
         <span style={{ textAlign: 'right' }}>P_Market</span>
         <span style={{ textAlign: 'right' }}>P_Model</span>
-        <span style={{ textAlign: 'right' }}>Est. Edge</span>
+        <span style={{ textAlign: 'right' }}>Est. Edge <InfoTip text="Model's estimated probability vs market implied probability. Positive: model sees overpricing. Negative: model sees underpricing. Not financial advice." /></span>
       </div>
 
       <div>
@@ -198,8 +242,11 @@ function FeaturedMarkets({ featured, remaining }: { featured: Leg[]; remaining: 
         ))}
       </div>
 
-      <div style={{ marginTop: 16, fontSize: 12, color: '#9B9B9B' }}>
+      <div style={{ marginTop: 16, fontSize: 12, color: '#9B9B9B', fontStyle: 'italic' }}>
         + {remaining} more positions · proprietary selection
+      </div>
+      <div style={{ marginTop: 8, fontSize: 10, color: '#9B9B9B' }}>
+        Edge is model-estimated. Past performance does not guarantee future results.
       </div>
     </div>
   );
@@ -230,8 +277,8 @@ function FeaturedRow({ leg }: { leg: Leg }) {
       <span className="font-num" style={{ textAlign: 'right', fontSize: 13, color: '#6B6B6B' }}>
         {(pModel * 100).toFixed(1)}%
       </span>
-      <span className="font-num" style={{ textAlign: 'right', fontSize: 13, color: '#1A56DB' }}>
-        +{(edge * 100).toFixed(1)}%
+      <span className="font-num" style={{ textAlign: 'right', fontSize: 13, color: edge >= 0 ? '#1A56DB' : '#00875A' }}>
+        {edge >= 0 ? '+' : '−'}{Math.abs(edge * 100).toFixed(1)}%
       </span>
     </div>
   );
@@ -242,24 +289,35 @@ function truncate(s: string, n: number): string {
   return s.length <= n ? s : s.slice(0, n - 1).trimEnd() + '…';
 }
 
-function SourcePill({ source }: { source: string }) {
-  const s = (source ?? '').toLowerCase();
-  const isKalshi = s === 'kalshi';
+function InfoTip({ text }: { text: string }) {
+  const [show, setShow] = useState(false);
   return (
-    <span
-      style={{
-        fontSize: 10,
-        fontFamily: '"DM Sans", sans-serif',
-        textTransform: 'uppercase',
-        letterSpacing: '0.08em',
-        padding: '2px 8px',
-        borderRadius: 10,
-        background: isKalshi ? '#E6F4EC' : '#EBF0FF',
-        color: isKalshi ? '#00875A' : '#1A56DB',
-        whiteSpace: 'nowrap',
-        width: 'fit-content',
-      }}
-    >
+    <span onMouseEnter={() => setShow(true)} onMouseLeave={() => setShow(false)}
+      style={{ position: 'relative', color: '#C0C0C0', cursor: 'help', fontSize: 11 }}>
+      ⓘ
+      {show && (
+        <span style={{
+          position: 'absolute', bottom: '150%', right: 0, background: '#FFFFFF', border: '1px solid #E5E5E3',
+          borderRadius: 8, padding: 12, fontSize: 12, fontFamily: '"DM Sans", sans-serif', color: '#0A0A0A',
+          width: 220, whiteSpace: 'normal', textTransform: 'none', letterSpacing: 0, lineHeight: 1.5, fontWeight: 400,
+          boxShadow: '0 8px 24px rgba(0,0,0,0.1)', zIndex: 50, textAlign: 'left',
+        }}>{text}</span>
+      )}
+    </span>
+  );
+}
+
+function SourcePill({ source }: { source: string }) {
+  const isKalshi = (source ?? '').toLowerCase() === 'kalshi';
+  const c = isKalshi
+    ? { background: '#F0FDF4', color: '#15803D', border: '1px solid #BBF7D0' }
+    : { background: '#EFF6FF', color: '#1D4ED8', border: '1px solid #BFDBFE' };
+  return (
+    <span style={{
+      fontFamily: '"IBM Plex Mono", monospace', fontSize: 10, letterSpacing: '0.06em', fontWeight: 500,
+      height: 20, lineHeight: '18px', padding: '0 8px', borderRadius: 10, display: 'inline-flex',
+      alignItems: 'center', whiteSpace: 'nowrap', width: 'fit-content', boxSizing: 'border-box', ...c,
+    }}>
       {isKalshi ? 'Kalshi' : 'Polymarket'}
     </span>
   );

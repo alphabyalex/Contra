@@ -705,6 +705,14 @@
           "writable": true
         },
         {
+          "name": "fee_treasury",
+          "docs": [
+            "Authority's USDC ATA — receives the vault's 0.5% deposit fee on the",
+            "leveraged deposit CPI. The vault enforces owner == vault.authority."
+          ],
+          "writable": true
+        },
+        {
           "name": "lending_pool",
           "writable": true
         },
