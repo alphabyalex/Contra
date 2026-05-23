@@ -24,6 +24,9 @@ import {
   updateLeveragedPosition,
 } from '../db/queries';
 import { computeBasketNav } from '../services/nav';
+import { buildClosePositionTransaction } from '../solana/leverageClose';
+import { getConnection } from '../solana/client';
+import { confirmSignature } from '../solana/deposit';
 
 export const leverageRouter: Router = Router();
 
@@ -200,27 +203,101 @@ leverageRouter.post('/:id/close', async (req, res) => {
   }
 });
 
-// POST /api/leverage/:id/confirm — record the close in the DB.
-leverageRouter.post('/:id/confirm', async (req, res) => {
-  const schema = z.object({ signature: z.string().min(8), tokenAmount: z.number().positive().optional() });
+// POST /api/leverage/:id/close/prepare — build the on-chain close_position
+// tx for Phantom to sign. FULL close only (close_position is a full unwind
+// on-chain; there is no partial-amount instruction).
+leverageRouter.post('/:id/close/prepare', async (req, res) => {
+  const schema = z.object({ walletAddress: z.string().min(32) });
   const parsed = schema.safeParse(req.body ?? {});
+  if (!parsed.success) return res.status(400).json({ error: 'bad_input', detail: parsed.error.flatten() });
+  try {
+    const built = await buildClosePositionTransaction(req.params.id, parsed.data.walletAddress);
+    res.json({
+      transaction_b64: built.transactionBase64,
+      recentBlockhash: built.recentBlockhash,
+      lastValidBlockHeight: built.lastValidBlockHeight,
+      position_pda: built.positionPda,
+      vault_finalized: built.vaultFinalized,
+      current_nav: built.currentNav,
+      preview: built.preview,
+    });
+  } catch (e) {
+    const msg = (e as Error).message;
+    const code =
+      msg === 'position_not_found' || msg === 'basket_not_found' ? 404
+      : msg === 'position_already_closed' ? 409
+      : 500;
+    res.status(code).json({ error: msg });
+  }
+});
+
+// POST /api/leverage/:id/confirm — submit the Phantom-signed close_position
+// tx on-chain, wait for confirmation, then settle the DB with the REAL
+// signature. Full close only.
+leverageRouter.post('/:id/confirm', async (req, res) => {
+  console.log('confirm body:', JSON.stringify(req.body));
+  const schema = z.object({ signedTx: z.string().min(1) });
+  const parsed = schema.safeParse(req.body ?? {});
+  console.log('parsed signedTx length:', parsed.data?.signedTx?.length);
   if (!parsed.success) return res.status(400).json({ error: 'bad_input', detail: parsed.error.flatten() });
   try {
     const lp = await getLeveragedPositionById(req.params.id);
     if (!lp) return res.status(404).json({ error: 'not_found' });
+    if (lp.closed_at || lp.liquidated) return res.status(409).json({ error: 'already_closed' });
     const p = await describePosition(lp);
-    const tokensToClose = Math.min(parsed.data.tokenAmount ?? p.token_amount, p.token_amount);
-    const prev = closePreview(p, tokensToClose);
-    const remaining = p.token_amount - tokensToClose;
-    const fullClose = remaining <= 1e-6;
+
+    // Submit the signed transaction and wait for it to land on-chain.
+    const conn = getConnection();
+    let signature: string;
+    try {
+      signature = await conn.sendRawTransaction(Buffer.from(parsed.data.signedTx, 'base64'), {
+        skipPreflight: false,
+        maxRetries: 3,
+      });
+    } catch (e) {
+      // TEMP: log full error object + any RPC logs (SendTransactionError carries
+      // .logs after .getLogs() is awaited) so we can see what the chain rejected with.
+      const err = e as any;
+      console.error('[leverage/confirm] sendRawTransaction failed — message:', err?.message);
+      console.error('[leverage/confirm] error.name:', err?.name, '| code:', err?.code);
+      if (typeof err?.getLogs === 'function') {
+        try {
+          const logs = await err.getLogs();
+          console.error('[leverage/confirm] program logs:', logs);
+        } catch (logErr) {
+          console.error('[leverage/confirm] getLogs() threw:', (logErr as Error).message);
+        }
+      }
+      if (Array.isArray(err?.logs)) console.error('[leverage/confirm] err.logs:', err.logs);
+      console.error('[leverage/confirm] stack:', err?.stack);
+      return res.status(502).json({ error: 'submit_failed', detail: (e as Error).message });
+    }
+
+    let confirmed = false;
+    for (let i = 0; i < 8; i++) {
+      const r = await confirmSignature(signature);
+      if (r.confirmed) { confirmed = true; break; }
+      if (r.err) return res.status(502).json({ error: 'tx_failed', detail: r.err, signature });
+      await new Promise((resolve) => setTimeout(resolve, 1500));
+    }
+    if (!confirmed) return res.status(202).json({ status: 'pending', signature });
+
+    // Confirmed: settle the DB (full close) with the real signature.
+    const prev = closePreview(p, p.token_amount);
     const updated = await updateLeveragedPosition(req.params.id, {
-      vault_tokens: fullClose ? 0 : remaining,
-      closed_at: fullClose ? new Date().toISOString() : null,
-      closed_pnl_usdc: fullClose ? prev.net - p.collateral_usdc : null,
+      vault_tokens: 0,
+      closed_at: new Date().toISOString(),
+      closed_pnl_usdc: prev.net - p.collateral_usdc,
     });
-    // No transaction row is recorded for a DB-settled close — there is no
-    // real on-chain signature yet, and fake "pending-…" rows pollute history.
-    res.json({ success: true, net_usdc: prev.net, closed: fullClose, position: updated });
+    await recordTransaction({
+      basket_id: lp.basket_id,
+      wallet: lp.wallet,
+      type: 'leverage_close',
+      usdc_delta: prev.net, // inflow to the user (USDC refunded after repay)
+      tokens_delta: -p.token_amount,
+      tx_signature: signature,
+    });
+    res.json({ success: true, signature, net_usdc: prev.net, closed: true, position: updated });
   } catch (e) {
     res.status(500).json({ error: (e as Error).message });
   }

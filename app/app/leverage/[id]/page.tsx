@@ -2,7 +2,10 @@
 
 import { useEffect, useMemo, useState } from 'react';
 import { useParams, useRouter } from 'next/navigation';
+import { useWallet } from '@solana/wallet-adapter-react';
+import { VersionedTransaction } from '@solana/web3.js';
 import { api } from '../../_lib/api';
+import { BACKEND_URL } from '../../_lib/tokens';
 
 const SANS = '"DM Sans", sans-serif';
 const MONO = '"IBM Plex Mono", monospace';
@@ -16,6 +19,7 @@ export default function LeverageClosePage() {
   const params = useParams<{ id: string }>();
   const router = useRouter();
   const id = params?.id ?? '';
+  const { publicKey, signTransaction } = useWallet();
   const [pos, setPos] = useState<any>(null);
   const [err, setErr] = useState<string | null>(null);
   const [mode, setMode] = useState<'tokens' | 'usdc'>('tokens');
@@ -57,13 +61,41 @@ export default function LeverageClosePage() {
 
   async function close() {
     setErr(null);
-    if (tokensToClose <= 0) { setErr('Enter an amount to close'); return; }
+    // close_position is a full-unwind on-chain instruction — there is no
+    // partial close, so the per-tokens input is informational only.
+    if (!publicKey || !signTransaction) {
+      setErr('Connect your wallet first');
+      return;
+    }
     setBusy(true);
     try {
-      // On-chain close_position settlement is wired at the DB/accounting layer;
-      // a signed-tx builder follows the verified open-position pattern.
-      const r = await api.leverage.confirm(id, { signature: 'pending-' + Date.now(), tokenAmount: tokensToClose });
-      setDone({ net: r.net_usdc, closed: r.closed });
+      // 1. Ask the backend to build the unsigned close_position tx.
+      const prepRes = await fetch(`${BACKEND_URL}/api/leverage/${id}/close/prepare`, {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ walletAddress: publicKey.toString() }),
+      });
+      const prep = await prepRes.json().catch(() => null);
+      if (!prepRes.ok) throw new Error(prep?.error ?? `prepare failed: ${prepRes.status}`);
+
+      // 2. Deserialize, let Phantom sign.
+      const tx = VersionedTransaction.deserialize(Buffer.from(prep.transaction_b64, 'base64'));
+      const signed = await signTransaction(tx);
+      const signedB64 = Buffer.from(signed.serialize()).toString('base64');
+
+      // 3. Submit + confirm via the backend; only then does the DB settle.
+      const confRes = await fetch(`${BACKEND_URL}/api/leverage/${id}/confirm`, {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ signedTx: signedB64 }),
+      });
+      const conf = await confRes.json().catch(() => null);
+      if (!confRes.ok) {
+        console.log('confirm response:', conf);
+        throw new Error(JSON.stringify(conf));
+      }
+
+      setDone({ net: Number(conf.net_usdc ?? 0), closed: Boolean(conf.closed) });
     } catch (e) {
       setErr((e as Error).message);
     } finally {

@@ -103,10 +103,14 @@ export function deriveBorrowerAuthority(): [PublicKey, number] {
 export function derivePosition(
   basketUuid: string | Buffer,
   wallet: PublicKey,
+  nonce: bigint,
 ): [PublicKey, number] {
   const bytes = typeof basketUuid === 'string' ? uuidToBytes(basketUuid) : basketUuid;
+  // Match the on-chain seed: u64 little-endian, 8 bytes.
+  const nonceBytes = Buffer.alloc(8);
+  nonceBytes.writeBigUInt64LE(nonce);
   return PublicKey.findProgramAddressSync(
-    [POSITION_SEED, bytes, wallet.toBuffer()],
+    [POSITION_SEED, bytes, wallet.toBuffer(), nonceBytes],
     contraLeverageProgramId(),
   );
 }

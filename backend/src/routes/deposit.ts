@@ -28,6 +28,13 @@ const INTEREST_APY = 0.05; // 5% flat APY on borrowed amount
 // Liquidation NAV as a fraction of entry NAV, per leverage tier.
 const LIQ_NAV_FACTOR: Record<2 | 3, number> = { 2: 0.52, 3: 0.68 };
 
+// In-memory positionPda → positionNonce stash. /prepare generates a random
+// u64 nonce per leveraged open and writes it here; /confirm reads it back so
+// the leveraged_positions row stores the nonce (needed later to re-derive
+// the same Position PDA at close time). Frontend forwards positionPda
+// already, so we don't need any frontend change to thread the nonce.
+const PENDING_LEVERAGE_NONCES = new Map<string, string>();
+
 async function entryNavFor(basketId: string): Promise<number> {
   const snap = await getLatestNavSnapshot(basketId).catch(() => null);
   return snap && Number.isFinite(Number(snap.nav)) && Number(snap.nav) > 0 ? Number(snap.nav) : 1;
@@ -67,6 +74,8 @@ depositRouter.post('/prepare', async (req, res) => {
         collateralUsdc: parsed.data.amountUsdc,
         leverage: lev,
       });
+      // Stash nonce for /confirm to retrieve by positionPda.
+      PENDING_LEVERAGE_NONCES.set(built.positionPda, built.positionNonce);
       const entryNav = await entryNavFor(basket.id);
       const liquidationNav = LIQ_NAV_FACTOR[lev] * entryNav;
       const dailyInterest = (built.borrowedUsdc * INTEREST_APY) / 365;
@@ -148,10 +157,23 @@ depositRouter.post('/confirm', async (req, res) => {
       // Net (post 0.5% vault fee) exposure mints CTRS at entry NAV.
       const vaultTokens = (total * 0.995) / entryNav;
       const healthFactor = borrowed > 0 ? (total * entryNav) / borrowed : Number.POSITIVE_INFINITY;
+      // Look up the nonce we stashed at /prepare time so the row's PDA can
+      // be re-derived at close. Missing here is recoverable but the close
+      // path would fall back to nonce=0 and derive the wrong PDA — so log a
+      // warning if it's somehow gone (server restart between prepare and confirm).
+      const positionPda = parsed.data.positionPda ?? null;
+      const stashedNonce = positionPda ? PENDING_LEVERAGE_NONCES.get(positionPda) : undefined;
+      if (positionPda && !stashedNonce) {
+        console.warn(`[deposit/confirm] missing nonce for positionPda=${positionPda} (server restart between prepare and confirm?)`);
+      }
+      const positionNonce = stashedNonce ?? '0';
+      if (positionPda) PENDING_LEVERAGE_NONCES.delete(positionPda);
+
       await insertLeveragedPosition({
         basket_id: parsed.data.basketId,
         wallet: parsed.data.walletAddress,
-        position_pda: parsed.data.positionPda ?? null,
+        position_pda: positionPda,
+        nonce: positionNonce,
         collateral_usdc: parsed.data.amountUsdc,
         debt_usdc: borrowed,
         vault_tokens: vaultTokens,

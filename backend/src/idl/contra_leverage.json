@@ -47,6 +47,11 @@
                 "kind": "account",
                 "path": "position.owner",
                 "account": "Position"
+              },
+              {
+                "kind": "account",
+                "path": "position.nonce",
+                "account": "Position"
               }
             ]
           }
@@ -235,6 +240,10 @@
               {
                 "kind": "account",
                 "path": "user"
+              },
+              {
+                "kind": "arg",
+                "path": "nonce"
               }
             ]
           }
@@ -258,6 +267,10 @@
               16
             ]
           }
+        },
+        {
+          "name": "nonce",
+          "type": "u64"
         }
       ]
     },
@@ -300,6 +313,11 @@
               {
                 "kind": "account",
                 "path": "position.owner",
+                "account": "Position"
+              },
+              {
+                "kind": "account",
+                "path": "position.nonce",
                 "account": "Position"
               }
             ]
@@ -494,6 +512,11 @@
                 "kind": "account",
                 "path": "position.owner",
                 "account": "Position"
+              },
+              {
+                "kind": "account",
+                "path": "position.nonce",
+                "account": "Position"
               }
             ]
           }
@@ -687,6 +710,11 @@
               {
                 "kind": "account",
                 "path": "position.owner",
+                "account": "Position"
+              },
+              {
+                "kind": "account",
+                "path": "position.nonce",
                 "account": "Position"
               }
             ]
@@ -886,6 +914,11 @@
               {
                 "kind": "account",
                 "path": "position.owner",
+                "account": "Position"
+              },
+              {
+                "kind": "account",
+                "path": "position.nonce",
                 "account": "Position"
               }
             ]
@@ -1132,6 +1165,14 @@
                 16
               ]
             }
+          },
+          {
+            "name": "nonce",
+            "docs": [
+              "Per-position uniqueness — same (wallet, basket) can open new",
+              "positions back-to-back as long as the nonce differs."
+            ],
+            "type": "u64"
           },
           {
             "name": "collateral_usdc",

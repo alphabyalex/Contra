@@ -337,61 +337,189 @@ export async function getAllOpenMarkets(maxPages = 10): Promise<RawKalshiMarket[
   return all;
 }
 
+export type InternalCategory = 'politics' | 'sports' | 'macro' | 'crypto' | 'other';
+
 export interface KalshiScreenerMarket {
   ticker: string;
   title: string;
   p_market: number;
   volume: number;
   days_to_close: number | null;
+  category: InternalCategory;
   source: 'kalshi';
 }
 
 /**
- * Fetch + filter Kalshi markets for the screener (Artemis Track #2).
- * Paginates open markets, applies the same longshot band as the Polymarket
- * screener (0.02 ≤ p ≤ 0.12, volume ≥ $100k, resolves within 365d), skips
- * non-binary spread/range markets. Returns one row per market (YES side).
+ * Map a Kalshi market's category / series / title text onto one of our
+ * internal categories. Kalshi's own `category` is coarse and inconsistent,
+ * so we keyword-match across category + series_ticker + event_ticker +
+ * ticker + title for the best signal.
  */
-export async function fetchKalshiMarkets(maxPages = 10): Promise<KalshiScreenerMarket[]> {
-  const out: KalshiScreenerMarket[] = [];
+export function inferKalshiCategory(m: {
+  category?: string;
+  series_ticker?: string;
+  event_ticker?: string;
+  ticker?: string;
+  title?: string;
+}): InternalCategory {
+  const hay = `${m.category ?? ''} ${m.series_ticker ?? ''} ${m.event_ticker ?? ''} ${m.ticker ?? ''} ${m.title ?? ''}`.toLowerCase();
+  if (/\b(fed|fomc|cpi|inflation|jobs|payroll|payrolls|unemployment|gdp|interest rate|rate cut|rate hike|recession|treasury|yield)\b/.test(hay)) return 'macro';
+  if (/\b(election|senate|house|president|presidential|governor|congress|primary|nominee|nomination|democrat|republican|parliament|prime minister|cabinet|impeach)\b/.test(hay)) return 'politics';
+  if (/\b(btc|eth|crypto|bitcoin|ethereum|solana|dogecoin|xrp|stablecoin)\b/.test(hay)) return 'crypto';
+  if (/\b(nfl|nba|mlb|nhl|fifa|world cup|tennis|golf|super bowl|stanley cup|world series|premier league|ufc|boxing|olympics|olympic|soccer|football|basketball|baseball|hockey|grand slam|wimbledon|masters)\b/.test(hay)) return 'sports';
+  return 'other';
+}
+
+// ---------- /events + /series browsing ------------------------------
+
+interface RawKalshiEvent {
+  event_ticker: string;
+  series_ticker?: string;
+  title?: string;
+  category?: string;
+  markets?: RawKalshiMarket[];
+}
+interface EventsResponse {
+  events: RawKalshiEvent[];
+  cursor?: string;
+}
+interface SingleEventResponse {
+  event?: RawKalshiEvent;
+  markets?: RawKalshiMarket[];
+}
+
+/**
+ * Browse Kalshi markets via the /events endpoint (broader coverage than
+ * /markets alone — surfaces econ/Fed/politics events whose markets don't
+ * appear high in the flat /markets list). Paginates GET /events?status=open
+ * with_nested_markets=true; when an event arrives without nested markets we
+ * fall back to GET /events/:event_ticker (capped to avoid rate limits).
+ * Event-level category/series are stamped onto each market so downstream
+ * category inference has the best signal. Reuses getJson() (RSA-PSS auth +
+ * 429 handling) — no new auth logic.
+ */
+export async function getKalshiEventMarkets(
+  maxPages = 5,
+  maxPerEventFetches = 80,
+): Promise<RawKalshiMarket[]> {
+  const out: RawKalshiMarket[] = [];
   const seen = new Set<string>();
   let cursor: string | undefined;
-  let fetched = 0;
+  let perEventFetches = 0;
+  let eventsSeen = 0;
 
   for (let page = 0; page < maxPages; page++) {
-    if (page > 0) await sleep(500); // avoid rate limits
+    if (page > 0) await sleep(400);
     const search = new URLSearchParams({ limit: '200', status: 'open', with_nested_markets: 'true' });
     if (cursor) search.set('cursor', cursor);
-    const r = await getJson<MarketsResponse>('/markets', search);
-    if (r.status === 429) { console.info('[kalshi] fetchKalshiMarkets throttled, stopping'); break; }
-    const markets = r.data?.markets ?? [];
-    if (markets.length === 0) break;
-    fetched += markets.length;
+    const r = await getJson<EventsResponse>('/events', search);
+    if (r.status === 429) { console.info('[kalshi] getKalshiEventMarkets throttled, stopping'); break; }
+    const events = r.data?.events ?? [];
+    if (events.length === 0) break;
+    eventsSeen += events.length;
 
-    for (const m of markets) {
-      if (seen.has(m.ticker)) continue;
-      seen.add(m.ticker);
-      const title = m.title ?? '';
-      if (/\b(spread|range)\b/i.test(title)) continue; // non-binary
-      const p = yesProb(m);
-      if (p == null || p < 0.02 || p > 0.12) continue;
-      // Kalshi volume_fp is CONTRACT COUNT (not USD). 500 contracts is a
-      // reasonable price-discovery floor for the longshot band.
-      const vol = volumeUsd(m);
-      if (vol < 500) continue;
-      let days: number | null = null;
-      if (m.close_time) {
-        const t = Date.parse(m.close_time);
-        if (!Number.isNaN(t)) days = Math.round((t - Date.now()) / 86_400_000);
+    for (const ev of events) {
+      let markets = ev.markets ?? [];
+      if (markets.length === 0 && perEventFetches < maxPerEventFetches) {
+        await sleep(250);
+        perEventFetches += 1;
+        const er = await getJson<SingleEventResponse>(`/events/${encodeURIComponent(ev.event_ticker)}`);
+        markets = er.data?.markets ?? er.data?.event?.markets ?? [];
       }
-      if (days != null && (days < 0 || days > 365)) continue;
-      out.push({ ticker: m.ticker, title, p_market: p, volume: vol, days_to_close: days, source: 'kalshi' });
+      for (const m of markets) {
+        if (!m.ticker || seen.has(m.ticker)) continue;
+        seen.add(m.ticker);
+        // Propagate event-level metadata so inferKalshiCategory has more to go on.
+        if (!m.category && ev.category) m.category = ev.category;
+        if (!m.series_ticker && ev.series_ticker) m.series_ticker = ev.series_ticker;
+        if (!m.event_ticker) m.event_ticker = ev.event_ticker;
+        out.push(m);
+      }
     }
 
     if (!r.data?.cursor) break;
     cursor = r.data.cursor;
   }
-  console.info(`[kalshi] fetchKalshiMarkets: ${fetched} fetched, ${out.length} passed filter`);
+  console.info(`[kalshi] getKalshiEventMarkets: ${eventsSeen} events, ${perEventFetches} per-event fetches, ${out.length} markets`);
+  return out;
+}
+
+/** Paginate the flat /markets list, returning raw markets (no filtering). */
+async function getRawOpenMarkets(maxPages = 10): Promise<RawKalshiMarket[]> {
+  const out: RawKalshiMarket[] = [];
+  const seen = new Set<string>();
+  let cursor: string | undefined;
+  for (let page = 0; page < maxPages; page++) {
+    if (page > 0) await sleep(500);
+    const search = new URLSearchParams({ limit: '200', status: 'open', with_nested_markets: 'true' });
+    if (cursor) search.set('cursor', cursor);
+    const r = await getJson<MarketsResponse>('/markets', search);
+    if (r.status === 429) { console.info('[kalshi] getRawOpenMarkets throttled, stopping'); break; }
+    const markets = r.data?.markets ?? [];
+    if (markets.length === 0) break;
+    for (const m of markets) {
+      if (!m.ticker || seen.has(m.ticker)) continue;
+      seen.add(m.ticker);
+      out.push(m);
+    }
+    if (!r.data?.cursor) break;
+    cursor = r.data.cursor;
+  }
+  return out;
+}
+
+/**
+ * Fetch + filter Kalshi markets for the screener (Artemis Track #2).
+ * Pulls from BOTH /markets and /events for broad coverage, dedupes by
+ * ticker, then applies the widened longshot/contender band (0.02 ≤ p ≤ 0.25,
+ * matching ML zones 1+2), a ≥100-contract volume floor, a 0-365d window, and
+ * the non-binary spread/range exclusion. Category is inferred per-market.
+ * Returns one row per market (YES side).
+ */
+export async function fetchKalshiMarkets(maxPages = 10): Promise<KalshiScreenerMarket[]> {
+  const [flat, viaEvents] = await Promise.all([
+    getRawOpenMarkets(maxPages),
+    getKalshiEventMarkets(5).catch((e) => {
+      console.warn(`[kalshi] /events browse failed: ${(e as Error).message}`);
+      return [] as RawKalshiMarket[];
+    }),
+  ]);
+
+  // Merge + dedupe by ticker (flat /markets wins on metadata).
+  const byTicker = new Map<string, RawKalshiMarket>();
+  for (const m of viaEvents) if (m.ticker) byTicker.set(m.ticker, m);
+  for (const m of flat) if (m.ticker) byTicker.set(m.ticker, m);
+  const merged = [...byTicker.values()];
+
+  const out: KalshiScreenerMarket[] = [];
+  for (const m of merged) {
+    const title = m.title ?? '';
+    if (/\b(spread|range)\b/i.test(title)) continue; // non-binary
+    const p = yesProb(m);
+    if (p == null || p < 0.02 || p > 0.25) continue; // widened band (zones 1+2)
+    // Kalshi volume_fp is CONTRACT COUNT (not USD); lowered to 100 — quality
+    // is filtered downstream in the scorer.
+    const vol = volumeUsd(m);
+    if (vol < 100) continue;
+    let days: number | null = null;
+    if (m.close_time) {
+      const t = Date.parse(m.close_time);
+      if (!Number.isNaN(t)) days = Math.round((t - Date.now()) / 86_400_000);
+    }
+    if (days != null && (days < 0 || days > 365)) continue;
+    out.push({
+      ticker: m.ticker,
+      title,
+      p_market: p,
+      volume: vol,
+      days_to_close: days,
+      category: inferKalshiCategory(m),
+      source: 'kalshi',
+    });
+  }
+  console.info(
+    `[kalshi] fetchKalshiMarkets: ${flat.length} via /markets + ${viaEvents.length} via /events → ${merged.length} unique, ${out.length} passed filter`,
+  );
   return out;
 }
 

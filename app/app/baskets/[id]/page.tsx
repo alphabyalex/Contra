@@ -242,9 +242,11 @@ function FeaturedMarkets({ featured, remaining }: { featured: Leg[]; remaining: 
         ))}
       </div>
 
-      <div style={{ marginTop: 16, fontSize: 12, color: '#9B9B9B', fontStyle: 'italic' }}>
-        + {remaining} more positions · proprietary selection
-      </div>
+      {/* Used to display the count of additional positions held in the basket.
+          Leg counts are intentionally hidden from user-facing surfaces, so
+          the line is omitted. `remaining` is still computed (and still used
+          internally for the avg-edge calc above) so removing this render
+          is purely a visibility change. */}
       <div style={{ marginTop: 8, fontSize: 10, color: '#9B9B9B' }}>
         Edge is model-estimated. Past performance does not guarantee future results.
       </div>

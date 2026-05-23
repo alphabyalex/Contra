@@ -33,7 +33,10 @@ const USDC_MINT_DEVNET = new PublicKey('4zMMC9srt5Ri5X14GAgXhaHii3GnPAEERYPJgZJD
 const COLOR = {
   usdc: '#9B9B9B',
   ctraOdd: '#1A56DB',
-  ctraEven: '#0E3A8C',
+  // Long (even-numbered / type === 'long') baskets use the same green
+  // accent as the basket cards on /baskets so coloring stays consistent
+  // across the app. Short baskets (odd-numbered) keep blue.
+  ctraEven: '#00875A',
   profit: '#00875A',
   loss: '#CC2936',
   text: '#0A0A0A',
@@ -49,15 +52,26 @@ const COLOR = {
 
 const SANS = '"DM Sans", system-ui, sans-serif';
 
-function basketTypeFor(name: string | undefined): { label: string; color: string } | null {
+// Resolve a basket's display label + accent color. Source of truth (in order):
+//   1. basket.type === 'long' (explicit DB/API field, if present)
+//   2. Even-numbered CTRA name (CTRA-02, CTRA-04, ...) is long
+//   3. Otherwise short
+// Long → green to match the Baskets page card border; short → blue.
+function basketTypeFor(
+  name: string | undefined,
+  basket?: { type?: string | null } | null,
+): { label: string; color: string } | null {
   if (!name) return null;
+  if (basket && String(basket.type ?? '').toLowerCase() === 'long') {
+    return { label: 'LONG', color: COLOR.ctraEven };
+  }
   const m = name.match(/^CTRA-(\d+)/i);
   if (!m) return null;
   const n = parseInt(m[1], 10);
   if (Number.isNaN(n)) return null;
   return n % 2 === 1
     ? { label: 'SHORT TERM', color: COLOR.ctraOdd }
-    : { label: 'MID TERM', color: COLOR.ctraEven };
+    : { label: 'LONG', color: COLOR.ctraEven };
 }
 
 interface HoldingRow {
@@ -169,7 +183,7 @@ export default function PortfolioPage() {
   // ---- holdings rows (positions + USDC) ----
   const positionRows: HoldingRow[] = basketPositions.map((p) => {
     const name = p.basket?.name ?? 'Basket';
-    const t = basketTypeFor(name);
+    const t = basketTypeFor(name, p.basket as any);
     return {
       key: p.id,
       name,

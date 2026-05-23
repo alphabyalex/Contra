@@ -68,7 +68,9 @@ export function TickerMarquee() {
     ['Markets Scanned', s.marketsScanned.toLocaleString()],
     ['Active Baskets', String(s.activeBaskets)],
     ['Avg Edge', `${(s.avgEdge * 100).toFixed(1)}%`],
-    ['Legs Resolved NO', String(s.legsResolvedNo)],
+    // 'Legs Resolved NO' intentionally omitted: leg counts are hidden from
+    // user-facing surfaces. The legsResolvedNo data is still fetched (state
+    // + the totalLegs accumulator in the effect) so re-enabling is one line.
     ['Protocol TVL', `$${s.tvl.toLocaleString(undefined, { maximumFractionDigits: 0 })}`],
   ];
   // Duplicate so the marquee loops without a visible jump.

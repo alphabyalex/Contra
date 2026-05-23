@@ -21,6 +21,7 @@ import {
   updateBasket,
   recordTransaction,
   getLatestNavSnapshot,
+  listNavHistory,
 } from '../db/queries';
 import { computeBasketNav } from '../services/nav';
 import {
@@ -78,6 +79,74 @@ adminRouter.get('/baskets', async (_req, res) => {
           current_nav: nav,
           vault_pda: b.vault_pda ?? null,
           contra_mint: b.contra_mint ?? null,
+        };
+      }),
+    );
+    res.json({ baskets: out });
+  } catch (e) {
+    res.status(500).json({ error: (e as Error).message });
+  }
+});
+
+/**
+ * GET /api/admin/sharpe — annualized Sharpe ratio per basket.
+ *
+ *   For each basket with at least MIN_SNAPSHOTS nav_snapshots (ordered
+ *   ascending), compute period returns r_i = (nav[i] - nav[i-1]) / nav[i-1],
+ *   then Sharpe = (mean(r) / stddev(r)) * sqrt(PERIODS_PER_YEAR).
+ *   Risk-free rate is zero (devnet/demo). Snapshots run every 2 minutes,
+ *   so PERIODS_PER_YEAR = (365.25 * 1440) / 2 = 262,980.
+ *
+ *   Baskets with too few snapshots, NaN stddev (flat NAV), or otherwise
+ *   undefined Sharpe come back with `sharpe: null` and a `reason`. Sample
+ *   uses Bessel's correction (n - 1) so a single-period series doesn't
+ *   silently divide by zero.
+ *
+ *   Admin-only: never link from user pages.
+ */
+adminRouter.get('/sharpe', async (_req, res) => {
+  const MIN_SNAPSHOTS = 30;
+  const PERIODS_PER_YEAR = (365.25 * 24 * 60) / 2; // 262,980 (2-min cadence)
+  const SQRT_PERIODS = Math.sqrt(PERIODS_PER_YEAR);
+  try {
+    const baskets = await listBaskets();
+    const out = await Promise.all(
+      baskets.map(async (b) => {
+        const snaps = await listNavHistory(b.id, 100_000).catch(() => []);
+        const navs = snaps.map((s) => Number(s.nav)).filter((n) => Number.isFinite(n) && n > 0);
+        const n = navs.length;
+        const base = {
+          basket_id: b.id,
+          basket_name: b.name,
+          num_snapshots: n,
+          period_days: snaps.length >= 2
+            ? (Date.parse(snaps[snaps.length - 1].snapshotted_at) - Date.parse(snaps[0].snapshotted_at)) / 86_400_000
+            : 0,
+        };
+        if (n < MIN_SNAPSHOTS) return { ...base, sharpe: null, reason: `need >= ${MIN_SNAPSHOTS} snapshots, have ${n}` };
+
+        // Period returns r_i.
+        const rets: number[] = [];
+        for (let i = 1; i < n; i++) {
+          const prev = navs[i - 1];
+          if (prev <= 0) continue;
+          rets.push((navs[i] - prev) / prev);
+        }
+        if (rets.length < 2) return { ...base, sharpe: null, reason: 'insufficient return periods' };
+
+        const mean = rets.reduce((s, r) => s + r, 0) / rets.length;
+        // Sample variance with Bessel's correction.
+        const sq = rets.reduce((s, r) => s + (r - mean) ** 2, 0) / (rets.length - 1);
+        const sd = Math.sqrt(sq);
+        if (!Number.isFinite(sd) || sd === 0) return { ...base, sharpe: null, reason: 'zero variance (flat NAV)' };
+
+        const sharpe = (mean / sd) * SQRT_PERIODS;
+        return {
+          ...base,
+          sharpe: Number(sharpe.toFixed(4)),
+          mean_return: Number(mean.toFixed(8)),
+          stddev_return: Number(sd.toFixed(8)),
+          annualization_factor: PERIODS_PER_YEAR,
         };
       }),
     );

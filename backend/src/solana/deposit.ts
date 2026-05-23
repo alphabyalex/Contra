@@ -165,6 +165,7 @@ export interface PrepareLeverageResult {
   recentBlockhash: string;
   lastValidBlockHeight: number;
   positionPda: string;
+  positionNonce: string; // u64 as decimal string — DB stores it, close reads it back
   collateralUsdc: number;
   borrowedUsdc: number;
   totalExposureUsdc: number;
@@ -195,10 +196,14 @@ export async function buildLeveragedTransaction(
   const totalRaw = (collateralRaw * BigInt(leverageBps)) / 10_000n;
   const borrowedRaw = totalRaw - collateralRaw;
 
+  // Random nonce per open so the position PDA is unique even for the same
+  // (wallet, basket) pair — fixes the deterministic-PDA collision bug.
+  const positionNonce = BigInt(Date.now());
+
   const [vaultPda] = deriveVaultPda(input.basketUuid);
   const [contraMint] = deriveContraMint(vaultPda);
   const [vaultUsdc] = deriveVaultUsdc(vaultPda);
-  const [position] = derivePosition(input.basketUuid, user);
+  const [position] = derivePosition(input.basketUuid, user, positionNonce);
   const [positionUsdc] = derivePositionUsdc(position);
   const [positionCtrs] = derivePositionCtrs(position);
   const [pool] = deriveLendingPool();
@@ -209,7 +214,7 @@ export async function buildLeveragedTransaction(
   const feeTreasuryAta = getAssociatedTokenAddressSync(usdc, getAuthorityKeypair().publicKey);
 
   const initPositionIx = await leverage.methods
-    .initPosition([...uuidBytes] as number[])
+    .initPosition([...uuidBytes] as number[], new BN(positionNonce.toString()))
     .accounts({ vault: vaultPda, position, user, systemProgram: SystemProgram.programId })
     .instruction();
 
@@ -272,6 +277,7 @@ export async function buildLeveragedTransaction(
     recentBlockhash: blockhash,
     lastValidBlockHeight,
     positionPda: position.toBase58(),
+    positionNonce: positionNonce.toString(),
     collateralUsdc: input.collateralUsdc,
     borrowedUsdc: Number(borrowedRaw) / 1e6,
     totalExposureUsdc: Number(totalRaw) / 1e6,

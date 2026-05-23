@@ -144,8 +144,15 @@ function LiveStatsBar() {
       {stats.markets} markets tracked
       <span style={{ color: '#C0C0C0', margin: '0 8px' }}>·</span>
       {stats.baskets} active baskets
-      <span style={{ color: '#C0C0C0', margin: '0 8px' }}>·</span>
-      ${stats.avgNav.toFixed(2)} avg NAV
+      {/* Avg NAV is only shown when >= 1 (i.e. the portfolio is at or above
+          inception). Below 1 we hide it rather than display a discouraging
+          number on the front door. */}
+      {stats.avgNav >= 1 && (
+        <>
+          <span style={{ color: '#C0C0C0', margin: '0 8px' }}>·</span>
+          ${stats.avgNav.toFixed(2)} avg NAV
+        </>
+      )}
     </div>
   );
 }

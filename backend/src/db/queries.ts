@@ -77,6 +77,10 @@ export interface LeveragedPosition {
   basket_id: string;
   wallet: string;
   position_pda?: string | null;
+  /** u64 nonce in the position-PDA seed. Stored as Postgres BIGINT —
+   *  Supabase returns it as `number` (Date.now() is safely below 2^53)
+   *  but we tolerate `string` for callers that prefer that. */
+  nonce?: string | number | null;
   collateral_usdc: number;
   debt_usdc: number;
   vault_tokens: number;

@@ -58,11 +58,13 @@ pub mod contra_leverage {
     pub fn init_position(
         ctx: Context<InitPosition>,
         basket_uuid: [u8; 16],
+        nonce: u64,
     ) -> Result<()> {
         let pos = &mut ctx.accounts.position;
         pos.owner = ctx.accounts.user.key();
         pos.basket_vault = ctx.accounts.vault.key();
         pos.basket_uuid = basket_uuid;
+        pos.nonce = nonce;
         pos.collateral_usdc = 0;
         pos.debt_usdc = 0;
         pos.ctrs_held = 0;
@@ -153,10 +155,12 @@ pub mod contra_leverage {
         let basket_uuid = pos.basket_uuid;
         let pos_bump = pos.bump;
         let user_pk = pos.owner;
+        let nonce_bytes = pos.nonce.to_le_bytes();
         let pos_signer: &[&[&[u8]]] = &[&[
             POSITION_SEED,
             basket_uuid.as_ref(),
             user_pk.as_ref(),
+            nonce_bytes.as_ref(),
             &[pos_bump],
         ]];
         contra_vault::cpi::deposit(
@@ -177,10 +181,19 @@ pub mod contra_leverage {
             total_u64,
         )?;
 
+        // Reload position_ctrs_account so its `.amount` reflects what the
+        // vault deposit CPI just minted. The vault skims a 0.5% deposit fee
+        // into fee_treasury, so the position only ends up with total × 0.995
+        // CTRS, NOT the gross total_u64. We must store the true minted amount
+        // — otherwise `unwind_position` later tries to burn more than exists
+        // and the SPL token program reverts with InsufficientFunds.
+        ctx.accounts.position_ctrs_account.reload()?;
+        let actually_minted = ctx.accounts.position_ctrs_account.amount;
+
         let pos = &mut ctx.accounts.position;
         pos.collateral_usdc = collateral_usdc;
         pos.debt_usdc = debt;
-        pos.ctrs_held = total_u64; // contra_vault mints 1:1 during Active
+        pos.ctrs_held = actually_minted; // true on-chain balance (post 0.5% vault fee)
         pos.leverage_bps = leverage_bps;
         pos.health_factor = HEALTH_SCALE; // NAV = 1.0 at open
         pos.opened_at = Clock::get()?.unix_timestamp;
@@ -264,26 +277,32 @@ fn unwind_position<'info>(
     vault_program: &Program<'info, ContraVault>,
     lending_program: &Program<'info, ContraLending>,
     token_program: &Program<'info, Token>,
-    vault: &Account<'info, contra_vault::Vault>,
-    contra_mint: &Account<'info, Mint>,
-    vault_usdc_account: &Account<'info, TokenAccount>,
+    // Heavy accounts are Boxed in ClosePosition/Liquidate (Vault Vec<Leg>,
+    // Pool, token accounts) so they live on the heap; the references here
+    // must thread the Box through rather than copy a fat Account onto the
+    // stack — otherwise the 4KB BPF stack overflows.
+    vault: &Box<Account<'info, contra_vault::Vault>>,
+    contra_mint: &Box<Account<'info, Mint>>,
+    vault_usdc_account: &Box<Account<'info, TokenAccount>>,
     position: &Account<'info, Position>,
-    position_usdc: &mut Account<'info, TokenAccount>,
-    position_ctrs: &Account<'info, TokenAccount>,
-    lending_pool: &Account<'info, contra_lending::Pool>,
-    lending_pool_usdc: &Account<'info, TokenAccount>,
+    position_usdc: &mut Box<Account<'info, TokenAccount>>,
+    position_ctrs: &Box<Account<'info, TokenAccount>>,
+    lending_pool: &Box<Account<'info, contra_lending::Pool>>,
+    lending_pool_usdc: &Box<Account<'info, TokenAccount>>,
     borrower_authority: &Account<'info, BorrowerAuthority>,
-    user_usdc: &Account<'info, TokenAccount>,
-    liquidator_usdc: Option<&Account<'info, TokenAccount>>,
+    user_usdc: &Box<Account<'info, TokenAccount>>,
+    liquidator_usdc: Option<&Box<Account<'info, TokenAccount>>>,
     vault_finalized: bool,
 ) -> Result<()> {
     let basket_uuid = position.basket_uuid;
     let pos_bump = position.bump;
     let owner = position.owner;
+    let nonce_bytes = position.nonce.to_le_bytes();
     let pos_signer: &[&[&[u8]]] = &[&[
         POSITION_SEED,
         basket_uuid.as_ref(),
         owner.as_ref(),
+        nonce_bytes.as_ref(),
         &[pos_bump],
     ]];
 
@@ -333,8 +352,15 @@ fn unwind_position<'info>(
     // Step 2 — repay debt to lending pool. We always repay the full
     // outstanding debt if we can; any shortfall is socialized to LPs as
     // bad debt (acceptable for v0; revisit when adding insurance fund).
-    let auth_bump = borrower_authority.bump;
-    let auth_signer: &[&[&[u8]]] = &[&[BORROWER_AUTH_SEED, &[auth_bump]]];
+    //
+    // The repayer must equal the SPL token-account authority on
+    // `source_usdc_account` (position_usdc). position_usdc was init'd with
+    // `token::authority = position`, so the position PDA must be both the
+    // declared repayer AND the CPI signer. The borrower_authority PDA only
+    // matters for the `borrow` CPI (lending checks pool.borrow_authority
+    // against the Borrow::borrow_authority signer); repay has no such
+    // pool-side identity check. `borrower_authority` is kept in the outer
+    // ClosePosition/Liquidate structs purely for the address validation.
     let repay_amount = position.debt_usdc.min(recovered);
     if repay_amount > 0 {
         contra_lending::cpi::repay(
@@ -343,15 +369,16 @@ fn unwind_position<'info>(
                 Repay {
                     pool: lending_pool.to_account_info(),
                     pool_usdc_account: lending_pool_usdc.to_account_info(),
-                    repayer: borrower_authority.to_account_info(),
+                    repayer: position.to_account_info(),
                     source_usdc_account: position_usdc.to_account_info(),
                     token_program: token_program.to_account_info(),
                 },
-                auth_signer,
+                pos_signer,
             ),
             repay_amount,
         )?;
     }
+    let _ = borrower_authority; // kept in outer accounts list; not used post-fix
 
     // Step 3 — distribute remainder. Liquidator gets 5% bonus on remainder
     // (capped at remainder); user receives the rest.
@@ -431,7 +458,7 @@ pub struct InitializeBorrowerAuthority<'info> {
 }
 
 #[derive(Accounts)]
-#[instruction(basket_uuid: [u8; 16])]
+#[instruction(basket_uuid: [u8; 16], nonce: u64)]
 pub struct InitPosition<'info> {
     /// The basket vault this position will be entered into. Cross-checked
     /// against basket_uuid via vault.basket_uuid (read-only here).
@@ -440,7 +467,7 @@ pub struct InitPosition<'info> {
         init,
         payer = user,
         space = Position::SPACE,
-        seeds = [POSITION_SEED, basket_uuid.as_ref(), user.key().as_ref()],
+        seeds = [POSITION_SEED, basket_uuid.as_ref(), user.key().as_ref(), nonce.to_le_bytes().as_ref()],
         bump,
         constraint = vault.basket_uuid == basket_uuid @ LeverageError::BasketMismatch,
     )]
@@ -454,7 +481,7 @@ pub struct InitPosition<'info> {
 pub struct InitPositionTokens<'info> {
     #[account(
         mut,
-        seeds = [POSITION_SEED, position.basket_uuid.as_ref(), position.owner.as_ref()],
+        seeds = [POSITION_SEED, position.basket_uuid.as_ref(), position.owner.as_ref(), position.nonce.to_le_bytes().as_ref()],
         bump = position.bump,
         constraint = position.owner == user.key() @ LeverageError::Unauthorized,
     )]
@@ -492,7 +519,7 @@ pub struct InitPositionTokens<'info> {
 pub struct OpenPosition<'info> {
     #[account(
         mut,
-        seeds = [POSITION_SEED, position.basket_uuid.as_ref(), position.owner.as_ref()],
+        seeds = [POSITION_SEED, position.basket_uuid.as_ref(), position.owner.as_ref(), position.nonce.to_le_bytes().as_ref()],
         bump = position.bump,
         constraint = position.owner == user.key() @ LeverageError::Unauthorized,
     )]
@@ -549,7 +576,7 @@ pub struct OpenPosition<'info> {
 pub struct UpdateHealth<'info> {
     #[account(
         mut,
-        seeds = [POSITION_SEED, position.basket_uuid.as_ref(), position.owner.as_ref()],
+        seeds = [POSITION_SEED, position.basket_uuid.as_ref(), position.owner.as_ref(), position.nonce.to_le_bytes().as_ref()],
         bump = position.bump,
     )]
     pub position: Account<'info, Position>,
@@ -560,23 +587,27 @@ pub struct UpdateHealth<'info> {
 pub struct ClosePosition<'info> {
     #[account(
         mut,
-        seeds = [POSITION_SEED, position.basket_uuid.as_ref(), position.owner.as_ref()],
+        seeds = [POSITION_SEED, position.basket_uuid.as_ref(), position.owner.as_ref(), position.nonce.to_le_bytes().as_ref()],
         bump = position.bump,
         constraint = position.owner == user.key() @ LeverageError::Unauthorized,
     )]
     pub position: Account<'info, Position>,
 
+    // Heavy accounts are Boxed onto the heap — without this, the Vault's
+    // Vec<Leg> (up to 43 legs) plus the Pool plus all the token accounts
+    // overflow the BPF 4KB stack the first time `unwind_position` is called.
+    // Mirrors OpenPosition's identical treatment for the same reason.
     #[account(mut)]
-    pub vault: Account<'info, contra_vault::Vault>,
+    pub vault: Box<Account<'info, contra_vault::Vault>>,
     #[account(mut, address = vault.contra_mint @ LeverageError::WrongMint)]
-    pub contra_mint: Account<'info, Mint>,
+    pub contra_mint: Box<Account<'info, Mint>>,
     #[account(mut, address = vault.vault_usdc_account @ LeverageError::WrongVaultAccount)]
-    pub vault_usdc_account: Account<'info, TokenAccount>,
+    pub vault_usdc_account: Box<Account<'info, TokenAccount>>,
 
     #[account(mut)]
-    pub lending_pool: Account<'info, contra_lending::Pool>,
+    pub lending_pool: Box<Account<'info, contra_lending::Pool>>,
     #[account(mut, address = lending_pool.pool_usdc_account @ LeverageError::WrongVaultAccount)]
-    pub lending_pool_usdc: Account<'info, TokenAccount>,
+    pub lending_pool_usdc: Box<Account<'info, TokenAccount>>,
     #[account(seeds = [BORROWER_AUTH_SEED], bump = borrower_authority.bump)]
     pub borrower_authority: Account<'info, BorrowerAuthority>,
 
@@ -585,13 +616,13 @@ pub struct ClosePosition<'info> {
         seeds = [POSITION_USDC_SEED, position.key().as_ref()],
         bump = position.usdc_bump,
     )]
-    pub position_usdc_account: Account<'info, TokenAccount>,
+    pub position_usdc_account: Box<Account<'info, TokenAccount>>,
     #[account(
         mut,
         seeds = [POSITION_CTRS_SEED, position.key().as_ref()],
         bump = position.ctrs_bump,
     )]
-    pub position_ctrs_account: Account<'info, TokenAccount>,
+    pub position_ctrs_account: Box<Account<'info, TokenAccount>>,
 
     #[account(mut)]
     pub user: Signer<'info>,
@@ -599,7 +630,7 @@ pub struct ClosePosition<'info> {
         mut,
         constraint = user_usdc_account.owner == user.key() @ LeverageError::Unauthorized,
     )]
-    pub user_usdc_account: Account<'info, TokenAccount>,
+    pub user_usdc_account: Box<Account<'info, TokenAccount>>,
 
     pub contra_vault_program: Program<'info, ContraVault>,
     pub contra_lending_program: Program<'info, ContraLending>,
@@ -610,22 +641,25 @@ pub struct ClosePosition<'info> {
 pub struct Liquidate<'info> {
     #[account(
         mut,
-        seeds = [POSITION_SEED, position.basket_uuid.as_ref(), position.owner.as_ref()],
+        seeds = [POSITION_SEED, position.basket_uuid.as_ref(), position.owner.as_ref(), position.nonce.to_le_bytes().as_ref()],
         bump = position.bump,
     )]
     pub position: Account<'info, Position>,
 
+    // Box the heavy accounts — same reasoning as OpenPosition / ClosePosition:
+    // the Vault Vec<Leg> + Pool + token accounts overflow the 4KB BPF stack
+    // when unwind_position is invoked on top of an already-deep call frame.
     #[account(mut)]
-    pub vault: Account<'info, contra_vault::Vault>,
+    pub vault: Box<Account<'info, contra_vault::Vault>>,
     #[account(mut, address = vault.contra_mint @ LeverageError::WrongMint)]
-    pub contra_mint: Account<'info, Mint>,
+    pub contra_mint: Box<Account<'info, Mint>>,
     #[account(mut, address = vault.vault_usdc_account @ LeverageError::WrongVaultAccount)]
-    pub vault_usdc_account: Account<'info, TokenAccount>,
+    pub vault_usdc_account: Box<Account<'info, TokenAccount>>,
 
     #[account(mut)]
-    pub lending_pool: Account<'info, contra_lending::Pool>,
+    pub lending_pool: Box<Account<'info, contra_lending::Pool>>,
     #[account(mut, address = lending_pool.pool_usdc_account @ LeverageError::WrongVaultAccount)]
-    pub lending_pool_usdc: Account<'info, TokenAccount>,
+    pub lending_pool_usdc: Box<Account<'info, TokenAccount>>,
     #[account(seeds = [BORROWER_AUTH_SEED], bump = borrower_authority.bump)]
     pub borrower_authority: Account<'info, BorrowerAuthority>,
 
@@ -634,17 +668,17 @@ pub struct Liquidate<'info> {
         seeds = [POSITION_USDC_SEED, position.key().as_ref()],
         bump = position.usdc_bump,
     )]
-    pub position_usdc_account: Account<'info, TokenAccount>,
+    pub position_usdc_account: Box<Account<'info, TokenAccount>>,
     #[account(
         mut,
         seeds = [POSITION_CTRS_SEED, position.key().as_ref()],
         bump = position.ctrs_bump,
     )]
-    pub position_ctrs_account: Account<'info, TokenAccount>,
+    pub position_ctrs_account: Box<Account<'info, TokenAccount>>,
 
     /// The position owner's USDC ATA — receives the post-debt remainder.
     #[account(mut)]
-    pub user_usdc_account: Account<'info, TokenAccount>,
+    pub user_usdc_account: Box<Account<'info, TokenAccount>>,
 
     #[account(mut)]
     pub liquidator: Signer<'info>,
@@ -652,7 +686,7 @@ pub struct Liquidate<'info> {
         mut,
         constraint = liquidator_usdc_account.owner == liquidator.key() @ LeverageError::Unauthorized,
     )]
-    pub liquidator_usdc_account: Account<'info, TokenAccount>,
+    pub liquidator_usdc_account: Box<Account<'info, TokenAccount>>,
 
     pub contra_vault_program: Program<'info, ContraVault>,
     pub contra_lending_program: Program<'info, ContraLending>,
@@ -684,6 +718,9 @@ pub struct Position {
     pub owner: Pubkey,
     pub basket_vault: Pubkey,
     pub basket_uuid: [u8; 16],
+    /// Per-position uniqueness — same (wallet, basket) can open new
+    /// positions back-to-back as long as the nonce differs.
+    pub nonce: u64,
     pub collateral_usdc: u64,
     pub debt_usdc: u64,
     pub ctrs_held: u64,
@@ -700,6 +737,7 @@ pub struct Position {
 impl Position {
     pub const SPACE: usize = 8         // discriminator
         + 32 + 32 + 16                 // owner, basket_vault, basket_uuid
+        + 8                            // nonce
         + 8 * 5                        // 5 u64s (collateral, debt, ctrs, leverage, health)
         + 8 + 8                        // opened_at, closed_at
         + 1 + 1 + 1 + 1;               // status + 3 bumps

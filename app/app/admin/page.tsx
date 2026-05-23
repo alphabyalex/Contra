@@ -29,6 +29,17 @@ async function get<T>(path: string): Promise<T> {
   return json as T;
 }
 
+// Admin-gated GETs (anything under /api/admin/*). Auto-authenticated with
+// the hardcoded ADMIN_TOKEN — there is no login UI on this page.
+async function adminGet<T>(path: string): Promise<T> {
+  const res = await fetch(`${BACKEND_URL}${path}`, {
+    headers: { 'x-admin-token': ADMIN_TOKEN },
+  });
+  const json = await res.json().catch(() => ({}));
+  if (!res.ok) throw new Error((json as any)?.error ?? `${res.status} ${res.statusText}`);
+  return json as T;
+}
+
 // ---- shared styles --------------------------------------------------
 
 const colors = {
@@ -626,8 +637,18 @@ interface AdminLeg {
   outcome?: 0 | 1 | null;
 }
 
+interface SharpeRow {
+  basket_id: string;
+  basket_name: string;
+  sharpe: number | null;
+  num_snapshots: number;
+  period_days: number;
+  reason?: string;
+}
+
 function ActiveBasketsSection() {
   const [baskets, setBaskets] = useState<BasketRow[] | null>(null);
+  const [sharpeMap, setSharpeMap] = useState<Record<string, SharpeRow>>({});
   const [err, setErr] = useState<string | null>(null);
   const [expanded, setExpanded] = useState<string | null>(null);
   const [legsCache, setLegsCache] = useState<Record<string, AdminLeg[]>>({});
@@ -635,7 +656,18 @@ function ActiveBasketsSection() {
   const [legsErr, setLegsErr] = useState<Record<string, string>>({});
 
   useEffect(() => {
-    get<{ baskets: BasketRow[] }>('/api/baskets').then((d) => setBaskets(d.baskets ?? [])).catch((e) => setErr(e.message));
+    get<{ baskets: BasketRow[] }>('/api/baskets')
+      .then((d) => setBaskets(d.baskets ?? []))
+      .catch((e) => setErr(e.message));
+    // Pull Sharpe in parallel — failures here only blank the column, the
+    // rest of the table still renders.
+    adminGet<{ baskets: SharpeRow[] }>('/api/admin/sharpe')
+      .then((d) => {
+        const m: Record<string, SharpeRow> = {};
+        for (const r of d.baskets ?? []) m[r.basket_id] = r;
+        setSharpeMap(m);
+      })
+      .catch(() => { /* leave map empty; column shows — */ });
   }, []);
 
   const toggle = async (b: BasketRow) => {
@@ -674,12 +706,22 @@ function ActiveBasketsSection() {
               <Th align="right">Legs</Th>
               <Th align="right">Resolved</Th>
               <Th align="right">NAV</Th>
+              <Th align="right">Sharpe</Th>
               <Th>Status</Th>
             </tr>
           </thead>
           <tbody>
             {baskets.map((b) => {
               const open = expanded === b.id;
+              const sh = sharpeMap[b.id];
+              // Sharpe is colored green if positive, red if negative, grey
+              // if null (not enough snapshots / zero variance).
+              const sharpeColor = sh && sh.sharpe != null
+                ? (sh.sharpe >= 0 ? colors.positive : colors.negative)
+                : colors.faint;
+              const sharpeText = sh && sh.sharpe != null
+                ? (sh.sharpe >= 0 ? '+' : '') + sh.sharpe.toFixed(2)
+                : '—';
               return (
                 <>
                   <tr
@@ -697,11 +739,17 @@ function ActiveBasketsSection() {
                     <td style={{ padding: '10px 8px', textAlign: 'right', ...numCell }}>{b.num_legs}</td>
                     <td style={{ padding: '10px 8px', textAlign: 'right', ...numCell }}>{b.legs_resolved}/{b.legs_total}</td>
                     <td style={{ padding: '10px 8px', textAlign: 'right', ...numCell }}>{(b.nav ?? 1).toFixed(4)}</td>
+                    <td
+                      style={{ padding: '10px 8px', textAlign: 'right', ...numCell, color: sharpeColor }}
+                      title={sh?.reason ? sh.reason : sh ? `${sh.num_snapshots} snapshots over ${sh.period_days.toFixed(2)}d` : 'loading'}
+                    >
+                      {sharpeText}
+                    </td>
                     <td style={{ padding: '10px 8px', color: colors.muted }}>{b.status}</td>
                   </tr>
                   {open && (
                     <tr key={`${b.id}-legs`}>
-                      <td colSpan={6} style={{ background: colors.bg, padding: 16 }}>
+                      <td colSpan={7} style={{ background: colors.bg, padding: 16 }}>
                         {legsLoading === b.id && <Skeleton lines={3} />}
                         {legsErr[b.id] && <div style={{ color: colors.negative }}>error: {legsErr[b.id]}</div>}
                         {legsCache[b.id] && <AdminLegTable legs={legsCache[b.id]} />}
