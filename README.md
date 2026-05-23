@@ -15,7 +15,7 @@ Users deposit USDC, receive CTRA tokens representing their share of the basket N
 
 ## How the model works
 
-The mispricing model is built on 4,310 resolved Polymarket markets and maps implied probability buckets to true historical resolution rates. Markets priced at 5-10% resolve YES only ~1.7% of the time on average. That gap is the edge.
+The mispricing model is built on thousands of resolved Polymarket markets and maps implied probability buckets to true historical resolution rates. Markets priced at 5-10% resolve YES only ~1.7% of the time on average. That gap is the edge.
 
 The model layers on top of base calibration:
 
