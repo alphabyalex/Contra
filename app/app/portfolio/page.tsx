@@ -1201,6 +1201,21 @@ function HistoryRow({ row }: { row: TxRow }) {
   const amount = Math.abs(row.usdcDelta);
   const tokens = Math.abs(row.tokensDelta);
   const explorerUrl = `https://explorer.solana.com/tx/${row.signature}?cluster=devnet`;
+
+  // Token column rendering. The previous build hid the count for WITHDRAW
+  // rows because it required row.basketName to be present, but a fully
+  // redeemed basket drops out of basket_positions and its name therefore
+  // never reaches the lookup. Sign comes from the transaction type so the
+  // user can tell deposits (+) from withdrawals (-) at a glance.
+  const tLower = row.type.toLowerCase();
+  const isDeposit = tLower === 'deposit';
+  const isWithdraw = tLower === 'redeem' || tLower === 'exit';
+  const isLeverage = tLower === 'leverage_open' || tLower === 'leverage_close' || tLower === 'liquidation';
+  const sign = isDeposit ? '+' : isWithdraw ? '−' : '';
+  const decimals = isLeverage ? 4 : 2;
+  const basketSuffix = row.basketName ? ` ${row.basketName}` : '';
+  const tokensCell = tokens > 0 ? `${sign}${tokens.toFixed(decimals)}${basketSuffix}` : '—';
+  const tokensCellColor = isDeposit ? '#00875A' : isWithdraw ? '#CC2936' : COLOR.body;
   return (
     <div
       onMouseEnter={() => setHover(true)}
@@ -1225,8 +1240,8 @@ function HistoryRow({ row }: { row: TxRow }) {
       <span className="font-num" style={{ textAlign: 'right', fontSize: 13, color: COLOR.text }}>
         {amount > 0 ? formatUsd(amount) : '—'}
       </span>
-      <span className="font-num" style={{ textAlign: 'right', fontSize: 13, color: COLOR.body }}>
-        {tokens > 0 && row.basketName ? `${tokens.toFixed(4)} ${row.basketName}` : '—'}
+      <span className="font-num" style={{ textAlign: 'right', fontSize: 13, color: tokensCellColor }}>
+        {tokensCell}
       </span>
       <span style={{ textAlign: 'right', fontSize: 13, color: COLOR.body }}>{Math.max(1, Math.round((row.leverageBps || 10000) / 10000))}x</span>
       <span style={{ textAlign: 'right' }}>

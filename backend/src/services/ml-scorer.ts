@@ -17,7 +17,7 @@
  *     Sub-category tiers bake the category bias into the base p_model, so
  *     category_factor is set to 1.0 for those rows — no double-dip.
  *
- *   Layer 2  hard exclusion → days <3 / days >365 / volume <100k
+ *   Layer 2  hard exclusion → days <3 / days >260 / volume <100k
  *                              → adj_edge = 0, include = false, stop
  *
  *   Layer 3  factor stack on p_model (NOT on edge):
@@ -86,8 +86,11 @@ export const P_MARKET_INCLUDE_MIN = 0.02;
 export const P_MARKET_INCLUDE_MAX = 0.12;
 
 // Hard exclusion thresholds (Layer 2).
+// MAX_DAYS_TO_CLOSE caps basket eligibility, not screener entry or scanner
+// display. 260 days from 2026-05-23 lands just past Super Bowl LXI
+// (~Feb 8 2027), capturing NFL futures alongside every Dec 31 2026 longshot.
 export const MIN_DAYS_TO_CLOSE = 3;
-export const MAX_DAYS_TO_CLOSE = 365;
+export const MAX_DAYS_TO_CLOSE = 260;
 export const MIN_VOLUME_USD = 100_000;
 
 // ---------------------------------------------------------------------
@@ -138,8 +141,46 @@ export function detectSportsSubcategory(question: string): SportsSubcategory {
   return null;
 }
 
+// calibration_v6 partial: per-(sport, bucket) multipliers ONLY for buckets
+// with >= 25 historical samples. Buckets below the gate are absent here and
+// fall through to the v5_2 tier rules below. Source: ml/artifacts/calibration_v6.json.
+// Updated with the expanded FIFA dataset (Euros 2008-2024 + Copa America
+// 2015-2024 added). FIFA 10-15 now crosses the 25-sample gate (n=31) and
+// joins as a v6-kept bucket with the bumped multiplier 1.791.
+const V6_PARTIAL_MULTIPLIERS: Partial<Record<NonNullable<SportsSubcategory>, Record<string, number>>> = {
+  fifa:   { '0-5': 0.576, '5-10': 0.756, '10-15': 1.791 },
+  nba:    { '5-10': 1.421 },
+  nfl:    { '5-10': 0.949, '10-15': 1.004, '15-20': 0.922 },
+  nhl:    { '5-10': 1.219, '10-15': 0.825, '15-20': 0.987 },
+  tennis: { '0-5': 1.912, '5-10': 0.455 },
+};
+
+function v6Bucket(p: number): string {
+  if (p < 0.05) return '0-5';
+  if (p < 0.10) return '5-10';
+  if (p < 0.15) return '10-15';
+  if (p < 0.20) return '15-20';
+  if (p < 0.30) return '20-30';
+  if (p < 0.50) return '30-50';
+  if (p < 0.75) return '50-75';
+  return '75+';
+}
+
+function lookupV6PartialMultiplier(sub: SportsSubcategory, p: number): number | null {
+  if (!sub) return null;
+  const table = V6_PARTIAL_MULTIPLIERS[sub];
+  if (!table) return null;
+  const mult = table[v6Bucket(p)];
+  return typeof mult === 'number' ? mult : null;
+}
+
 export function getSportsSubcategoryPModel(sub: SportsSubcategory, p_market: number): number {
   if (!Number.isFinite(p_market)) return 0;
+  // calibration_v6 partial: use the v6 multiplier when the bucket had >= 25
+  // historical samples. The constant table above holds only those buckets;
+  // anything else falls through to the v5_2 tier rules.
+  const v6 = lookupV6PartialMultiplier(sub, p_market);
+  if (v6 != null) return Math.max(0, Math.min(1, p_market * v6));
   switch (sub) {
     case 'fifa':
       if (p_market > 0.15) return p_market * 0.88;
@@ -616,12 +657,27 @@ export function computeLayeredScore(opts: {
   void momentum_factor;
   const signal = classifySignal(raw_edge);
 
-  const include_in_basket =
+  // Short-basket inclusion: positive edge + classic-longshot p_market range.
+  const include_short_side =
     !excludedByScreener &&
     !hard_excluded &&
     adjusted_edge >= EDGE_INCLUDE_THRESHOLD &&
     p_market >= P_MARKET_INCLUDE_MIN &&
     p_market <= P_MARKET_INCLUDE_MAX;
+
+  // Long-basket inclusion: negative edge from the classifySignal threshold
+  // (signal in long/strong_long), OR raw_edge below the loosened -0.005 gate
+  // for fair-value-classified favorites the model still likes. Same hard
+  // quality gates (volume floor, days window, not excluded) but a wider
+  // p_market window because tournament favorites sit at 0.10..0.35.
+  const include_long_side =
+    !excludedByScreener &&
+    !hard_excluded &&
+    ((signal === 'long' || signal === 'strong_long') || raw_edge < -0.005) &&
+    p_market >= 0.05 &&
+    p_market <= 0.35;
+
+  const include_in_basket = include_short_side || include_long_side;
 
   return {
     p_model,
@@ -936,8 +992,13 @@ export async function applyTournamentNormalization(
       const volume_factor = getVolumeFactor(member.volume);
       const newAdjEdge = newRawEdge * time_factor * volume_factor;
       const isFavorite = newRawEdge <= 0;
-      const include = newRawEdge > TOURNAMENT_EDGE_INCLUDE_THRESHOLD;
       const signal = classifySignal(newRawEdge);
+      // Tournament inclusion: shorts pass when raw_edge exceeds the longshot
+      // threshold; longs pass when the renormalized signal is long/strong_long.
+      const include =
+        newRawEdge > TOURNAMENT_EDGE_INCLUDE_THRESHOLD ||
+        signal === 'long' ||
+        signal === 'strong_long';
       const category = 'sports';
 
       if (isFavorite) favCount += 1;

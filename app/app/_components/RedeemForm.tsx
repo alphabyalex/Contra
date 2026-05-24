@@ -92,32 +92,60 @@ export function RedeemForm({ basketId, basketName, currentNav }: Props) {
     return { tokenAmount: tokens, grossUsdc: gross, fee: f, netUsdc: gross - f };
   }, [input, mode, nav]);
 
+  // Helper to render the confirmation modal alongside whatever the body is.
+  // The portfolio re-fetch fires as soon as setDone runs (because `done` is in
+  // the effect's dep array), which means the user's position can collapse to
+  // zero before the modal has a chance to mount. Render the modal from EVERY
+  // branch so a successful redeem always surfaces the confirmation even when
+  // the form area has already switched to "no tokens".
+  const modal = done ? (
+    <RedeemConfirmationModal
+      basketName={basketName ?? 'Basket'}
+      done={done}
+      onClose={() => setDone(null)}
+    />
+  ) : null;
+
   if (!mounted) {
-    return <div suppressHydrationWarning className="bg-white" style={{ border: '1px solid #E5E5E3', padding: 20, minHeight: 200 }} />;
+    return (
+      <>
+        <div suppressHydrationWarning className="bg-white" style={{ border: '1px solid #E5E5E3', padding: 20, minHeight: 200 }} />
+        {modal}
+      </>
+    );
   }
 
   if (!wallet.publicKey) {
     return (
-      <div className="bg-white" style={{ border: '1px solid #E5E5E3', padding: 20 }}>
-        <div style={label}>Connect wallet to redeem</div>
-        <WalletMultiButton />
-      </div>
+      <>
+        <div className="bg-white" style={{ border: '1px solid #E5E5E3', padding: 20 }}>
+          <div style={label}>Connect wallet to redeem</div>
+          <WalletMultiButton />
+        </div>
+        {modal}
+      </>
     );
   }
 
   if (loading) {
     return (
-      <div className="bg-white" style={{ border: '1px solid #E5E5E3', padding: 20, color: '#9B9B9B', fontSize: 13 }}>
-        Loading position…
-      </div>
+      <>
+        <div className="bg-white" style={{ border: '1px solid #E5E5E3', padding: 20, color: '#9B9B9B', fontSize: 13 }}>
+          Loading position…
+        </div>
+        {modal}
+      </>
     );
   }
 
   if (!pos || pos.tokensHeld <= 0) {
     return (
-      <div className="bg-white" style={{ border: '1px solid #E5E5E3', padding: 20, color: '#6B6B6B', fontSize: 13 }}>
-        You don&apos;t hold any {basketName ?? 'CTRA'} tokens
-      </div>
+      <>
+        <div className="bg-white" style={{ border: '1px solid #E5E5E3', padding: 20, color: '#6B6B6B', fontSize: 13 }}>
+          You don&apos;t hold any {basketName ?? 'CTRA'} tokens
+        </div>
+        {modal}
+      </>
     );
   }
 
@@ -267,18 +295,12 @@ export function RedeemForm({ basketId, basketName, currentNav }: Props) {
         {err && <div style={{ color: '#CC2936', fontSize: 12, marginTop: 8 }}>{err}</div>}
       </div>
 
-      {done && (
-        <RedeemConfirmationModal
-          basketName={basketName ?? 'Basket'}
-          done={done}
-          onClose={() => setDone(null)}
-        />
-      )}
+      {modal}
     </>
   );
 }
 
-function InfoRow({ label: l, value, valueColor }: { label: string; value: string; valueColor?: string }) {
+function InfoRow({ label: l, value, valueColor }: { label: string; value: React.ReactNode; valueColor?: string }) {
   return (
     <div className="flex items-center justify-between" style={{ padding: '4px 0' }}>
       <span style={{ fontSize: 11, color: '#9B9B9B', fontFamily: SANS }}>{l}</span>
@@ -304,19 +326,47 @@ function RedeemConfirmationModal({ basketName, done, onClose }: { basketName: st
       role="dialog"
       aria-modal="true"
       onClick={onClose}
-      style={{ position: 'fixed', inset: 0, background: 'rgba(0,0,0,0.5)', display: 'flex', alignItems: 'center', justifyContent: 'center', zIndex: 1000, padding: 16 }}
+      style={{
+        position: 'fixed',
+        inset: 0,
+        background: 'rgba(0,0,0,0.5)',
+        display: 'flex',
+        alignItems: 'center',
+        justifyContent: 'center',
+        zIndex: 1000,
+        padding: 16,
+        animation: 'modalOverlayIn 200ms ease-out',
+      }}
     >
-      <div onClick={(e) => e.stopPropagation()} style={{ background: '#FFFFFF', borderRadius: 12, padding: 32, maxWidth: 480, width: '100%', boxShadow: '0 24px 64px rgba(0,0,0,0.16)' }}>
+      <style>{`
+        @keyframes modalOverlayIn { from { opacity: 0; } to { opacity: 1; } }
+        @keyframes modalIn {
+          from { opacity: 0; transform: scale(0.95); }
+          to   { opacity: 1; transform: scale(1); }
+        }
+      `}</style>
+      <div
+        onClick={(e) => e.stopPropagation()}
+        style={{
+          background: '#FFFFFF',
+          borderRadius: 12,
+          padding: 32,
+          maxWidth: 480,
+          width: '100%',
+          animation: 'modalIn 200ms ease-out',
+          boxShadow: '0 24px 64px rgba(0,0,0,0.16)',
+        }}
+      >
         <div className="flex items-center gap-3" style={{ marginBottom: 20 }}>
           <svg width="32" height="32" viewBox="0 0 24 24" fill="none" stroke="#00875A" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round" aria-hidden="true">
             <circle cx="12" cy="12" r="10" />
             <polyline points="9 12 11 14 15 10" />
           </svg>
-          <h2 style={{ fontSize: 20, fontWeight: 500, color: '#0A0A0A', margin: 0, fontFamily: SANS }}>Position Redeemed</h2>
+          <h2 style={{ fontSize: 20, fontWeight: 500, color: '#0A0A0A', margin: 0, fontFamily: SANS }}>Tokens Redeemed</h2>
         </div>
         <div style={{ background: '#F7F7F5', borderRadius: 8, padding: 16, marginBottom: 16 }}>
           <InfoRow label="Basket" value={basketName} />
-          <InfoRow label="Tokens redeemed" value={`${done.tokensRedeemed.toFixed(4)} ${basketName}`} />
+          <InfoRow label="Tokens burned" value={`${done.tokensRedeemed.toFixed(4)} ${basketName}`} />
           <InfoRow label="USDC received" value={`$${done.netUsdc.toFixed(2)}`} />
           <InfoRow label="Fee paid" value={`$${done.fee.toFixed(2)}`} valueColor="#CC2936" />
           <InfoRow
@@ -324,16 +374,29 @@ function RedeemConfirmationModal({ basketName, done, onClose }: { basketName: st
             value={`${done.realizedPnl >= 0 ? '+' : '−'}$${Math.abs(done.realizedPnl).toFixed(2)}`}
             valueColor={done.realizedPnl >= 0 ? '#00875A' : '#CC2936'}
           />
+          <InfoRow
+            label="Transaction"
+            value={(
+              <a
+                href={explorerUrl}
+                target="_blank"
+                rel="noopener noreferrer"
+                style={{ color: '#1A56DB', textDecoration: 'none' }}
+              >
+                {sigShort}
+              </a>
+            )}
+          />
         </div>
         <a href={explorerUrl} target="_blank" rel="noopener noreferrer" style={{ display: 'inline-block', fontSize: 13, color: '#1A56DB', marginBottom: 20 }}>
-          View on Solana Explorer → ({sigShort})
+          View on Solana Explorer →
         </a>
         <div className="flex gap-3">
           <Link href="/portfolio" onClick={onClose} style={{ flex: 1, textAlign: 'center', background: '#1A56DB', color: '#FFFFFF', padding: '12px 0', fontSize: 13, fontWeight: 500, borderRadius: 4, textDecoration: 'none', fontFamily: SANS }}>
             View Portfolio
           </Link>
           <button type="button" onClick={onClose} style={{ flex: 1, background: 'transparent', border: '1px solid #E5E5E3', color: '#6B6B6B', padding: '12px 0', fontSize: 13, fontWeight: 500, borderRadius: 4, cursor: 'pointer', fontFamily: SANS }}>
-            Close
+            Done
           </button>
         </div>
       </div>

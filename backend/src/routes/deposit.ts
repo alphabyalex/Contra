@@ -28,6 +28,16 @@ const INTEREST_APY = 0.05; // 5% flat APY on borrowed amount
 // Liquidation NAV as a fraction of entry NAV, per leverage tier.
 const LIQ_NAV_FACTOR: Record<2 | 3, number> = { 2: 0.52, 3: 0.68 };
 
+// Mirrors PROTOCOL_FEE_BPS in programs/contra_vault/src/lib.rs. The on-chain
+// deposit ix mints CTRS 1:1 with the NET (post-fee) USDC, no NAV factor:
+//     tokens_minted = amount_usdc * (1 - PROTOCOL_FEE_BPS / BPS_DENOMINATOR)
+// The TS confirm handler must apply exactly the same formula when writing
+// positions.tokens_held and transactions.tokens_delta — otherwise the DB
+// drifts away from the on-chain CTRS balance and subsequent redeems try to
+// burn more tokens than the user actually holds.
+const PROTOCOL_FEE_BPS = 50;
+const DEPOSIT_NET_FACTOR = 1 - PROTOCOL_FEE_BPS / 10_000;
+
 // In-memory positionPda → positionNonce stash. /prepare generates a random
 // u64 nonce per leveraged open and writes it here; /confirm reads it back so
 // the leveraged_positions row stores the nonce (needed later to re-derive
@@ -154,8 +164,10 @@ depositRouter.post('/confirm', async (req, res) => {
       const entryNav = await entryNavFor(parsed.data.basketId);
       const total = parsed.data.amountUsdc * lev;
       const borrowed = total - parsed.data.amountUsdc;
-      // Net (post 0.5% vault fee) exposure mints CTRS at entry NAV.
-      const vaultTokens = (total * 0.995) / entryNav;
+      // The leverage program CPI-calls vault.deposit with the full `total`,
+      // and that ix mints CTRS 1:1 with NET (post-fee) USDC, no NAV. Mirror
+      // exactly that math here so vault_tokens matches the on-chain mint.
+      const vaultTokens = total * DEPOSIT_NET_FACTOR;
       const healthFactor = borrowed > 0 ? (total * entryNav) / borrowed : Number.POSITIVE_INFINITY;
       // Look up the nonce we stashed at /prepare time so the row's PDA can
       // be re-derived at close. Missing here is recoverable but the close
@@ -202,15 +214,17 @@ depositRouter.post('/confirm', async (req, res) => {
       });
     }
 
-    // Tokens minted at the current NAV: tokens = usdc / current_nav.
-    // First-deposit / pre-snapshot fallback: NAV = 1.0 (Active phase
-    // default). Once nav_snapshots starts ticking, later deposits mint
-    // proportionally fewer/more tokens.
+    // Tokens minted MUST mirror the on-chain deposit ix (programs/contra_vault
+    // /src/lib.rs:161-235). On-chain mints exactly the NET USDC 1:1 to CTRS,
+    // ignoring NAV entirely; NAV is only used at withdraw. Previously this
+    // handler wrote `usdc / entry_nav` which drifts from on-chain by roughly
+    // `(1/nav) - (1 - fee)` per dollar deposited and accumulates into a
+    // positions.tokens_held > on-chain ATA gap, breaking redeem.
     const snap = await getLatestNavSnapshot(parsed.data.basketId).catch(() => null);
     const entryNav = snap && Number.isFinite(Number(snap.nav)) && Number(snap.nav) > 0
       ? Number(snap.nav)
       : 1;
-    const tokens = parsed.data.amountUsdc / entryNav;
+    const tokens = parsed.data.amountUsdc * DEPOSIT_NET_FACTOR;
 
     await upsertPosition({
       basket_id: parsed.data.basketId,

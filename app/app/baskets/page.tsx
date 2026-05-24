@@ -58,11 +58,14 @@ export default function BasketsPage() {
     api.baskets
       .list()
       .then((r) => {
-        if (!r.baskets || r.baskets.length === 0) {
+        // Archived baskets (legacy CTRA-01 etc.) live in the DB as a
+        // historical record but should never render on the Baskets page.
+        const live = (r.baskets ?? []).filter((b: any) => String(b.status ?? '').toLowerCase() !== 'archived');
+        if (live.length === 0) {
           setUsingMock(true);
           setBaskets([]);
         } else {
-          setBaskets(r.baskets);
+          setBaskets(live);
         }
       })
       .catch(() => setUsingMock(true))
@@ -134,12 +137,31 @@ export default function BasketsPage() {
           </Link>
         </div>
 
-        <div style={{ display: 'grid', gridTemplateColumns: 'repeat(auto-fill, minmax(min(100%, 480px), 1fr))', gap: 24, paddingBottom: 48 }}>
-          {loading
-            ? Array.from({ length: 4 }).map((_, i) => (
-                <div key={i} className="skeleton" style={{ height: 280, borderRadius: 16 }} />
-              ))
-            : display.map((b) => <BasketCardPremium key={b.id} b={b} />)}
+        {/* Strict 2-column grid: odd-numbered baskets (CTRA-01, CTRA-03, ...)
+            sorted ascending in the left column; even-numbered (CTRA-02,
+            CTRA-04, ...) sorted ascending in the right column. Unequal
+            column heights leave empty space at the bottom of the shorter
+            side rather than spilling across. Colors are unchanged; column
+            assignment is purely a sort/layout step. */}
+        <div style={{ display: 'grid', gridTemplateColumns: '1fr 1fr', gap: 24, paddingBottom: 48 }}>
+          {loading ? (
+            Array.from({ length: 4 }).map((_, i) => (
+              <div key={i} className="skeleton" style={{ height: 280, borderRadius: 16 }} />
+            ))
+          ) : (
+            <>
+              <div style={{ display: 'flex', flexDirection: 'column', gap: 24 }}>
+                {sortByCtraNumber(display.filter((b) => isOddBasket(b))).map((b) => (
+                  <BasketCardPremium key={b.id} b={b} />
+                ))}
+              </div>
+              <div style={{ display: 'flex', flexDirection: 'column', gap: 24 }}>
+                {sortByCtraNumber(display.filter((b) => !isOddBasket(b))).map((b) => (
+                  <BasketCardPremium key={b.id} b={b} />
+                ))}
+              </div>
+            </>
+          )}
         </div>
       </div>
     </div>
@@ -148,6 +170,31 @@ export default function BasketsPage() {
 
 function isLongBasket(b: any): boolean {
   return /^CTRA-L/i.test(b.name ?? '') || /long exposure/i.test(b.description ?? '') || b.type === 'long';
+}
+
+/**
+ * Parse the integer number out of a CTRA-NN basket name. Leverage variants
+ * like CTRA-01-2X reuse the base number. CTRA-L prefixed names (legacy long
+ * basket naming, e.g. CTRA-L02) parse from the digits after the L. Returns
+ * Number.MAX_SAFE_INTEGER for anything unparseable so it sorts to the end.
+ */
+function parseCtraNumber(name: string | undefined): number {
+  const m = (name ?? '').match(/^CTRA-L?(\d+)/i);
+  if (!m) return Number.MAX_SAFE_INTEGER;
+  const n = parseInt(m[1], 10);
+  return Number.isFinite(n) ? n : Number.MAX_SAFE_INTEGER;
+}
+
+/** Odd-numbered baskets (CTRA-01, CTRA-03, ...) are short and render blue. */
+function isOddBasket(b: any): boolean {
+  const n = parseCtraNumber(b.name);
+  if (n === Number.MAX_SAFE_INTEGER) return true; // unparseable: default to left column
+  return n % 2 === 1;
+}
+
+/** Ascending sort by CTRA number; non-CTRA names fall to the bottom. */
+function sortByCtraNumber<T extends { name?: string }>(rows: T[]): T[] {
+  return [...rows].sort((a, b) => parseCtraNumber(a.name) - parseCtraNumber(b.name));
 }
 
 const PILL: React.CSSProperties = {

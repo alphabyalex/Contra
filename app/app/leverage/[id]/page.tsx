@@ -1,7 +1,8 @@
 'use client';
 
 import { useEffect, useMemo, useState } from 'react';
-import { useParams, useRouter } from 'next/navigation';
+import Link from 'next/link';
+import { useParams } from 'next/navigation';
 import { useWallet } from '@solana/wallet-adapter-react';
 import { VersionedTransaction } from '@solana/web3.js';
 import { api } from '../../_lib/api';
@@ -17,7 +18,6 @@ function fmtUsd(v: number): string {
 
 export default function LeverageClosePage() {
   const params = useParams<{ id: string }>();
-  const router = useRouter();
   const id = params?.id ?? '';
   const { publicKey, signTransaction } = useWallet();
   const [pos, setPos] = useState<any>(null);
@@ -26,7 +26,13 @@ export default function LeverageClosePage() {
   const [input, setInput] = useState('');
   const [preview, setPreview] = useState<any>(null);
   const [busy, setBusy] = useState(false);
-  const [done, setDone] = useState<{ net: number; closed: boolean } | null>(null);
+  const [done, setDone] = useState<{
+    net: number;
+    closed: boolean;
+    signature: string;
+    tokensClosed: number;
+    basketName: string;
+  } | null>(null);
 
   useEffect(() => {
     if (!id) return;
@@ -95,7 +101,16 @@ export default function LeverageClosePage() {
         throw new Error(JSON.stringify(conf));
       }
 
-      setDone({ net: Number(conf.net_usdc ?? 0), closed: Boolean(conf.closed) });
+      setDone({
+        net: Number(conf.net_usdc ?? 0),
+        closed: Boolean(conf.closed),
+        signature: String(conf.signature ?? ''),
+        // close_position is a full unwind on-chain, so the tokens closed
+        // equal the full token_amount the position held at open time. The
+        // preview is the most accurate live figure when present.
+        tokensClosed: Number(preview?.tokensClosed ?? pos?.token_amount ?? 0),
+        basketName: String(pos?.basket_name ?? 'Basket'),
+      });
     } catch (e) {
       setErr((e as Error).message);
     } finally {
@@ -171,18 +186,138 @@ export default function LeverageClosePage() {
             {busy ? 'Closing…' : 'Close Position'}
           </button>
           {err && <div style={{ color: '#CC2936', fontSize: 12, marginTop: 8 }}>{err}</div>}
-
-          {done && (
-            <div style={{ marginTop: 14, background: '#F7F7F5', borderRadius: 8, padding: 14 }}>
-              <div style={{ fontSize: 14, fontWeight: 500, color: '#00875A', fontFamily: SANS }}>Position Closed</div>
-              <div style={{ fontSize: 13, color: '#0A0A0A', fontFamily: MONO, marginTop: 4 }}>Received {fmtUsd(done.net)} USDC</div>
-              <button type="button" onClick={() => router.push('/portfolio')}
-                style={{ marginTop: 10, background: '#1A56DB', color: '#FFF', padding: '8px 16px', fontSize: 13, borderRadius: 4, border: 'none', cursor: 'pointer', fontFamily: SANS }}>View Portfolio</button>
-            </div>
-          )}
         </div>
       </div>
+
+      {done && (
+        <LeverageCloseModal
+          done={done}
+          onClose={() => setDone(null)}
+        />
+      )}
     </Shell>
+  );
+}
+
+// =====================================================================
+// Confirmation modal (visual style mirrors DepositForm.ConfirmationModal
+// and RedeemForm.RedeemConfirmationModal so the user sees the same shape
+// after every settlement action).
+// =====================================================================
+
+function LeverageCloseModal({
+  done,
+  onClose,
+}: {
+  done: { net: number; closed: boolean; signature: string; tokensClosed: number; basketName: string };
+  onClose: () => void;
+}) {
+  const explorerUrl = `https://explorer.solana.com/tx/${done.signature}?cluster=devnet`;
+  const sigShort = done.signature
+    ? `${done.signature.slice(0, 8)}…${done.signature.slice(-8)}`
+    : '—';
+  return (
+    <div
+      role="dialog"
+      aria-modal="true"
+      onClick={onClose}
+      style={{
+        position: 'fixed',
+        inset: 0,
+        background: 'rgba(0,0,0,0.5)',
+        display: 'flex',
+        alignItems: 'center',
+        justifyContent: 'center',
+        zIndex: 1000,
+        padding: 16,
+        animation: 'modalOverlayIn 200ms ease-out',
+      }}
+    >
+      <style>{`
+        @keyframes modalOverlayIn { from { opacity: 0; } to { opacity: 1; } }
+        @keyframes modalIn {
+          from { opacity: 0; transform: scale(0.95); }
+          to   { opacity: 1; transform: scale(1); }
+        }
+      `}</style>
+      <div
+        onClick={(e) => e.stopPropagation()}
+        style={{
+          background: '#FFFFFF',
+          borderRadius: 12,
+          padding: 32,
+          maxWidth: 480,
+          width: '100%',
+          animation: 'modalIn 200ms ease-out',
+          boxShadow: '0 24px 64px rgba(0,0,0,0.16)',
+        }}
+      >
+        <div className="flex items-center gap-3" style={{ marginBottom: 20 }}>
+          <svg width="32" height="32" viewBox="0 0 24 24" fill="none" stroke="#00875A" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round" aria-hidden="true">
+            <circle cx="12" cy="12" r="10" />
+            <polyline points="9 12 11 14 15 10" />
+          </svg>
+          <h2 style={{ fontSize: 20, fontWeight: 500, color: '#0A0A0A', margin: 0, fontFamily: SANS }}>Tokens Redeemed</h2>
+        </div>
+        <div style={{ background: '#F7F7F5', borderRadius: 8, padding: 16, marginBottom: 16 }}>
+          <ModalRow label="Basket" value={done.basketName} />
+          <ModalRow label="Tokens burned" value={`${done.tokensClosed.toFixed(4)} ${done.basketName}`} />
+          <ModalRow label="USDC received" value={fmtUsd(done.net)} />
+          <ModalRow
+            label="Transaction"
+            value={
+              done.signature ? (
+                <a
+                  href={explorerUrl}
+                  target="_blank"
+                  rel="noopener noreferrer"
+                  style={{ color: '#1A56DB', textDecoration: 'none' }}
+                >
+                  {sigShort}
+                </a>
+              ) : (
+                '—'
+              )
+            }
+          />
+        </div>
+        {done.signature && (
+          <a
+            href={explorerUrl}
+            target="_blank"
+            rel="noopener noreferrer"
+            style={{ display: 'inline-block', fontSize: 13, color: '#1A56DB', marginBottom: 20 }}
+          >
+            View on Solana Explorer →
+          </a>
+        )}
+        <div className="flex gap-3">
+          <Link
+            href="/portfolio"
+            onClick={onClose}
+            style={{ flex: 1, textAlign: 'center', background: '#1A56DB', color: '#FFFFFF', padding: '12px 0', fontSize: 13, fontWeight: 500, borderRadius: 4, textDecoration: 'none', fontFamily: SANS }}
+          >
+            View Portfolio
+          </Link>
+          <button
+            type="button"
+            onClick={onClose}
+            style={{ flex: 1, background: 'transparent', border: '1px solid #E5E5E3', color: '#6B6B6B', padding: '12px 0', fontSize: 13, fontWeight: 500, borderRadius: 4, cursor: 'pointer', fontFamily: SANS }}
+          >
+            Done
+          </button>
+        </div>
+      </div>
+    </div>
+  );
+}
+
+function ModalRow({ label, value }: { label: string; value: React.ReactNode }) {
+  return (
+    <div className="flex items-center justify-between" style={{ padding: '4px 0' }}>
+      <span style={{ fontSize: 11, color: '#9B9B9B', fontFamily: SANS }}>{label}</span>
+      <span className="font-num" style={{ fontSize: 13, color: '#0A0A0A' }}>{value}</span>
+    </div>
   );
 }
 

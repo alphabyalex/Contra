@@ -13,8 +13,11 @@
 
 import { Router } from 'express';
 import { z } from 'zod';
+import { PublicKey } from '@solana/web3.js';
+import { getAssociatedTokenAddressSync } from '@solana/spl-token';
 import { buildRedeemTransaction } from '../solana/redeem';
 import { confirmSignature } from '../solana/deposit';
+import { getConnection } from '../solana/client';
 import {
   getBasket,
   getLatestNavSnapshot,
@@ -49,6 +52,35 @@ async function heldTokens(wallet: string, basketId: string): Promise<number> {
   return pos ? Number(pos.tokens_held) : 0;
 }
 
+/**
+ * Read the user's actual on-chain CTRS balance directly from the SPL
+ * token account. Used by /prepare as the source of truth so a stale
+ * positions.tokens_held row can never cause a redeem to ask for more
+ * tokens than the user holds (which would otherwise burn-fail on-chain
+ * with "insufficient funds").
+ *
+ * Returns null when the ATA doesn't exist or the RPC errors; the caller
+ * then falls back to the DB-tracked held figure.
+ */
+async function onChainCtrsBalance(
+  contraMintBase58: string,
+  walletAddress: string,
+): Promise<number | null> {
+  try {
+    const conn = getConnection();
+    const ata = getAssociatedTokenAddressSync(
+      new PublicKey(contraMintBase58),
+      new PublicKey(walletAddress),
+    );
+    const resp = await conn.getTokenAccountBalance(ata, 'confirmed');
+    const ui = resp?.value?.uiAmount;
+    return typeof ui === 'number' && Number.isFinite(ui) ? ui : null;
+  } catch (e) {
+    console.warn(`[redeem/prepare] on-chain balance fetch failed: ${(e as Error).message}`);
+    return null;
+  }
+}
+
 const prepareSchema = z
   .object({
     basketId: z.string().uuid(),
@@ -77,14 +109,56 @@ redeemRouter.post('/prepare', async (req, res) => {
     }
 
     const nav = await currentNav(basketId);
-    const tokenAmount =
+    const requestedTokenAmount =
       parsed.data.tokenAmount != null
         ? parsed.data.tokenAmount
         : (parsed.data.usdcAmount as number) / nav;
 
-    const held = await heldTokens(walletAddress, basketId);
-    if (tokenAmount > held + 1e-9) {
-      return res.status(409).json({ error: 'insufficient_balance', held, requested: tokenAmount });
+    // On-chain balance is the source of truth. The DB position can drift if
+    // a confirm handler missed an update or used the wrong mint formula
+    // (deposits formerly recorded usdc/nav, on-chain mints usdc*(1-fee)).
+    // If the on-chain balance is lower than the requested amount, clamp the
+    // burn to the on-chain figure and log a warning instead of erroring; this
+    // makes redeem self-healing. Also push the corrected balance back into
+    // positions.tokens_held so the next request sees consistent state.
+    const dbHeld = await heldTokens(walletAddress, basketId);
+    const onChainHeld = basket.contra_mint
+      ? await onChainCtrsBalance(basket.contra_mint, walletAddress)
+      : null;
+    const sourceOfTruth = onChainHeld != null ? onChainHeld : dbHeld;
+
+    if (onChainHeld != null && Math.abs(onChainHeld - dbHeld) > 1e-6) {
+      console.warn(
+        `[redeem/prepare] DB/on-chain drift detected basket=${basketId.slice(0, 8)} ` +
+          `wallet=${walletAddress.slice(0, 8)} db=${dbHeld} onchain=${onChainHeld} ` +
+          `(syncing positions.tokens_held to on-chain)`,
+      );
+      try {
+        await upsertPosition({
+          basket_id: basketId,
+          wallet: walletAddress,
+          tokens_delta: onChainHeld - dbHeld,
+          usdc_delta: 0,
+        });
+      } catch (e) {
+        console.warn(`[redeem/prepare] position sync write failed: ${(e as Error).message}`);
+      }
+    }
+
+    if (sourceOfTruth <= 0) {
+      return res
+        .status(409)
+        .json({ error: 'insufficient_balance', held: sourceOfTruth, requested: requestedTokenAmount });
+    }
+
+    let tokenAmount = Math.min(requestedTokenAmount, sourceOfTruth);
+    let clamped = false;
+    if (requestedTokenAmount > sourceOfTruth + 1e-9) {
+      console.warn(
+        `[redeem/prepare] clamping burn requested=${requestedTokenAmount} sourceOfTruth=${sourceOfTruth} ` +
+          `wallet=${walletAddress.slice(0, 8)} basket=${basketId.slice(0, 8)}`,
+      );
+      clamped = true;
     }
 
     const grossUsdc = tokenAmount * nav;
@@ -103,6 +177,10 @@ redeemRouter.post('/prepare', async (req, res) => {
       recentBlockhash: built.recentBlockhash,
       lastValidBlockHeight: built.lastValidBlockHeight,
       tokenAmount,
+      requested_token_amount: requestedTokenAmount,
+      on_chain_held: onChainHeld,
+      db_held: dbHeld,
+      clamped_to_on_chain: clamped,
       gross_usdc: grossUsdc,
       fee,
       net_usdc: netUsdc,
