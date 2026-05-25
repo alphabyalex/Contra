@@ -144,7 +144,29 @@ export default function ScannerPage() {
   useEffect(() => { load({ sort: sortField }); /* eslint-disable-next-line react-hooks/exhaustive-deps */ }, [sortField]);
 
   const isSearching = query.trim().length > 0;
-  const visible = useMemo(() => rows, [rows]);
+
+  // Near-certain markets (p_market ≥ 0.85) are hidden from the default
+  // scanner view because the model has no actionable opinion on them —
+  // they read as misleading "overpriced" signals. They remain visible
+  // when the user searches (explicit intent), and the per-row badge /
+  // p_model / edge displays already collapse to '—' for these via the
+  // isOutsideRange gate inside ScannerRow.
+  const isNearCertain = (r: Row): boolean =>
+    typeof r.p_market === 'number' && r.p_market >= 0.85;
+  const visible = useMemo(
+    () => (isSearching ? rows : rows.filter((r) => !isNearCertain(r))),
+    [rows, isSearching],
+  );
+  const filteredGroups = useMemo<ScannerGroup[]>(
+    () =>
+      isSearching
+        ? groups
+        : groups.map((g) => ({
+            ...g,
+            markets: g.markets.filter((r) => !isNearCertain(r)),
+          })),
+    [groups, isSearching],
+  );
   const hasZone3 = useMemo(() => visible.some((r: Row) => r.zone === 3), [visible]);
   const secondsAgo = updatedAt ? Math.max(0, Math.floor((Date.now() - updatedAt) / 1000)) : null;
   void tick;
@@ -279,7 +301,7 @@ export default function ScannerPage() {
                 </thead>
                 <tbody>
                   {view === 'category_grouped' && !isSearching ? (
-                    groups
+                    filteredGroups
                       .filter((g) => g.markets.length > 0)
                       .map((g, gIdx) => (
                         <CategorySection key={g.category} group={g} firstSection={gIdx === 0} />
@@ -373,14 +395,27 @@ function ScannerRow({ row }: { row: Row }) {
   const modelStale = Boolean(row.model_stale);
   const residual = row.residual ?? (zone === 3 ? 1 - row.p_market : null);
 
-  // p_model display rules (Phase 3):
-  //   zone 3 (90%+)  → show RESIDUAL (how overpriced the NO side is)
+  // Markets where the model has no useful view: zone 4 (fair-value band),
+  // near-certain (p_market ≥ 0.85), or backend says signal is missing /
+  // outside model range. We collapse both the p_model column and the
+  // edge column to '—' for these so the row reads as "no model opinion"
+  // rather than offering a misleading numeric estimate.
+  const isOutsideRange =
+    zone === 4 ||
+    (typeof row.p_market === 'number' && row.p_market >= 0.85) ||
+    row.signal == null ||
+    (row.signal as string) === 'outside_range';
+
+  // p_model display rules:
+  //   excluded / outside range → '—'
+  //   zone 3 (90%+)  → would show RESIDUAL but isOutsideRange already
+  //                    catches this (p ≥ 0.85 → '—').
   //   model stale    → '—' (live price diverged >20pts from screened)
   //   zone 1/2       → p_model (calibration / tournament normalization valid)
   const pModelDisplay = isExcluded
     ? '—'
-    : zone === 3
-    ? (residual != null ? formatPct(residual) : '~100%')
+    : isOutsideRange
+    ? '—'
     : modelStale
     ? '—'
     : isImpossible
@@ -395,10 +430,17 @@ function ScannerRow({ row }: { row: Row }) {
   // zeroed by time-decay filters — what we want to surface to users.
   // adj_edge is preserved server-side for basket-inclusion checks but
   // intentionally not shown in this column.
+  // Near-certain markets (p_market ≥ 0.85, zone 3 and the loose band
+  // around it) show '—' here — the residual lives in the p_model column
+  // for these rows and the literal raw_edge (often a large negative) is
+  // misleading next to the "near-certain" badge.
+  const isNearCertain = typeof row.p_market === 'number' && row.p_market >= 0.85;
   const rawEdge = row.raw_edge ?? row.edge ?? null;
   const edgeDisplay = isImpossible
     ? signedPct(row.p_market)
     : isExcluded
+    ? '—'
+    : isNearCertain
     ? '—'
     : rawEdge != null && hasModelData
     ? signedPct(rawEdge)
@@ -457,12 +499,19 @@ function ScannerRow({ row }: { row: Row }) {
       <td style={{ padding: '16px 18px', verticalAlign: 'top' }} colSpan={2}>
         <div style={{ fontSize: 14, fontWeight: 400, color: '#0A0A0A', fontFamily: '"DM Sans", sans-serif', lineHeight: 1.4 }} title={row.question}>
           {truncated}
-          {zone === 4 && <span style={{ fontSize: 10, color: '#9B9B9B', marginLeft: 8 }}>Outside model range</span>}
         </div>
         <div style={{ display: 'flex', alignItems: 'center', gap: 8, marginTop: 8, flexWrap: 'wrap' }}>
-          <EdgeBadge rawEdge={row.raw_edge ?? row.edge} badge={row.badge} />
+          <EdgeBadge
+            rawEdge={row.raw_edge ?? row.edge}
+            badge={row.badge}
+            zone={row.zone}
+            pMarket={row.p_market}
+            pModel={row.p_model}
+            signal={row.signal}
+          />
           <SourcePill source={row.source} />
           <CategoryPill category={row.category} />
+          {isOutsideRange && <OutsideRangePill />}
         </div>
       </td>
       <td className="font-num" style={{ padding: '16px 18px', textAlign: 'right', fontSize: 15, color: pMarketColor, verticalAlign: 'top' }}>
@@ -651,7 +700,45 @@ const PILL_BASE: React.CSSProperties = {
 //   raw_edge > 0  → "overpriced"  (blue)
 //   raw_edge < 0  → "underpriced" (green)
 //   |raw_edge|<1% → "fair value"  (grey)
-function EdgeBadge({ rawEdge, badge }: { rawEdge?: number | null; badge?: string }) {
+// Special cases that override the sign-based label:
+//   p_market ≥ 0.85 → "near-certain" (amber). These are zone-3 markets
+//                     where calling the YES side "overpriced" is misleading
+//                     (the YES is what the model also assigns high prob to).
+//   zone 4, no model data, or signal=outside_range → render nothing. The
+//                     model intentionally has no view here and showing
+//                     "overpriced"/"underpriced" would be a false signal.
+function EdgeBadge({
+  rawEdge,
+  badge,
+  zone,
+  pMarket,
+  pModel,
+  signal,
+}: {
+  rawEdge?: number | null;
+  badge?: string;
+  zone?: number;
+  pMarket?: number;
+  pModel?: number | null;
+  signal?: string | null;
+}) {
+  // Hide entirely when the model has no opinion on this market.
+  const hasNoModel = pModel == null || pModel === 0;
+  const outsideRange = zone === 4 || signal === 'outside_range' || signal == null;
+  if (outsideRange || hasNoModel) return null;
+
+  // Near-certain override — applied BEFORE the sign-based label so zone-3
+  // (and the looser 0.85 ceiling around it) gets the amber "near-certain"
+  // chip regardless of which side of fair the raw edge lands on.
+  if (typeof pMarket === 'number' && pMarket >= 0.85) {
+    const amber = { bg: '#FFFBEB', fg: '#B45309', bd: '#FDE68A' };
+    return (
+      <span style={{ ...PILL_BASE, background: amber.bg, color: amber.fg, border: `1px solid ${amber.bd}` }}>
+        near-certain
+      </span>
+    );
+  }
+
   const label = badge ?? (() => {
     const e = Number(rawEdge ?? 0);
     return Math.abs(e) < 0.01 ? 'fair value' : e > 0 ? 'overpriced' : 'underpriced';
@@ -671,6 +758,25 @@ function SourcePill({ source }: { source: 'kalshi' | 'polymarket' }) {
     ? { background: '#F0FDF4', color: '#15803D', border: '1px solid #BBF7D0' }
     : { background: '#EFF6FF', color: '#1D4ED8', border: '1px solid #BFDBFE' };
   return <span style={{ ...PILL_BASE, ...style }}>{isKalshi ? 'Kalshi' : 'Polymarket'}</span>;
+}
+
+// Small grey pill used to mark rows where the model has no actionable
+// opinion (zone-4 fair-value band, near-certain p ≥ 0.85, or missing
+// signal). Matches the SourcePill / CategoryPill visual so it slots
+// cleanly into the same pills row under the market title.
+function OutsideRangePill() {
+  return (
+    <span
+      style={{
+        ...PILL_BASE,
+        background: '#F3F4F6',
+        color: '#6B6B6B',
+        border: '1px solid #E5E7EB',
+      }}
+    >
+      Outside model range
+    </span>
+  );
 }
 
 const CATEGORY_PALETTE: Record<string, { bg: string; fg: string }> = {

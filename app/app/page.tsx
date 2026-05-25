@@ -129,7 +129,13 @@ function LiveStatsBar() {
           api.baskets.list().catch(() => null),
         ]);
         if (cancelled) return;
-        const baskets = bk?.baskets ?? [];
+        // Only count live baskets; the DB keeps archived rows (legacy
+        // CTRA-01 etc.) as a historical record and the API surfaces them
+        // alongside the active set. Counting them on the landing page
+        // would overstate the live protocol.
+        const baskets = (bk?.baskets ?? []).filter(
+          (b: any) => String(b.status ?? 'active').toLowerCase() === 'active',
+        );
         const navs = baskets.map((b: any) => Number(b.nav ?? b.current_nav ?? 1)).filter((n: number) => Number.isFinite(n));
         const avgNav = navs.length ? navs.reduce((s: number, n: number) => s + n, 0) / navs.length : 1;
         const markets = Number((scan as any)?.watched_count ?? (scan as any)?.count ?? 0);
