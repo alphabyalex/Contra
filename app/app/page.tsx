@@ -168,26 +168,35 @@ function HoverButton({ href, variant, children }: { href: string; variant: 'fill
 
 // ============== STATS STRIP ==============
 function StatsStrip({ count, onCount }: { count: number | null; onCount: (n: number) => void }) {
+  // Run exactly once on mount. We do NOT depend on `count` because
+  // LiveScannerMini in <LiveRightNowSection /> shares the same parent
+  // setter and would otherwise win the race with the filtered row count
+  // (~189), causing this effect to early-return before its own fetch
+  // lands. Hitting the same endpoint twice is cheap and lets each caller
+  // pull the field it actually wants.
   useEffect(() => {
-    if (count != null) return;
     let cancelled = false;
     (async () => {
       try {
-        // watched_count is the curated tracked universe (~1,000), not the
-        // post-filter row count which is just the rows returned by this
-        // particular query window. api.scanner.markets falls back to the
-        // snapshot response when the backend is unreachable, and that
-        // response also surfaces watched_count from SNAPSHOT_STATS, so the
-        // same field works in both modes.
+        // /api/scanner/markets returns:
+        //   watched_count -> curated tracked universe (~1,000)  <-- use this
+        //   count         -> rows AFTER the p_market filter (~189, misleading here)
+        // Snapshot mode (Vercel) returns the same shape with watched_count
+        // sourced from SNAPSHOT_STATS.markets_tracked.
         const r = await api.scanner.markets({ min: 0.02, max: 0.15 });
-        const n = Number(
-          (r as { watched_count?: number }).watched_count ?? r.count ?? 0,
-        );
-        if (!cancelled && Number.isFinite(n) && n > 0) onCount(n);
-      } catch { /* leave count null */ }
+        const watched = Number((r as { watched_count?: number }).watched_count ?? 0);
+        // Hard floor at 1,000 if the response omitted watched_count for any
+        // reason (older backend build, partial outage, etc.). The filtered
+        // r.count is intentionally NOT used as a fallback here.
+        const n = watched > 0 ? watched : 1000;
+        if (!cancelled) onCount(n);
+      } catch {
+        if (!cancelled) onCount(1000);
+      }
     })();
     return () => { cancelled = true; };
-  }, [count, onCount]);
+  // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, []);
 
   // Live count is the precise current scanner figure. The "+" appears
   // only on the general watched-universe references elsewhere on the

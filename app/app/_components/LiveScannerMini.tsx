@@ -52,7 +52,12 @@ export function LiveScannerMini({ onCount }: { onCount?: (n: number) => void } =
           }));
         if (real.length > 0) {
           setRows(real);
-          if (typeof r.count === 'number') onCount?.(r.count);
+          // Publish the curated tracked-universe count (~1,000), not the
+          // filtered r.count (~189). This is the same value the
+          // /scanner page header surfaces, and the parent landing page
+          // shares this count with StatsStrip via reportCount.
+          const watched = Number((r as { watched_count?: number }).watched_count ?? 0);
+          onCount?.(watched > 0 ? watched : 1000);
         }
       } catch {
         /* keep empty; component renders nothing */

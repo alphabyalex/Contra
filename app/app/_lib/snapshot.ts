@@ -6642,8 +6642,8 @@ export const SNAPSHOT_LEGS: SnapshotLeg[] = [
 export const SNAPSHOT_STATS: SnapshotStats = {
   "markets_tracked": 1000,
   "screened_count": 6443,
-  "polymarket_count": 6314,
-  "kalshi_count": 111,
+  "polymarket_count": 904,
+  "kalshi_count": 96,
   "short_signal_count": 4057,
   "active_basket_count": 3,
   "avg_short_edge": 0.0956,
