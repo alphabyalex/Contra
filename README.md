@@ -8,7 +8,7 @@ Contra is a Solana-native prediction market protocol that gives users systematic
 
 Prediction markets have a well-documented problem: retail traders consistently overpay for low-probability outcomes. A market priced at 8% might only resolve YES 1.7% of the time. Contra's ML model identifies these mispricings across Kalshi and Polymarket and bundles them into tradeable SPL token vaults.
 
-- **Short baskets (CTRA-01, CTRA-1.1, ...)** — systematic short exposure to overpriced longshots. Collect premium from markets where the crowd is wrong.
+- **Short baskets (CTRA-01, CTRA-03, ...)** — systematic short exposure to overpriced longshots. Collect premium from markets where the crowd is wrong.
 - **Long baskets (CTRA-02, CTRA-04, ...)** — long exposure to underpriced favorites in tournament markets. Positions appreciate as favorites gain probability ahead of resolution.
 
 Users deposit USDC, receive CTRA tokens representing their share of the basket NAV, and can optionally apply 2x or 3x leverage. Everything settles on-chain via three chained Anchor programs.
