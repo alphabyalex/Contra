@@ -54,7 +54,7 @@ Requires a `.env` file with Supabase, Kalshi, and Anthropic credentials. See `.e
 
 ## Live Demo
 
-Deployed at https://contra-git-main-alphabyalexs-projects.vercel.app
+Deployed at https://contra-beta.vercel.app/
 
 The deployed version runs without a backend. API secrets are not committed to this repo.
 What you see: a real snapshot of the scanner and baskets captured May 26, 2026.
