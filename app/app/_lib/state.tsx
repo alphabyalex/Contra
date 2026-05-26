@@ -22,6 +22,7 @@ interface Position {
   basket: { id: string; name: string; status: string } | null;
   tokens_held: number;
   usdc_deposited: number;
+  entry_nav?: number;
   current_nav: number;
   current_value_usdc: number;
   pnl_usdc: number;
