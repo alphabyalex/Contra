@@ -16,6 +16,26 @@ function fmtUsd(v: number): string {
   return v > 0 && v < 0.01 ? `$${v.toFixed(4)}` : `$${v.toFixed(2)}`;
 }
 
+/**
+ * Translate raw on-chain or simulation error strings into something a
+ * user can act on. Currently only specializes the lending pool's
+ * InsufficientLiquidity error (Anchor error code 6007, custom program
+ * error 0x1777). Every other error falls through untouched so unfamiliar
+ * failures still surface their raw message for triage.
+ */
+function friendlyLeverageError(raw: string | null | undefined): string {
+  const msg = String(raw ?? '');
+  if (
+    /InsufficientLiquidity/i.test(msg)
+    || /0x1777/i.test(msg)
+    || /\b6007\b/.test(msg)
+    || /Insufficient liquidity available in pool/i.test(msg)
+  ) {
+    return 'The lending pool is currently low on liquidity. Close an existing leveraged position to free up funds, or try a 1x deposit instead.';
+  }
+  return msg;
+}
+
 export default function LeverageClosePage() {
   const params = useParams<{ id: string }>();
   const id = params?.id ?? '';
@@ -112,7 +132,7 @@ export default function LeverageClosePage() {
         basketName: String(pos?.basket_name ?? 'Basket'),
       });
     } catch (e) {
-      setErr((e as Error).message);
+      setErr(friendlyLeverageError((e as Error).message));
     } finally {
       setBusy(false);
     }
@@ -257,12 +277,12 @@ function LeverageCloseModal({
             <circle cx="12" cy="12" r="10" />
             <polyline points="9 12 11 14 15 10" />
           </svg>
-          <h2 style={{ fontSize: 20, fontWeight: 500, color: '#0A0A0A', margin: 0, fontFamily: SANS }}>Tokens Redeemed</h2>
+          <h2 style={{ fontSize: 20, fontWeight: 500, color: '#0A0A0A', margin: 0, fontFamily: SANS }}>Position Closed</h2>
         </div>
         <div style={{ background: '#F7F7F5', borderRadius: 8, padding: 16, marginBottom: 16 }}>
           <ModalRow label="Basket" value={done.basketName} />
-          <ModalRow label="Tokens burned" value={`${done.tokensClosed.toFixed(4)} ${done.basketName}`} />
-          <ModalRow label="USDC received" value={fmtUsd(done.net)} />
+          <ModalRow label="Position size" value={`${done.tokensClosed.toFixed(4)} ${done.basketName}`} />
+          <ModalRow label="USDC returned to wallet" value={fmtUsd(done.net)} />
           <ModalRow
             label="Transaction"
             value={

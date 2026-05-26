@@ -17,43 +17,51 @@ interface Row {
   p_market: number;
 }
 
-const FALLBACK: Row[] = [
-  { question: 'Will Trump be impeached by June?',         source: 'polymarket', p_market: 0.08 },
-  { question: 'Will BTC hit $250k before July?',          source: 'polymarket', p_market: 0.12 },
-  { question: 'Will Apple acquire Netflix in 2026?',      source: 'polymarket', p_market: 0.06 },
-  { question: 'Will Fed cut rates 5x this year?',         source: 'polymarket', p_market: 0.09 },
-  { question: 'Will Barron Trump become Fed Chair?',      source: 'polymarket', p_market: 0.03 },
-];
-
 function truncate(s: string, n: number): string {
   if (s.length <= n) return s;
   return s.slice(0, n - 1).trimEnd() + '…';
 }
 
 export function LiveScannerMini({ onCount }: { onCount?: (n: number) => void } = {}) {
-  const [rows, setRows] = useState<Row[]>(FALLBACK);
+  // No hardcoded fallback. Hidden until the scanner endpoint returns real
+  // short-signal markets that clear the edge gate.
+  const [rows, setRows] = useState<Row[]>([]);
 
   useEffect(() => {
     let cancelled = false;
     (async () => {
       try {
-        const r = await api.scanner.markets(0.02, 0.15);
+        const r = await api.scanner.markets({ min: 0.02, max: 0.20 });
         if (cancelled) return;
         const real = (r.rows ?? [])
+          .filter((m: any) =>
+            m
+            && m.question
+            && (m.signal === 'short' || m.signal === 'strong_short')
+            && Number.isFinite(Number(m.p_market))
+            && Number.isFinite(Number(m.raw_edge ?? m.edge))
+            && Number(m.raw_edge ?? m.edge) > 0.03,
+          )
           .slice()
-          .sort((a, b) => a.p_market - b.p_market)
+          .sort((a: any, b: any) => Number(a.p_market) - Number(b.p_market))
           .slice(0, 5)
-          .map((m) => ({ question: m.question, source: m.source, p_market: m.p_market }));
+          .map((m: any) => ({
+            question: String(m.question),
+            source: m.source as 'kalshi' | 'polymarket',
+            p_market: Number(m.p_market),
+          }));
         if (real.length > 0) {
           setRows(real);
           if (typeof r.count === 'number') onCount?.(r.count);
         }
       } catch {
-        /* fallback already in state */
+        /* keep empty; component renders nothing */
       }
     })();
     return () => { cancelled = true; };
   }, [onCount]);
+
+  if (rows.length === 0) return null;
 
   return (
     <div className="bg-white" style={{ border: '1px solid #E5E5E3', overflow: 'hidden' }}>

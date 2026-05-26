@@ -4,9 +4,12 @@
  * Horizontal infinite ticker. Items repeat seamlessly via duplication +
  * a 50%-width translate animation. Items are separated by a thin blue dot.
  *
- * Stats source: /api/baskets — TVL approximated as nav × 100 USDC per
- * basket; replace with real on-chain TVL once vault USDC accounts are
- * being polled.
+ * Stats sources:
+ *   /api/scanner/markets -> watched_count for "Markets Scanned" (the
+ *     curated tracked universe, currently in the thousands).
+ *   /api/baskets -> active basket count, average edge across active legs.
+ *   Protocol TVL is intentionally hidden on devnet (the figure is
+ *     misleadingly small in a demo context).
  */
 
 import { useEffect, useState } from 'react';
@@ -16,16 +19,12 @@ interface Stats {
   marketsScanned: number;
   activeBaskets: number;
   avgEdge: number;
-  legsResolvedNo: number;
-  tvl: number;
 }
 
 const ZERO: Stats = {
   marketsScanned: 0,
   activeBaskets: 0,
   avgEdge: 0,
-  legsResolvedNo: 0,
-  tvl: 0,
 };
 
 export function TickerMarquee() {
@@ -35,27 +34,32 @@ export function TickerMarquee() {
     let cancelled = false;
     (async () => {
       try {
-        const r = await api.baskets.list();
-        const baskets = r.baskets ?? [];
-        let totalLegs = 0;
+        const [scan, bk] = await Promise.all([
+          // watched_count is the size of the curated tracked universe
+          // (scored_markets minus ephemeral favorites). Falls back to
+          // `count` if the server hasn't shipped watched_count yet.
+          api.scanner.markets({ min: 0.02, max: 0.20 }).catch(() => null),
+          api.baskets.list().catch(() => null),
+        ]);
+        const baskets = (bk?.baskets ?? []).filter(
+          (b: any) => b.status === 'active' || b.status === 'resolving',
+        );
         let edgeSum = 0;
         let edgeCount = 0;
-        let tvl = 0;
         for (const b of baskets) {
-          totalLegs += Number(b.num_legs ?? 0);
           if (Number.isFinite(b.avg_edge)) {
             edgeSum += Number(b.avg_edge);
             edgeCount += 1;
           }
-          tvl += Number(b.nav ?? 1) * 100;
         }
+        const marketsScanned = Number(
+          (scan as any)?.watched_count ?? (scan as any)?.count ?? 0,
+        );
         if (!cancelled) {
           setS({
-            marketsScanned: totalLegs * 4,
-            activeBaskets: baskets.filter((b: any) => b.status === 'active' || b.status === 'resolving').length,
+            marketsScanned,
+            activeBaskets: baskets.length,
             avgEdge: edgeCount > 0 ? edgeSum / edgeCount : 0,
-            legsResolvedNo: 0,
-            tvl,
           });
         }
       } catch {
@@ -68,10 +72,8 @@ export function TickerMarquee() {
     ['Markets Scanned', s.marketsScanned.toLocaleString()],
     ['Active Baskets', String(s.activeBaskets)],
     ['Avg Edge', `${(s.avgEdge * 100).toFixed(1)}%`],
-    // 'Legs Resolved NO' intentionally omitted: leg counts are hidden from
-    // user-facing surfaces. The legsResolvedNo data is still fetched (state
-    // + the totalLegs accumulator in the effect) so re-enabling is one line.
-    ['Protocol TVL', `$${s.tvl.toLocaleString(undefined, { maximumFractionDigits: 0 })}`],
+    // Protocol TVL intentionally removed on devnet: a sub-$1000 figure
+    // misrepresents the protocol's scale in a demo context.
   ];
   // Duplicate so the marquee loops without a visible jump.
   const looped = [...items, ...items];

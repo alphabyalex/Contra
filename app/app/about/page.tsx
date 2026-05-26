@@ -192,7 +192,7 @@ function PayoffsTab() {
     },
     {
       h: 'Leverage',
-      b: 'Leverage between 1x and 3x is available on basket positions. Leverage multiplies both gains and losses. A leveraged position on a basket that returns 10% earns proportionally more, but the same leverage applies to losses. Health factor is monitored continuously.',
+      b: 'Leverage of 1x, 2x, or 3x is available on basket positions. Leverage multiplies both gains and losses. A leveraged position on a basket that returns 10% earns proportionally more, but the same leverage applies to losses. Health factor is monitored continuously.',
     },
   ];
   return (

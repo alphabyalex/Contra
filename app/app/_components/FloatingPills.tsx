@@ -19,16 +19,6 @@
 import { useEffect, useState } from 'react';
 import { api } from '../_lib/api';
 
-const FALLBACK = [
-  { question: 'Will Trump be impeached by June?', price: 0.08 },
-  { question: 'BTC hits $250k before July?', price: 0.12 },
-  { question: 'Apple acquires Netflix in 2026?', price: 0.06 },
-  { question: 'Fed cuts rates 5x this year?', price: 0.09 },
-  { question: 'Barron Trump becomes Fed Chair?', price: 0.03 },
-  { question: 'S&P drops 40% this year?', price: 0.11 },
-  { question: 'Elon buys Twitter again?', price: 0.07 },
-];
-
 interface Pill { question: string; price: number }
 
 // 3 lanes only — slower drift (38–42s) so the field reads as ambient
@@ -45,24 +35,37 @@ function truncate(s: string, n = 32): string {
 }
 
 export function FloatingPills() {
-  const [trades, setTrades] = useState<Pill[]>(FALLBACK);
+  // No hardcoded fallback. The hero renders nothing in this layer until
+  // the scanner endpoint hands back enough real short-signal markets to
+  // populate the lanes. Spec: never show placeholder or stub data.
+  const [trades, setTrades] = useState<Pill[]>([]);
 
   useEffect(() => {
     let cancelled = false;
     (async () => {
       try {
-        const r = await api.scanner.markets(0.02, 0.15);
+        const r = await api.scanner.markets({ min: 0.02, max: 0.20 });
         if (cancelled) return;
         const next = (r.rows ?? [])
-          .map((m) => ({ question: m.question, price: m.p_market }))
+          .filter((m: any) =>
+            m
+            && m.question
+            && (m.signal === 'short' || m.signal === 'strong_short')
+            && Number.isFinite(Number(m.p_market))
+            && Number.isFinite(Number(m.raw_edge ?? m.edge))
+            && Number(m.raw_edge ?? m.edge) > 0.03,
+          )
+          .map((m: any) => ({ question: String(m.question), price: Number(m.p_market) }))
           .filter((p) => p.question && Number.isFinite(p.price));
         if (next.length >= 4) setTrades(next.slice(0, 50));
       } catch {
-        /* fallback already in state */
+        /* keep empty; component renders nothing */
       }
     })();
     return () => { cancelled = true; };
   }, []);
+
+  if (trades.length === 0) return null;
 
   return (
     <div

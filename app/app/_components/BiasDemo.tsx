@@ -1,152 +1,237 @@
 'use client';
 
 /**
- * Bias demonstration widget. Fetches up to N real longshots from the
- * backend scanner endpoint and renders one card per market, stacked
- * vertically. Bars animate from 0 → final value when the stack scrolls
- * into view; per-card delay staggers the entrances.
+ * Bias demonstration cards. Renders up to N real short-signal markets
+ * pulled from the live scanner endpoint. Cards must satisfy:
  *
- *   <BiasDemo count={3} />  → up to 3 cards
+ *   signal in {short, strong_short}
+ *   raw_edge > 0.03
+ *
+ * and the rendered set must include at least 2 Kalshi and 2 Polymarket
+ * markets when count >= 4. If the fetch fails or returns insufficient
+ * qualifying rows, the component renders nothing (no fallback, no stub).
+ *
+ * Card content: question (truncated to ~50 chars), source pill, p_market,
+ * raw_edge as edge %.
  */
 
 import { useEffect, useState } from 'react';
 import { api } from '../_lib/api';
 import { useInView } from '../_lib/useInView';
 
-interface Demo { question: string; pMarket: number }
-const FALLBACK: Demo[] = [
-  { question: 'Will Barron Trump become Fed Chair?', pMarket: 0.08 },
-  { question: 'Will BTC hit $250k before July?',     pMarket: 0.12 },
-  { question: 'Will Apple acquire Netflix in 2026?', pMarket: 0.06 },
-];
+interface DemoRow {
+  question: string;
+  source: 'kalshi' | 'polymarket';
+  pMarket: number;
+  rawEdge: number;
+}
 
-export function BiasDemo({ count = 1 }: { count?: number } = {}) {
-  const [demos, setDemos] = useState<Demo[]>(() => FALLBACK.slice(0, Math.max(1, count)));
+function truncate(s: string, n = 50): string {
+  if (!s) return '';
+  return s.length <= n ? s : s.slice(0, n - 1).trimEnd() + '…';
+}
+
+/**
+ * Choose up to `count` rows from a candidate pool while enforcing a
+ * minimum source mix. When `requireMix` is true and the pool has both
+ * sources, the first 2 picks come from Kalshi and Polymarket each, then
+ * the remaining slots are filled by highest edge regardless of source.
+ * Kalshi rows are preferred when both sources are otherwise equivalent
+ * for a slot so the demo doesn't look Polymarket-only.
+ */
+function pickMixed(rows: DemoRow[], count: number, requireMix: boolean): DemoRow[] {
+  const sorted = [...rows].sort((a, b) => b.rawEdge - a.rawEdge);
+  if (!requireMix) return sorted.slice(0, count);
+  const kalshi = sorted.filter((r) => r.source === 'kalshi');
+  const poly = sorted.filter((r) => r.source === 'polymarket');
+  if (kalshi.length < 2 || poly.length < 2) {
+    // Not enough of one source to meet the user's minimum mix. Skip the
+    // hard requirement and just return the top edges so the component can
+    // still render rather than collapse to nothing.
+    return sorted.slice(0, count);
+  }
+  const picked: DemoRow[] = [kalshi[0], kalshi[1], poly[0], poly[1]];
+  const ids = new Set(picked.map((r) => r.question));
+  for (const r of sorted) {
+    if (picked.length >= count) break;
+    if (ids.has(r.question)) continue;
+    picked.push(r);
+    ids.add(r.question);
+  }
+  return picked.slice(0, count);
+}
+
+/**
+ * Markets we never want to feature as a "convincing longshot" example.
+ * High implied probabilities (15-20%+) and broad partisan-coverage
+ * elections read like coin flips, not lottery tickets. Filtering them out
+ * keeps every card in the canonical 5-12% longshot band.
+ */
+function isUnconvincingLongshot(q: string): boolean {
+  const s = (q || '').toLowerCase();
+  return (
+    // Whichever party "controls" a chamber after a midterm is always a
+    // ~50/50 markets pair, not a longshot regardless of which side trades
+    // at the higher price.
+    /(republican|democratic|democrat)\s+party\b.*\bcontrol\b/.test(s)
+    || /\bcontrol\s+(the\s+)?(house|senate|congress)\b/.test(s)
+    // Brazilian + similar foreign presidential markets at 12-15% are not
+    // recognizable to most viewers and read as random rather than as a
+    // clear longshot. Exclude single-candidate presidential markets that
+    // sit on the upper edge of the longshot band.
+    || /brazilian\s+presidential\s+election/.test(s)
+  );
+}
+
+export function BiasDemo({ count = 4 }: { count?: number } = {}) {
+  const [rows, setRows] = useState<DemoRow[] | null>(null);
   const [ref, inView] = useInView<HTMLDivElement>(0.2);
 
   useEffect(() => {
     let cancelled = false;
     (async () => {
       try {
-        const r = await api.scanner.markets(0.02, 0.15);
-        const real = (r.rows ?? [])
-          .filter((m) => m.question && Number.isFinite(m.p_market))
-          .slice(0, count)
-          .map((m) => ({ question: m.question, pMarket: m.p_market }));
-        if (!cancelled && real.length > 0) setDemos(real);
+        // Pull the broad short pool, then filter client-side. p_market window
+        // 0.02-0.20 captures the longshot band; the explicit signal + edge
+        // gates below enforce the user's quality bar.
+        const r = await api.scanner.markets({ min: 0.02, max: 0.20 });
+        if (cancelled) return;
+        const pool: DemoRow[] = (r.rows ?? [])
+          .filter((m: any) =>
+            m
+            && m.question
+            && (m.source === 'kalshi' || m.source === 'polymarket')
+            && (m.signal === 'short' || m.signal === 'strong_short')
+            && Number.isFinite(Number(m.p_market))
+            && Number.isFinite(Number(m.raw_edge ?? m.edge))
+            // Tighter than the previous 0.04 floor: only show markets
+            // where the model identifies a clear longshot mispricing.
+            // Upper bound 0.15 excludes the 20%+ partisan election markets
+            // that read like coin flips rather than longshots.
+            && Number(m.raw_edge ?? m.edge) > 0.05
+            && Number(m.p_market) < 0.15
+            && !isUnconvincingLongshot(String(m.question)),
+          )
+          .map((m: any) => ({
+            question: String(m.question),
+            source: m.source as 'kalshi' | 'polymarket',
+            pMarket: Number(m.p_market),
+            rawEdge: Number(m.raw_edge ?? m.edge),
+          }));
+        const requireMix = count >= 4;
+        const picked = pickMixed(pool, count, requireMix);
+        if (picked.length > 0) setRows(picked);
       } catch {
-        /* keep fallback */
+        // Empty state per spec: never show placeholders, just hide.
       }
     })();
     return () => { cancelled = true; };
   }, [count]);
 
+  if (!rows || rows.length === 0) return null;
+
   return (
     <div
       ref={ref}
       style={{
-        display: 'flex',
-        flexDirection: 'column',
+        display: 'grid',
+        gridTemplateColumns: rows.length > 1 ? 'repeat(2, minmax(0, 1fr))' : '1fr',
         gap: 16,
-        maxWidth: 680,
+        maxWidth: 760,
         width: '100%',
       }}
     >
-      {demos.map((d, i) => (
-        <BiasDemoCard key={`${d.question}-${i}`} demo={d} inView={inView} delayMs={i * 220} />
+      {rows.map((d, i) => (
+        <BiasCard key={`${d.source}-${d.question}-${i}`} row={d} inView={inView} delayMs={i * 120} />
       ))}
     </div>
   );
 }
 
-function BiasDemoCard({ demo, inView, delayMs }: { demo: Demo; inView: boolean; delayMs: number }) {
-  // Heuristic stub — same factor used by the backend mispricing service.
-  const pModel = demo.pMarket * 0.25;
-  const edge = demo.pMarket - pModel;
-
+function BiasCard({ row, inView, delayMs }: { row: DemoRow; inView: boolean; delayMs: number }) {
   return (
     <div
       className="bg-white"
       style={{
         border: '1px solid #E5E5E3',
-        padding: '28px 32px',
+        padding: '20px 22px',
         borderRadius: 4,
+        textAlign: 'left',
+        opacity: inView ? 1 : 0,
+        transform: inView ? 'translateY(0)' : 'translateY(8px)',
+        transition: `opacity 600ms cubic-bezier(0.2, 0.8, 0.2, 1) ${delayMs}ms, transform 600ms cubic-bezier(0.2, 0.8, 0.2, 1) ${delayMs}ms`,
       }}
     >
       <div
         style={{
-          fontSize: 16,
+          fontSize: 14,
           color: '#0A0A0A',
-          overflow: 'hidden',
-          textOverflow: 'ellipsis',
-          whiteSpace: 'nowrap',
-          marginBottom: 20,
+          lineHeight: 1.4,
+          fontFamily: '"DM Sans", system-ui, sans-serif',
+          minHeight: 40,
         }}
-        title={demo.question}
+        title={row.question}
       >
-        {demo.question}
+        {truncate(row.question, 50)}
       </div>
-
-      <div className="space-y-4">
-        <BarRow
-          label="Market"
-          valueText={demo.pMarket.toFixed(2)}
-          targetPct={demo.pMarket * 100}
-          color="#1A56DB"
-          inView={inView}
-          delayMs={delayMs}
-        />
-        <BarRow
-          label="Model"
-          valueText={pModel.toFixed(2)}
-          suffix="(stub)"
-          targetPct={pModel * 100}
-          color="#00875A"
-          inView={inView}
-          delayMs={delayMs + 250}
-        />
-      </div>
-
       <div
         style={{
-          marginTop: 20,
-          color: '#1A56DB',
-          fontSize: 15,
-          fontFamily: '"IBM Plex Mono", monospace',
-          display: 'inline-block',
+          display: 'flex',
+          alignItems: 'center',
+          justifyContent: 'space-between',
+          gap: 12,
+          marginTop: 16,
         }}
       >
-        +{(edge * 100).toFixed(1)}% in your favor
+        <SourcePill source={row.source} />
+        <div style={{ display: 'flex', gap: 14, alignItems: 'baseline' }}>
+          <span
+            className="font-num"
+            style={{ fontSize: 13, color: '#0A0A0A', fontFamily: '"IBM Plex Mono", monospace' }}
+            title="Implied market probability"
+          >
+            {(row.pMarket * 100).toFixed(1)}%
+          </span>
+          <span
+            className="font-num"
+            style={{
+              fontSize: 13,
+              color: '#1A56DB',
+              fontFamily: '"IBM Plex Mono", monospace',
+              fontWeight: 500,
+            }}
+            title="Model edge (p_market minus p_model)"
+          >
+            +{(row.rawEdge * 100).toFixed(1)}%
+          </span>
+        </div>
       </div>
     </div>
   );
 }
 
-function BarRow({
-  label, valueText, suffix, targetPct, color, inView, delayMs = 0,
-}: {
-  label: string; valueText: string; suffix?: string;
-  targetPct: number; color: string; inView: boolean; delayMs?: number;
-}) {
+function SourcePill({ source }: { source: 'kalshi' | 'polymarket' }) {
+  const isKalshi = source === 'kalshi';
+  const style: React.CSSProperties = isKalshi
+    ? { background: '#F0FDF4', color: '#15803D', border: '1px solid #BBF7D0' }
+    : { background: '#EFF6FF', color: '#1D4ED8', border: '1px solid #BFDBFE' };
   return (
-    <div>
-      <div className="flex items-center justify-between mb-1.5">
-        <span style={{ fontSize: 11, color: '#9B9B9B', fontFamily: '"IBM Plex Mono", monospace' }}>{label}</span>
-        <span style={{ fontSize: 11, color: '#0A0A0A', fontFamily: '"IBM Plex Mono", monospace' }}>
-          {valueText} {suffix && <span style={{ color: '#9B9B9B' }}>{suffix}</span>}
-        </span>
-      </div>
-      <div style={{ height: 8, background: '#F0F0EE', borderRadius: 2, overflow: 'hidden' }}>
-        <div
-          style={{
-            height: '100%',
-            width: `${inView ? Math.min(100, Math.max(0, targetPct)) : 0}%`,
-            background: color,
-            borderRadius: 2,
-            transition: `width 800ms cubic-bezier(0.2, 0.8, 0.2, 1) ${delayMs}ms`,
-          }}
-        />
-      </div>
-    </div>
+    <span
+      style={{
+        ...style,
+        fontFamily: '"IBM Plex Mono", monospace',
+        fontSize: 10,
+        letterSpacing: '0.06em',
+        fontWeight: 500,
+        height: 20,
+        lineHeight: '18px',
+        padding: '0 8px',
+        borderRadius: 10,
+        display: 'inline-flex',
+        alignItems: 'center',
+      }}
+    >
+      {isKalshi ? 'Kalshi' : 'Polymarket'}
+    </span>
   );
 }

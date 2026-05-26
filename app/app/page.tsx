@@ -120,57 +120,14 @@ function Hero() {
             <HoverButton href="/baskets" variant="filled">View Baskets</HoverButton>
             <HoverButton href="#how-it-works" variant="outline">How It Works</HoverButton>
           </div>
-          <LiveStatsBar />
+          {/* LiveStatsBar removed: the TickerMarquee directly below the hero
+              already surfaces the same numbers (markets scanned, active
+              baskets, avg edge). Two stat strips back to back read as a
+              duplicated metric panel. */}
         </div>
         <div aria-hidden />
       </div>
     </section>
-  );
-}
-
-// Live stats bar — real data from the API, no fabricated numbers.
-function LiveStatsBar() {
-  const [stats, setStats] = useState<{ markets: number; baskets: number; avgNav: number } | null>(null);
-  useEffect(() => {
-    let cancelled = false;
-    (async () => {
-      try {
-        const [scan, bk] = await Promise.all([
-          api.scanner.markets({ min: 0.02, max: 0.2 }).catch(() => null),
-          api.baskets.list().catch(() => null),
-        ]);
-        if (cancelled) return;
-        // Only count live baskets; the DB keeps archived rows (legacy
-        // CTRA-01 etc.) as a historical record and the API surfaces them
-        // alongside the active set. Counting them on the landing page
-        // would overstate the live protocol.
-        const baskets = (bk?.baskets ?? []).filter(
-          (b: any) => String(b.status ?? 'active').toLowerCase() === 'active',
-        );
-        const navs = baskets.map((b: any) => Number(b.nav ?? b.current_nav ?? 1)).filter((n: number) => Number.isFinite(n));
-        const avgNav = navs.length ? navs.reduce((s: number, n: number) => s + n, 0) / navs.length : 1;
-        const markets = Number((scan as any)?.watched_count ?? (scan as any)?.count ?? 0);
-        setStats({ markets, baskets: baskets.length, avgNav });
-      } catch { /* leave null */ }
-    })();
-    return () => { cancelled = true; };
-  }, []);
-  if (!stats) return null;
-  return (
-    <div style={{ marginTop: 24, fontSize: 13, color: '#6B6B6B', fontFamily: '"IBM Plex Mono", monospace' }}>
-      {stats.markets} markets tracked
-      <span style={{ color: '#C0C0C0', margin: '0 8px' }}>·</span>
-      {stats.baskets} active baskets
-      {/* Avg NAV is only shown when >= 1 (i.e. the portfolio is at or above
-          inception). Below 1 we hide it rather than display a discouraging
-          number on the front door. */}
-      {stats.avgNav >= 1 && (
-        <>
-          <span style={{ color: '#C0C0C0', margin: '0 8px' }}>·</span>
-          ${stats.avgNav.toFixed(2)} avg NAV
-        </>
-      )}
-    </div>
   );
 }
 
@@ -222,11 +179,15 @@ function StatsStrip({ count, onCount }: { count: number | null; onCount: (n: num
     return () => { cancelled = true; };
   }, [count, onCount]);
 
+  // Live count is the precise current scanner figure. The "+" appears
+  // only on the general watched-universe references elsewhere on the
+  // page (e.g. "View all 1000+ watched markets"), not on this specific
+  // live count where we have the exact number from the API.
   const liveCount = count != null ? `${count}` : '…';
   const stats = [
-    { value: liveCount, label: 'mispriced markets identified right now' },
+    { value: liveCount, label: 'markets tracked live' },
     { value: 'Devnet', label: 'live today on Solana devnet' },
-    { value: 'v5.1', label: 'calibration model screening every market' },
+    { value: 'Proprietary', label: 'screening every market' },
   ];
 
   // Scroll-triggered grid fade. useInView fires once the strip enters the
@@ -258,23 +219,48 @@ function StatsStrip({ count, onCount }: { count: number | null; onCount: (n: num
       />
       <div style={{ position: 'relative', zIndex: 2, maxWidth: 800, margin: '0 auto', padding: '32px 24px' }}>
         <div className="grid grid-cols-1 md:grid-cols-3" style={{ gap: 0 }}>
-          {stats.map((s, i) => (
-            <div
-              key={i}
-              style={{
-                padding: '12px 24px',
-                borderLeft: i === 0 ? 'none' : '1px solid #E5E5E3',
-                textAlign: 'center',
-              }}
-            >
-              <div className="font-num" style={{ fontSize: 36, color: '#1A56DB', fontWeight: 500, lineHeight: 1.1 }}>
-                {s.value}
+          {stats.map((s, i) => {
+            // Non-numeric values like 'Devnet' and 'Proprietary' get a
+            // slightly smaller font so they don't visually crowd or wrap
+            // the row alongside the numeric figure in the first cell.
+            // Every cell uses an identical fixed 80px height and the same
+            // flex centering so the three values share a single vertical
+            // center line regardless of font-size, and the three labels
+            // sit at exactly the same Y below them.
+            const isNumeric = /^[\d.,+\-]+$/.test(s.value.trim());
+            const fontSize = isNumeric ? 36 : s.value.length > 8 ? 24 : 28;
+            return (
+              <div
+                key={i}
+                style={{
+                  height: 80,
+                  padding: '12px 24px',
+                  borderLeft: i === 0 ? 'none' : '1px solid #E5E5E3',
+                  textAlign: 'center',
+                  display: 'flex',
+                  flexDirection: 'column',
+                  justifyContent: 'center',
+                  alignItems: 'center',
+                  boxSizing: 'border-box',
+                }}
+              >
+                <div
+                  className="font-num"
+                  style={{
+                    fontSize,
+                    color: '#1A56DB',
+                    fontWeight: 500,
+                    lineHeight: 1,
+                  }}
+                >
+                  {s.value}
+                </div>
+                <div style={{ fontSize: 12, color: '#6B6B6B', marginTop: 8, lineHeight: 1.5, whiteSpace: 'nowrap' }}>
+                  {s.label}
+                </div>
               </div>
-              <div style={{ fontSize: 12, color: '#6B6B6B', marginTop: 8, lineHeight: 1.5 }}>
-                {s.label}
-              </div>
-            </div>
-          ))}
+            );
+          })}
         </div>
         <div style={{ fontSize: 11, color: '#9B9B9B', textAlign: 'center', marginTop: 20 }}>
           Based on published academic research and live market data.
@@ -299,9 +285,10 @@ function ProblemSection() {
           Longshots lose. We built the short side.
         </h2>
         <p style={{ ...bodyParagraph, maxWidth: 780, margin: '24px auto 0' }}>
-          The longshot bias is one of the most replicated findings in behavioral economics. It holds
-          across elections, sports, crypto, and macro markets. Sophisticated traders know it exists.
-          Until now, nobody built the infrastructure to systematically sit on the other side of it at scale.
+          Retail traders treat low-probability contracts like lottery tickets. A 7% implied chance feels
+          plausible enough to buy, even when the true probability is closer to 1%. The gap between
+          perception and reality is persistent, measurable, and shows up in every category of
+          prediction market.
         </p>
 
         {/* Pill row — wider container so all three sit on one line. */}
@@ -337,7 +324,7 @@ function ProblemSection() {
         </div>
 
         <div style={{ marginTop: 32, display: 'flex', justifyContent: 'center' }}>
-          <BiasDemo count={1} />
+          <BiasDemo count={4} />
         </div>
       </div>
     </section>
@@ -349,7 +336,7 @@ function HowItWorksSection() {
   const steps = [
     { n: '01', title: 'We scan the markets', body: 'Thousands of prediction markets across Kalshi and Polymarket, scored in real time.' },
     { n: '02', title: 'Model finds the edge', body: 'Our proprietary ML model identifies where the crowd is most wrong. Every market is scored, ranked, and filtered by edge before it enters a basket.' },
-    { n: '03', title: 'You get one token',    body: 'The best opportunities bundle into a single tokenized basket. One deposit, hundreds of shorts.' },
+    { n: '03', title: 'You get one token',    body: 'The best opportunities bundle into a single tokenized basket. One deposit, dozens of positions.' },
   ];
   return (
     <section id="how-it-works" style={{ background: '#F7F7F5', padding: '48px 0' }}>
@@ -424,7 +411,7 @@ function WhyItWorksSection() {
     { label: 'Documented in academic literature', body: 'The longshot bias has been studied across horse racing, sports betting, and financial prediction markets for over 40 years.' },
     { label: 'Holds across every category', body: 'Politics, sports, crypto, macro, culture. The bias is not specific to one market type. It is structural.' },
     { label: 'Retail-driven mispricing', body: 'Sophisticated traders arbitrage most inefficiencies away. Longshot bias persists because it requires scale and infrastructure most traders do not have.' },
-    { label: 'The edge compounds', body: 'A basket of 100 independently mispriced markets has a more consistent return profile than any single position.' },
+    { label: 'The edge compounds', body: 'A basket of dozens of independently mispriced markets has a more consistent return profile than any single position.' },
   ];
   return (
     <section
@@ -491,17 +478,41 @@ function SupportPoint({ label, body }: { label: string; body: string }) {
   );
 }
 
-/** 2 ambient pills drifting across Why It Works at opacity 0.18, 35s duration. */
+/**
+ * Ambient drifting pills behind Why It Works. Pulls real short-signal
+ * markets from the scanner endpoint. Renders nothing if the fetch fails
+ * or returns no qualifying rows. No hardcoded placeholders.
+ */
 function SubtleSectionPills() {
-  const TRADES = [
-    { question: 'Will BTC hit $250k before July?', price: 0.12 },
-    { question: 'Apple acquires Netflix in 2026?', price: 0.06 },
-    { question: 'Fed cuts rates 5x this year?',     price: 0.09 },
-    { question: 'S&P drops 40% this year?',         price: 0.11 },
-  ];
+  const [trades, setTrades] = useState<Array<{ question: string; price: number }>>([]);
+  useEffect(() => {
+    let cancelled = false;
+    (async () => {
+      try {
+        const r = await api.scanner.markets({ min: 0.02, max: 0.20 });
+        if (cancelled) return;
+        const real = (r.rows ?? [])
+          .filter((m: any) =>
+            m
+            && m.question
+            && (m.signal === 'short' || m.signal === 'strong_short')
+            && Number.isFinite(Number(m.p_market))
+            && Number.isFinite(Number(m.raw_edge ?? m.edge))
+            && Number(m.raw_edge ?? m.edge) > 0.03,
+          )
+          .slice(0, 6)
+          .map((m: any) => ({ question: String(m.question), price: Number(m.p_market) }));
+        if (real.length > 0) setTrades(real);
+      } catch { /* leave empty; component renders null */ }
+    })();
+    return () => { cancelled = true; };
+  }, []);
+
+  if (trades.length === 0) return null;
+
   const lanes = [
     { topPct: 22, durationSec: 35, startDelaySec: 0,  index: 0 },
-    { topPct: 70, durationSec: 35, startDelaySec: 17, index: 2 },
+    { topPct: 70, durationSec: 35, startDelaySec: 17, index: Math.min(2, trades.length - 1) },
   ];
   return (
     <div
@@ -536,9 +547,9 @@ function SubtleSectionPills() {
           >
             <span style={{ color: '#CC2936', fontWeight: 500 }}>NO</span>
             <span style={{ color: 'rgba(10,10,10,0.35)' }}>·</span>
-            <span>{TRADES[l.index].question}</span>
+            <span>{trades[l.index].question}</span>
             <span style={{ color: 'rgba(10,10,10,0.35)' }}>·</span>
-            <span style={{ color: '#0A0A0A' }}>{TRADES[l.index].price.toFixed(2)}</span>
+            <span style={{ color: '#0A0A0A' }}>{trades[l.index].price.toFixed(2)}</span>
           </div>
         </div>
       ))}
@@ -565,12 +576,12 @@ function LiveRightNowSection({ count, onCount }: { count: number | null; onCount
           </p>
         </div>
 
-        {/* Counter: left-aligned, sits between body and table. */}
-        <div style={{ marginTop: 28, textAlign: 'left' }}>
-          <LiveCounter />
-        </div>
+        {/* LiveCounter removed: the 'NO outcomes confirmed 1,210' pill was
+            opaque to first-time visitors and the figure was a heuristic
+            estimate rather than a real on-chain count. The live scanner
+            table below now sits directly under the section body. */}
 
-        <div style={{ marginTop: 16 }}>
+        <div style={{ marginTop: 28 }}>
           <LiveScannerMini onCount={onCount} />
           <div style={{ marginTop: 16, textAlign: 'left' }}>
             <Link
@@ -588,54 +599,6 @@ function LiveRightNowSection({ count, onCount }: { count: number | null; onCount
         </div>
       </div>
     </section>
-  );
-}
-
-/** Inline pill-style counter — green tinted, sits before the live table. */
-function LiveCounter() {
-  // Deterministic initial value so SSR and first client render match.
-  // Real starting value is jittered after mount to avoid hydration mismatch.
-  const [value, setValue] = useState<number>(1300);
-  const [ref, inView] = useInView<HTMLDivElement>(0.1);
-
-  useEffect(() => {
-    setValue(1200 + Math.floor(Math.random() * 200));
-  }, []);
-
-  useEffect(() => {
-    if (!inView) return;
-    const iv = setInterval(() => setValue((v) => v + 1), 3000);
-    return () => clearInterval(iv);
-  }, [inView]);
-
-  return (
-    <div
-      ref={ref}
-      style={{
-        display: 'inline-flex',
-        alignItems: 'center',
-        gap: 12,
-        background: '#FFFFFF',
-        border: '1px solid #E5E5E3',
-        borderRadius: 4,
-        padding: '8px 16px',
-      }}
-    >
-      <span
-        style={{
-          fontSize: 9,
-          color: '#6B6B6B',
-          textTransform: 'uppercase',
-          letterSpacing: '0.1em',
-          fontFamily: '"DM Sans", sans-serif',
-        }}
-      >
-        NO outcomes confirmed
-      </span>
-      <span className="font-num" style={{ fontSize: 20, color: '#00875A' }}>
-        {value.toLocaleString()}
-      </span>
-    </div>
   );
 }
 

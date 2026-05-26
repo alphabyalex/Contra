@@ -34,6 +34,26 @@ const LIQ_NAV_FACTOR: Record<2 | 3, number> = {
   3: 0.68,
 };
 
+/**
+ * Translate raw on-chain or simulation error strings into something a
+ * user can act on. Currently only specializes the lending pool's
+ * InsufficientLiquidity error (Anchor error code 6007, custom program
+ * error 0x1777). Every other error falls through untouched so unfamiliar
+ * failures still surface their raw message for triage.
+ */
+function friendlyDepositError(raw: string | null | undefined): string {
+  const msg = String(raw ?? '');
+  if (
+    /InsufficientLiquidity/i.test(msg)
+    || /0x1777/i.test(msg)
+    || /\b6007\b/.test(msg)
+    || /Insufficient liquidity available in pool/i.test(msg)
+  ) {
+    return 'The lending pool is currently low on liquidity. Close an existing leveraged position to free up funds, or try a 1x deposit instead.';
+  }
+  return msg;
+}
+
 export function DepositForm({ basketId, basketName, avgEdge, entryNav, onConfirmed }: Props) {
   const wallet = useWallet();
   const [amount, setAmount] = useState('100');
@@ -91,7 +111,7 @@ export function DepositForm({ basketId, basketName, avgEdge, entryNav, onConfirm
       }
       onConfirmed?.(res.signature);
     } catch (e) {
-      setErr((e as Error).message);
+      setErr(friendlyDepositError((e as Error).message));
     } finally {
       setBusy(false);
     }
