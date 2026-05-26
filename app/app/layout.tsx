@@ -11,6 +11,13 @@ import Link from 'next/link';
 export const metadata: Metadata = {
   title: 'CONTRA — Bet Against the Obvious',
   description: 'Solana-native short-basket protocol for overpriced prediction-market longshots.',
+  icons: {
+    icon: [
+      { url: '/contra-app-icon.png', type: 'image/png' },
+    ],
+    shortcut: '/contra-app-icon.png',
+    apple: '/contra-app-icon.png',
+  },
 };
 
 export default function RootLayout({ children }: { children: React.ReactNode }) {
@@ -36,7 +43,7 @@ export default function RootLayout({ children }: { children: React.ReactNode }) 
                   <Logo size={32} tagline />
                 </Link>
                 <NavTabs />
-                <div className="flex items-center gap-3">
+                <div className="flex items-center gap-3 contra-nav-actions">
                   <PortfolioCta />
                   <ConnectButton />
                 </div>
@@ -54,7 +61,7 @@ export default function RootLayout({ children }: { children: React.ReactNode }) 
               }}
             >
               <div
-                className="max-w-[1400px] mx-auto h-full px-6 flex items-center justify-between"
+                className="max-w-[1400px] mx-auto h-full px-6 flex items-center justify-between contra-footer-bar"
                 style={{
                   fontSize: 11,
                   color: '#6B6B6B',

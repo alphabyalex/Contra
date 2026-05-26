@@ -121,3 +121,194 @@ html, body {
 .wallet-adapter-button-trigger:not([disabled]):hover {
   background-color: #1748B8 !important;
 }
+
+/* =====================================================================
+ * Responsive overrides. ONLY applies below 1024px. Desktop layout at
+ * 1024px+ is unchanged. Tablet (640-1023px) gets stacked grids and
+ * scaled padding; phone (<640px) gets further font/padding reductions
+ * and compact nav. Tap targets stay >= 44px tall.
+ * ===================================================================== */
+
+@media (max-width: 1023px) {
+  /* Hero: 58/42 desktop split collapses to a single column. */
+  .contra-hero-grid {
+    grid-template-columns: 1fr !important;
+  }
+  .contra-hero-left {
+    padding: 56px 24px 40px !important;
+  }
+  .contra-hero-right {
+    display: none !important;
+  }
+  .contra-hero-headline {
+    font-size: 40px !important;
+    line-height: 1.1 !important;
+  }
+  .contra-hero-sub {
+    font-size: 15px !important;
+  }
+
+  /* Baskets 2-col grid -> 1-col stacked. */
+  .contra-baskets-grid {
+    grid-template-columns: 1fr !important;
+    gap: 16px !important;
+  }
+
+  /* Any 3-up section (How / Why / Strategy) stacks to one column. */
+  .contra-3up,
+  .contra-2up {
+    grid-template-columns: 1fr !important;
+    gap: 20px !important;
+  }
+
+  /* Reduce section padding. */
+  .contra-section-pad {
+    padding-left: 24px !important;
+    padding-right: 24px !important;
+  }
+
+  /* Step / Support cards: take full width below tablet so they stack. */
+  .contra-step-card {
+    width: 100% !important;
+    min-width: 0 !important;
+    min-height: 0 !important;
+    padding: 24px !important;
+  }
+  .contra-support-card {
+    width: calc(50% - 10px) !important;
+    min-width: 0 !important;
+  }
+
+  /* Header: tighter logo + nav tabs; portfolio CTA hides label. */
+  .contra-nav-tabs a,
+  .contra-nav-tabs button {
+    padding-left: 10px !important;
+    padding-right: 10px !important;
+    font-size: 12px !important;
+  }
+
+  /* Stats strip: allow horizontal scroll if cells would overflow. */
+  .contra-stats-strip {
+    overflow-x: auto;
+  }
+
+  /* Tables: ensure horizontal scroll wrappers actually engage and shrink
+   * cell padding so more columns fit on tablets. */
+  .contra-table-scroll {
+    overflow-x: auto;
+    -webkit-overflow-scrolling: touch;
+  }
+  .contra-table-scroll table {
+    min-width: 720px;
+  }
+}
+
+@media (max-width: 639px) {
+  /* Phone: aggressive scale-downs. */
+  .contra-hero-left {
+    padding: 40px 18px 32px !important;
+  }
+  .contra-hero-headline {
+    font-size: 30px !important;
+  }
+  .contra-hero-sub {
+    font-size: 14px !important;
+  }
+  .contra-hero-eyebrow {
+    font-size: 10px !important;
+  }
+  .contra-hero-cta {
+    width: 100%;
+    justify-content: center !important;
+  }
+
+  /* Section padding and headers shrink further. */
+  .contra-section-pad {
+    padding-left: 16px !important;
+    padding-right: 16px !important;
+  }
+  .contra-section-title {
+    font-size: 28px !important;
+    line-height: 1.15 !important;
+  }
+  .contra-section-eyebrow {
+    font-size: 10px !important;
+  }
+  .contra-section-body {
+    font-size: 14px !important;
+  }
+
+  /* Hide secondary nav tabs on phones; keep the wallet button reachable
+   * and the logo visible. Home / Baskets / Scanner / About remain via the
+   * footer link grid (about, scanner) and the logo (home). */
+  .contra-nav-tabs {
+    display: none !important;
+  }
+  .contra-portfolio-label {
+    display: none !important;
+  }
+  .contra-portfolio-icon {
+    display: inline-block !important;
+  }
+  .contra-portfolio-cta {
+    padding: 7px 10px !important;
+  }
+
+  /* Step / Support cards: full width on phones. */
+  .contra-step-card,
+  .contra-support-card {
+    width: 100% !important;
+    min-width: 0 !important;
+  }
+
+  /* Baskets card: less padding, smaller heading. */
+  .contra-basket-card {
+    padding: 22px !important;
+  }
+  .contra-basket-card-title {
+    font-size: 20px !important;
+  }
+  .contra-basket-card-nav {
+    font-size: 26px !important;
+  }
+
+  /* Stats strip: ensure tap targets and readable text. */
+  .contra-stats-cell {
+    min-height: 44px;
+  }
+
+  /* Bias demo 2-col grid -> 1 col. */
+  .contra-bias-grid {
+    grid-template-columns: 1fr !important;
+  }
+
+  /* Tables: keep horizontal scroll, but also scale font + padding. */
+  .contra-table-scroll th,
+  .contra-table-scroll td {
+    padding: 10px 12px !important;
+    font-size: 12px !important;
+  }
+
+  /* Grid background watermark: reduce density on phones so the mark
+   * doesn't dominate small viewports. Cards and content always stay
+   * above it via z-index. */
+  .contra-grid-bg-mobile-quiet {
+    opacity: 0.025 !important;
+  }
+
+  /* Footer: stack lines, shrink. */
+  .contra-footer-bar {
+    flex-direction: column !important;
+    align-items: flex-start !important;
+    gap: 4px !important;
+    padding-top: 8px;
+    padding-bottom: 8px;
+    height: auto !important;
+  }
+
+  /* Ensure interactive elements meet the 44px touch-target floor. */
+  .contra-cta-button,
+  .contra-tab-button {
+    min-height: 44px;
+  }
+}

@@ -157,7 +157,7 @@ export default function BasketsPage() {
             column heights leave empty space at the bottom of the shorter
             side rather than spilling across. Colors are unchanged; column
             assignment is purely a sort/layout step. */}
-        <div style={{ display: 'grid', gridTemplateColumns: '1fr 1fr', gap: 24, paddingBottom: 48 }}>
+        <div className="contra-baskets-grid" style={{ display: 'grid', gridTemplateColumns: '1fr 1fr', gap: 24, paddingBottom: 48 }}>
           {loading ? (
             Array.from({ length: 4 }).map((_, i) => (
               <div key={i} className="skeleton" style={{ height: 280, borderRadius: 16 }} />
@@ -270,6 +270,7 @@ function BasketCardPremium({ b }: { b: any }) {
       onClick={() => router.push(`/baskets/${b.id}`)}
       onMouseEnter={() => setHover(true)}
       onMouseLeave={() => setHover(false)}
+      className="contra-basket-card"
       style={{
         background: '#FFF', borderRadius: 20, padding: 32, cursor: 'pointer', borderTop: `3px solid ${accent}`,
         boxShadow: hover ? '0 12px 32px rgba(0,0,0,0.14)' : '0 4px 16px rgba(0,0,0,0.08)',
@@ -279,7 +280,7 @@ function BasketCardPremium({ b }: { b: any }) {
     >
       <div style={{ display: 'flex', justifyContent: 'space-between', alignItems: 'flex-start' }}>
         <div>
-          <div style={{ fontSize: 24, fontWeight: 600, color: '#0A0A0A', fontFamily: '"IBM Plex Mono", monospace' }}>{b.name}</div>
+          <div className="contra-basket-card-title" style={{ fontSize: 24, fontWeight: 600, color: '#0A0A0A', fontFamily: '"IBM Plex Mono", monospace' }}>{b.name}</div>
           <div style={{ display: 'flex', gap: 8, marginTop: 12 }}>
             {/* Outlined type pill — more refined than a filled chip. */}
             <span style={{ height: 24, padding: '0 10px', borderRadius: 12, display: 'inline-flex', alignItems: 'center', background: '#FFF', border: `1.5px solid ${accent}`, color: accent, fontSize: 12, fontWeight: 500, fontFamily: '"DM Sans", sans-serif' }}>
@@ -291,7 +292,7 @@ function BasketCardPremium({ b }: { b: any }) {
           </div>
         </div>
         <div style={{ textAlign: 'right' }}>
-          <div className="font-num" style={{ fontSize: 32, fontWeight: 200, color: '#0A0A0A', lineHeight: 1.1 }}>${nav.toFixed(4)}</div>
+          <div className="font-num contra-basket-card-nav" style={{ fontSize: 32, fontWeight: 200, color: '#0A0A0A', lineHeight: 1.1 }}>${nav.toFixed(4)}</div>
           <div className="font-num" style={{ fontSize: 14, color: navChange >= 0 ? '#00875A' : '#CC2936', marginTop: 4 }}>
             {navChange >= 0 ? '+' : '−'}{Math.abs(navChange).toFixed(1)}%
           </div>

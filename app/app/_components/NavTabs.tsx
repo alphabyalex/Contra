@@ -18,7 +18,7 @@ export function NavTabs() {
   const [hoverIdx, setHoverIdx] = useState<number | null>(null);
 
   return (
-    <nav className="flex h-full">
+    <nav className="flex h-full contra-nav-tabs">
       {TABS.map((t, i) => {
         const active = t.href === '/' ? pathname === '/' : pathname.startsWith(t.href);
         const hovered = hoverIdx === i;

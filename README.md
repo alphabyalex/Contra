@@ -25,7 +25,7 @@ The model layers on top of base calibration:
 - Volume filters and hard exclusions for range/bracket markets
 - Impossible market detection via Anthropic API (weekly)
 
-354 markets tracked across Kalshi and Polymarket. Scanner updates every 15 minutes with live prices.
+6,425 markets tracked across Kalshi and Polymarket. Scanner updates every 15 minutes with live prices.
 
 ## Stack
 
@@ -51,6 +51,31 @@ npm run dev
 ```
 
 Requires a `.env` file with Supabase, Kalshi, and Anthropic credentials. See `.env.example` for required variables.
+
+## Live Demo
+
+Deployed at https://contra-git-main-alphabyalexs-projects.vercel.app
+
+The deployed version runs without a backend. API secrets are not committed to this repo.
+What you see: a real snapshot of the scanner and baskets captured May 26, 2026.
+What still works live: wallet connection, USDC deposits, redemptions, and all on-chain interactions go directly to Solana devnet.
+
+### Trying a real deposit (devnet)
+
+To interact with the protocol you need two free, test-only tokens on Solana devnet: SOL for gas and USDC to deposit. Both come from official faucets.
+
+1. Get devnet SOL for gas
+   Go to https://faucet.solana.com, select Devnet, paste your wallet address, and request SOL.
+
+2. Get devnet USDC to deposit
+   Go to https://faucet.circle.com, select Solana Devnet as the network, paste your wallet address, and request USDC.
+
+3. Connect and deposit
+   Open the site, connect your wallet (top right), and deposit into any basket. Your USDC and CTRA token balances are real on-chain devnet balances you can verify on Solana Explorer.
+
+### Running with live data locally
+
+Clone the repo, add your .env (see .env.example), and start the backend on port 3001. The frontend will use live data instead of the snapshot.
 
 ## Competition context
 

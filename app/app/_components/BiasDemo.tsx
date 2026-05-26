@@ -133,6 +133,7 @@ export function BiasDemo({ count = 4 }: { count?: number } = {}) {
   return (
     <div
       ref={ref}
+      className="contra-bias-grid"
       style={{
         display: 'grid',
         gridTemplateColumns: rows.length > 1 ? 'repeat(2, minmax(0, 1fr))' : '1fr',

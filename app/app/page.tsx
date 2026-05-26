@@ -60,6 +60,7 @@ function Hero() {
       />
 
       <div
+        className="contra-hero-grid"
         style={{
           position: 'relative',
           zIndex: 2,
@@ -69,6 +70,7 @@ function Hero() {
         }}
       >
         <div
+          className="contra-hero-left"
           style={{
             display: 'flex',
             flexDirection: 'column',
@@ -77,6 +79,7 @@ function Hero() {
           }}
         >
           <div
+            className="contra-hero-eyebrow"
             style={{
               fontSize: 11,
               color: '#9B9B9B',
@@ -90,6 +93,7 @@ function Hero() {
           </div>
           <div aria-hidden style={{ width: '100%', height: 1, background: '#E5E5E3', marginBottom: 20 }} />
           <h1
+            className="contra-hero-headline"
             style={{
               fontFamily: '"DM Sans", system-ui, sans-serif',
               fontWeight: 400,
@@ -103,6 +107,7 @@ function Hero() {
             Bet against the obvious.
           </h1>
           <p
+            className="contra-hero-sub"
             style={{
               fontSize: 16,
               color: '#4A4A4A',
@@ -116,16 +121,12 @@ function Hero() {
             so people buy it anyway. Contra packages the other side of that bias into tokenized short
             baskets you can hold to resolution.
           </p>
-          <div className="flex" style={{ gap: 12, marginTop: 32 }}>
+          <div className="flex flex-wrap contra-hero-cta-row" style={{ gap: 12, marginTop: 32 }}>
             <HoverButton href="/baskets" variant="filled">View Baskets</HoverButton>
             <HoverButton href="#how-it-works" variant="outline">How It Works</HoverButton>
           </div>
-          {/* LiveStatsBar removed: the TickerMarquee directly below the hero
-              already surfaces the same numbers (markets scanned, active
-              baskets, avg edge). Two stat strips back to back read as a
-              duplicated metric panel. */}
         </div>
-        <div aria-hidden />
+        <div aria-hidden className="contra-hero-right" />
       </div>
     </section>
   );
@@ -172,8 +173,17 @@ function StatsStrip({ count, onCount }: { count: number | null; onCount: (n: num
     let cancelled = false;
     (async () => {
       try {
+        // watched_count is the curated tracked universe (~1,000), not the
+        // post-filter row count which is just the rows returned by this
+        // particular query window. api.scanner.markets falls back to the
+        // snapshot response when the backend is unreachable, and that
+        // response also surfaces watched_count from SNAPSHOT_STATS, so the
+        // same field works in both modes.
         const r = await api.scanner.markets({ min: 0.02, max: 0.15 });
-        if (!cancelled && typeof r.count === 'number') onCount(r.count);
+        const n = Number(
+          (r as { watched_count?: number }).watched_count ?? r.count ?? 0,
+        );
+        if (!cancelled && Number.isFinite(n) && n > 0) onCount(n);
       } catch { /* leave count null */ }
     })();
     return () => { cancelled = true; };
@@ -278,13 +288,13 @@ function ProblemSection() {
     'Now shortable, systematically, on-chain',
   ];
   return (
-    <section className="bg-white" style={{ padding: '48px 80px' }}>
+    <section className="bg-white contra-section-pad" style={{ padding: '48px 80px' }}>
       <div style={{ maxWidth: 800, margin: '0 auto', textAlign: 'center' }}>
-        <div style={sectionLabel}>The Problem</div>
-        <h2 style={{ ...sectionHeading, fontSize: 36, fontWeight: 400, marginTop: 16 }}>
+        <div className="contra-section-eyebrow" style={sectionLabel}>The Problem</div>
+        <h2 className="contra-section-title" style={{ ...sectionHeading, fontSize: 36, fontWeight: 400, marginTop: 16 }}>
           Longshots lose. We built the short side.
         </h2>
-        <p style={{ ...bodyParagraph, maxWidth: 780, margin: '24px auto 0' }}>
+        <p className="contra-section-body" style={{ ...bodyParagraph, maxWidth: 780, margin: '24px auto 0' }}>
           Retail traders treat low-probability contracts like lottery tickets. A 7% implied chance feels
           plausible enough to buy, even when the true probability is closer to 1%. The gap between
           perception and reality is persistent, measurable, and shows up in every category of
@@ -340,13 +350,14 @@ function HowItWorksSection() {
   ];
   return (
     <section id="how-it-works" style={{ background: '#F7F7F5', padding: '48px 0' }}>
-      <div style={{ maxWidth: 800, margin: '0 auto 24px', padding: '0 80px', textAlign: 'center' }}>
-        <div style={sectionLabel}>How It Works</div>
+      <div className="contra-section-pad" style={{ maxWidth: 800, margin: '0 auto 24px', padding: '0 80px', textAlign: 'center' }}>
+        <div className="contra-section-eyebrow" style={sectionLabel}>How It Works</div>
       </div>
 
       {/* Cards: flex row, gap 24px, 48px page padding so they don't touch
           the edges. Each card is its own bordered square on white. */}
       <div
+        className="contra-section-pad"
         style={{
           display: 'flex',
           justifyContent: 'center',
@@ -371,6 +382,7 @@ function Step({ n, title, body, index }: { n: string; title: string; body: strin
       ref={ref}
       onMouseEnter={() => setHover(true)}
       onMouseLeave={() => setHover(false)}
+      className="contra-step-card"
       style={{
         width: 'calc(33% - 16px)',
         minHeight: 280,
@@ -420,12 +432,12 @@ function WhyItWorksSection() {
     >
       <SubtleSectionPills />
 
-      <div style={{ maxWidth: 980, margin: '0 auto', position: 'relative', zIndex: 1, textAlign: 'center', padding: '0 80px' }}>
-        <div style={sectionLabel}>Why It Works</div>
-        <h2 style={{ ...sectionHeading, marginTop: 16, marginLeft: 'auto', marginRight: 'auto' }}>
+      <div className="contra-section-pad" style={{ maxWidth: 980, margin: '0 auto', position: 'relative', zIndex: 1, textAlign: 'center', padding: '0 80px' }}>
+        <div className="contra-section-eyebrow" style={sectionLabel}>Why It Works</div>
+        <h2 className="contra-section-title" style={{ ...sectionHeading, marginTop: 16, marginLeft: 'auto', marginRight: 'auto' }}>
           This is not a hunch.
         </h2>
-        <p style={{ ...bodyParagraph, maxWidth: 820, margin: '24px auto 0' }}>
+        <p className="contra-section-body" style={{ ...bodyParagraph, maxWidth: 820, margin: '24px auto 0' }}>
           Longshot bias is one of the most replicated findings in behavioral economics. Favorites are
           underpriced. Longshots are overpriced. The pattern holds across elections, sports, crypto,
           and macro events. We built the short side of that trade. Packaged it. Put it on Solana.
@@ -460,6 +472,7 @@ function SupportPoint({ label, body }: { label: string; body: string }) {
     <div
       onMouseEnter={() => setHover(true)}
       onMouseLeave={() => setHover(false)}
+      className="contra-support-card"
       style={{
         width: 'calc(25% - 15px)',
         minWidth: 200,
@@ -563,14 +576,14 @@ function LiveRightNowSection({ count, onCount }: { count: number | null; onCount
     ? `View all ${count}+ watched markets →`
     : 'View all watched markets →';
   return (
-    <section className="bg-white" style={{ padding: '48px 80px' }}>
+    <section className="bg-white contra-section-pad" style={{ padding: '48px 80px' }}>
       {/* Outer container is wider (900) to accommodate the table. The
           heading + body still center inside narrower max-widths. */}
       <div style={{ maxWidth: 900, margin: '0 auto' }}>
         <div style={{ textAlign: 'center' }}>
-          <div style={sectionLabel}>Live Right Now</div>
-          <h2 style={{ ...sectionHeading, marginTop: 16 }}>The scanner never stops.</h2>
-          <p style={{ ...bodyParagraph, margin: '20px auto 0', maxWidth: 720 }}>
+          <div className="contra-section-eyebrow" style={sectionLabel}>Live Right Now</div>
+          <h2 className="contra-section-title" style={{ ...sectionHeading, marginTop: 16 }}>The scanner never stops.</h2>
+          <p className="contra-section-body" style={{ ...bodyParagraph, margin: '20px auto 0', maxWidth: 720 }}>
             Every prediction market on Kalshi and Polymarket is monitored continuously. When our model
             finds a mispricing worth acting on, it gets added to the next basket construction cycle.
           </p>
@@ -605,7 +618,7 @@ function LiveRightNowSection({ count, onCount }: { count: number | null; onCount
 // ============== CTA ==============
 function CtaSection() {
   return (
-    <section style={{ background: '#1A56DB', padding: '48px 80px' }}>
+    <section className="contra-section-pad" style={{ background: '#1A56DB', padding: '48px 80px' }}>
       <div
         className="max-w-[1400px] mx-auto"
         style={{

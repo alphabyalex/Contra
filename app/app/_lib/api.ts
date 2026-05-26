@@ -6,6 +6,12 @@
  */
 
 import { BACKEND_URL } from './tokens';
+import {
+  snapshotBasketsListResponse,
+  snapshotBasketGetResponse,
+  snapshotBasketNavResponse,
+  snapshotScannerResponse,
+} from './snapshot';
 
 /** Shape of a single scanner row returned by /api/scanner/markets. */
 export interface ScannerRowAPI {
@@ -63,13 +69,54 @@ async function jsonRequest<T>(path: string, init: RequestInit = {}): Promise<T> 
   return body as T;
 }
 
+/**
+ * Read-only GET wrapper with a 3 second timeout and a silent snapshot
+ * fallback. Used by the read endpoints (baskets, scanner) so the public
+ * Vercel deployment renders cleanly even though it has no backend.
+ *
+ * Writes (deposit, redeem, leverage close) keep using jsonRequest and
+ * surface real errors because they require a signed transaction round-trip.
+ */
+async function fetchWithFallback<T>(url: string, fallback: T): Promise<T> {
+  try {
+    const ctrl: AbortController | null =
+      typeof AbortController !== 'undefined' ? new AbortController() : null;
+    const timer =
+      ctrl && typeof setTimeout !== 'undefined'
+        ? setTimeout(() => ctrl.abort(), 3000)
+        : null;
+    try {
+      const res = await fetch(`${BACKEND_URL}${url}`, {
+        signal: ctrl?.signal,
+        headers: { 'Content-Type': 'application/json' },
+      });
+      if (!res.ok) throw new Error('not ok');
+      return (await res.json()) as T;
+    } finally {
+      if (timer != null) clearTimeout(timer as ReturnType<typeof setTimeout>);
+    }
+  } catch {
+    return fallback;
+  }
+}
+
 export const api = {
   health: () => jsonRequest<{ ok: boolean; supabase: any; idls: any; authority: boolean }>('/health'),
 
   baskets: {
-    list: () => jsonRequest<{ baskets: any[] }>('/api/baskets'),
-    get: (id: string) => jsonRequest<{ basket: any; legs: any[]; nav: number; breakdown: any }>(`/api/baskets/${id}`),
-    nav: (id: string) => jsonRequest<{ history: Array<{ nav: number; snapshotted_at: string }> }>(`/api/baskets/${id}/nav`),
+    list: () => fetchWithFallback<{ baskets: any[] }>('/api/baskets', snapshotBasketsListResponse()),
+    get: (id: string) =>
+      fetchWithFallback<{ basket: any; legs: any[]; nav: number; breakdown: any }>(
+        `/api/baskets/${id}`,
+        (snapshotBasketGetResponse(id) ?? { basket: null, legs: [], nav: 1, breakdown: null }) as {
+          basket: any; legs: any[]; nav: number; breakdown: any;
+        },
+      ),
+    nav: (id: string) =>
+      fetchWithFallback<{ history: Array<{ nav: number; snapshotted_at: string }> }>(
+        `/api/baskets/${id}/nav`,
+        snapshotBasketNavResponse(id),
+      ),
     construct: (input: { leverageType: 'conservative' | 'aggressive' | 'degen'; name?: string; category?: string }) =>
       jsonRequest('/api/baskets/construct', { method: 'POST', body: JSON.stringify(input) }),
   },
@@ -170,7 +217,7 @@ export const api = {
       p.set('sort', opts.sort ?? 'volume');
       if (opts.search) p.set('search', opts.search);
       if (opts.limit != null) p.set('limit', String(opts.limit));
-      return jsonRequest<{
+      return fetchWithFallback<{
         at: number;
         count: number;
         /** Curated-pool size (scored_markets only — excludes ephemeral). */
@@ -194,7 +241,29 @@ export const api = {
           markets: ScannerRowAPI[];
         }>;
         rows: ScannerRowAPI[];
-      }>(`/api/scanner/markets?${p.toString()}`);
+      }>(
+        `/api/scanner/markets?${p.toString()}`,
+        snapshotScannerResponse(opts) as unknown as {
+          at: number;
+          count: number;
+          watched_count?: number;
+          counts: { polymarket: number; kalshi: number };
+          kalshi_error?: string | null;
+          kalshi_throttled?: boolean;
+          sort?: string;
+          search?: string | null;
+          total_after_filter?: number;
+          view?: 'category_grouped' | 'search';
+          groups?: Array<{
+            category: string;
+            short_count: number;
+            long_count: number;
+            long_section_start: number | null;
+            markets: ScannerRowAPI[];
+          }>;
+          rows: ScannerRowAPI[];
+        },
+      );
     },
     /** Returns the EventSource — caller must close it on unmount. */
     live: (onMessage: (rows: any[]) => void): EventSource => {

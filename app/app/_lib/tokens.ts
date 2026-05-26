@@ -26,8 +26,14 @@ export const FONTS = {
   num: '"IBM Plex Mono", ui-monospace, monospace',
 } as const;
 
+// Primary env var is NEXT_PUBLIC_API_URL; NEXT_PUBLIC_BACKEND_URL is
+// kept as a fallback for older deploys. On Vercel where neither is
+// set, every call falls through to localhost:3001 (unreachable) and
+// the snapshot fallback in api.ts takes over.
 export const BACKEND_URL =
-  process.env.NEXT_PUBLIC_BACKEND_URL ?? 'http://localhost:3001';
+  process.env.NEXT_PUBLIC_API_URL
+  ?? process.env.NEXT_PUBLIC_BACKEND_URL
+  ?? 'http://localhost:3001';
 
 export const CLUSTER = (process.env.NEXT_PUBLIC_SOLANA_CLUSTER ?? 'devnet') as
   | 'devnet'

@@ -290,7 +290,7 @@ export default function ScannerPage() {
 
           {/* Table */}
           {!loading && !error && visible.length > 0 && (
-            <div style={{ overflowX: 'auto' }}>
+            <div className="contra-table-scroll" style={{ overflowX: 'auto' }}>
               <table style={{ width: '100%', borderCollapse: 'collapse', fontFamily: '"DM Sans", sans-serif' }}>
                 <thead>
                   <tr>
