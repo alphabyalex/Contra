@@ -41,7 +41,7 @@ function AboutShell({ active, onSelect }: { active: TabId; onSelect?: (id: TabId
     <div className="bg-white" style={{ minHeight: 'calc(100vh - 56px)' }}>
       <div style={{ maxWidth: 720, margin: '0 auto', padding: '64px 24px 0' }}>
         <div className="flex justify-center" style={{ marginBottom: 64 }}>
-          <Logo size={48} tagline={false} />
+          <Logo size={96} tagline={false} />
         </div>
 
         <div className="flex justify-start" style={{ borderBottom: '1px solid #E5E5E3' }}>

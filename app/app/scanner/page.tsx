@@ -17,6 +17,7 @@ import React, { useCallback, useEffect, useMemo, useRef, useState } from 'react'
 import { createPortal } from 'react-dom';
 import { api } from '../_lib/api';
 import { useInView } from '../_lib/useInView';
+import { GridBackground } from '../_components/GridBackground';
 
 interface Row {
   question: string;
@@ -174,9 +175,20 @@ export default function ScannerPage() {
   return (
     <div style={{ background: '#F7F7F5', minHeight: 'calc(100vh - 56px)' }}>
       <div className="max-w-[1400px] mx-auto px-6 py-10">
-        <div className="bg-white" style={{ border: '1px solid #E5E5E3' }}>
+        <div className="bg-white" style={{ position: 'relative', border: '1px solid #E5E5E3', overflow: 'hidden' }}>
+          {/* Decorative corner mark. Pinned to the top-right of the scanner
+              container, fades in on mount, never interacts with input. */}
+          <GridBackground
+            opacity={0.07}
+            variant="corner"
+            corner="top-right"
+            markSize={88}
+            fadeIn
+            duration={1100}
+            style={{ margin: 20 }}
+          />
           {/* Header */}
-          <div className="flex items-end justify-between" style={{ padding: '32px 36px', borderBottom: '1px solid #E5E5E3' }}>
+          <div className="flex items-end justify-between" style={{ position: 'relative', zIndex: 2, padding: '32px 36px', borderBottom: '1px solid #E5E5E3' }}>
             <div>
               <h1 style={{ fontSize: 36, fontWeight: 300, color: '#0A0A0A', margin: 0 }}>
                 Live Mispricing Scanner

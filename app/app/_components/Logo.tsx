@@ -3,53 +3,56 @@
 /**
  * The single canonical CONTRA logo treatment.
  *
- *   CON  (DM Sans 300)  TRA  (DM Sans 700)
- *   no letter-gap between CON and TRA
- *   letter-spacing 0.18em
- *   color #0A0A0A
- *   then a 1px #E5E5E3 vertical divider
- *   then "Bet Against the Obvious" in DM Sans uppercase #6B6B6B
+ * Renders the wordmark lockup PNG (CON light + TRA bold in #1A56DB on the
+ * dark variant) plus an optional vertical divider and the BET AGAINST THE
+ * OBVIOUS uppercase tagline. The variant prop swaps in the white-on-dark
+ * lockup for use over colored or dark backgrounds.
  *
- * `size` controls the wordmark font-size. `tagline={false}` hides the
- * divider + tagline text for centered/small contexts (about page,
- * portfolio empty state).
+ * `size` is the wordmark IMAGE HEIGHT in pixels. Width is computed via the
+ * native PNG aspect ratio set by max-content + height: <size>px. Common
+ * sizes:
+ *   nav            32
+ *   about          28
+ *   modal / inline 20-24
  */
 
 interface LogoProps {
-  size?: number;        // wordmark px size; default 17 (nav)
-  tagline?: boolean;    // include the divider + tagline text
-  taglineSize?: number; // tagline px size; default 11
-  color?: string;       // override wordmark color
+  size?: number;                  // image height in px; default 32 (nav)
+  tagline?: boolean;              // include divider + tagline text
+  taglineSize?: number;           // tagline px size; default 12
+  variant?: 'light' | 'dark';     // 'dark' uses the white wordmark for dark bgs
 }
 
 export function Logo({
-  size = 17,
+  size = 32,
   tagline = true,
   taglineSize = 12,
-  color = '#0A0A0A',
+  variant = 'light',
 }: LogoProps) {
+  const src =
+    variant === 'dark'
+      ? '/contra-logo-lockup-white.png'
+      : '/contra-logo-lockup.png';
   return (
     <div className="inline-flex items-center" style={{ gap: tagline ? 14 : 0 }}>
-      <span
-        style={{
-          color,
-          fontSize: size,
-          letterSpacing: '0.18em',
-          fontFamily: '"DM Sans", system-ui, sans-serif',
-          lineHeight: 1,
-          display: 'inline-flex',
-        }}
-      >
-        <span style={{ fontWeight: 300 }}>CON</span>
-        <span style={{ fontWeight: 700 }}>TRA</span>
-      </span>
+      {/* Plain <img> rather than next/image. The lockup is a small static
+          asset, height-controlled with width auto, and intrinsic dimensions
+          read by the browser from the PNG. next/image would force a layout
+          shift unless we pin width too. */}
+      {/* eslint-disable-next-line @next/next/no-img-element */}
+      <img
+        src={src}
+        alt="Contra"
+        style={{ height: size, width: 'auto', display: 'block' }}
+        draggable={false}
+      />
       {tagline && (
         <>
           <span
             aria-hidden
             style={{
               width: 1,
-              height: 14,
+              height: Math.max(12, Math.round(size * 0.45)),
               background: '#E5E5E3',
               display: 'inline-block',
             }}

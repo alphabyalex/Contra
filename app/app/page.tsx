@@ -6,6 +6,7 @@ import { FloatingPills } from './_components/FloatingPills';
 import { TickerMarquee } from './_components/TickerMarquee';
 import { BiasDemo } from './_components/BiasDemo';
 import { LiveScannerMini } from './_components/LiveScannerMini';
+import { GridBackground } from './_components/GridBackground';
 import { useInView } from './_lib/useInView';
 import { api } from './_lib/api';
 
@@ -37,6 +38,16 @@ function Hero() {
         minHeight: 'calc(100vh - 56px)',
       }}
     >
+      {/* Static Contra-mark tile that fades in once behind the hero. Sits
+          below the gradient mask, the floating pills, and the content layer. */}
+      <GridBackground
+        opacity={0.06}
+        variant="tile"
+        markSize={32}
+        gap={36}
+        fadeIn
+        duration={1200}
+      />
       <FloatingPills />
       <div
         aria-hidden
@@ -217,12 +228,35 @@ function StatsStrip({ count, onCount }: { count: number | null; onCount: (n: num
     { value: 'Devnet', label: 'live today on Solana devnet' },
     { value: 'v5.1', label: 'calibration model screening every market' },
   ];
+
+  // Scroll-triggered grid fade. useInView fires once the strip enters the
+  // viewport; we drive `stripInView` from that and pass it through to the
+  // GridBackground component as its `visible` prop. CSS handles the fade.
+  const [stripRef, stripInView] = useInView<HTMLElement>(0.2);
+
   return (
     <section
+      ref={stripRef}
       className="bg-white"
-      style={{ borderTop: '1px solid #E5E5E3', borderBottom: '1px solid #E5E5E3' }}
+      style={{
+        position: 'relative',
+        // Thin accent-blue top border defines the strip against the hero
+        // above without the heavier hairline color that surrounded it before.
+        borderTop: '1px solid #1A56DB',
+        borderBottom: '1px solid #E5E5E3',
+        overflow: 'hidden',
+      }}
     >
-      <div style={{ maxWidth: 800, margin: '0 auto', padding: '32px 24px' }}>
+      <GridBackground
+        opacity={0.04}
+        variant="tile"
+        markSize={28}
+        gap={28}
+        fadeIn
+        visible={stripInView}
+        duration={900}
+      />
+      <div style={{ position: 'relative', zIndex: 2, maxWidth: 800, margin: '0 auto', padding: '32px 24px' }}>
         <div className="grid grid-cols-1 md:grid-cols-3" style={{ gap: 0 }}>
           {stats.map((s, i) => (
             <div

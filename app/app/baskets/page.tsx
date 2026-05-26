@@ -6,6 +6,7 @@ import { useRouter } from 'next/navigation';
 import { AreaChart, Area, ResponsiveContainer } from 'recharts';
 import { api } from '../_lib/api';
 import { MOCK_BASKETS } from '../_lib/tokens';
+import { GridBackground } from '../_components/GridBackground';
 
 function BasketCardSkeleton() {
   return (
@@ -102,8 +103,21 @@ export default function BasketsPage() {
       }));
 
   return (
-    <div style={{ background: 'linear-gradient(135deg, #F7F7F5 0%, #F0F4FF 50%, #F7F7F5 100%)', backgroundSize: '400% 400%', animation: 'gradientShift 8s ease infinite', minHeight: 'calc(100vh - 56px)' }}>
+    <div style={{ position: 'relative', background: 'linear-gradient(135deg, #F7F7F5 0%, #F0F4FF 50%, #F7F7F5 100%)', backgroundSize: '400% 400%', animation: 'gradientShift 8s ease infinite', minHeight: 'calc(100vh - 56px)', overflow: 'hidden' }}>
       <style>{`@keyframes gradientShift { 0% { background-position: 0% 50% } 50% { background-position: 100% 50% } 100% { background-position: 0% 50% } }`}</style>
+      {/* Page-texture watermark. Small repeating tile so it reads as
+          paper grain rather than a floating mark, and the basket cards
+          always overlap it. Pointer-events:none + low z-index keep this
+          layer below every interactive element. */}
+      <GridBackground
+        opacity={0.035}
+        variant="tile"
+        markSize={44}
+        gap={48}
+        fadeIn
+        duration={1400}
+        style={{ position: 'fixed', zIndex: 0 }}
+      />
       {usingMock && (
         <div
           style={{
@@ -120,7 +134,7 @@ export default function BasketsPage() {
         </div>
       )}
 
-      <div style={{ maxWidth: 1200, margin: '0 auto', padding: '0 24px' }}>
+      <div style={{ position: 'relative', zIndex: 1, maxWidth: 1200, margin: '0 auto', padding: '0 24px' }}>
         <div style={{ padding: '48px 0 32px', display: 'flex', alignItems: 'flex-end', justifyContent: 'space-between' }}>
           <div>
             <h1 style={{ fontSize: 40, fontWeight: 200, color: '#0A0A0A', margin: 0, fontFamily: '"DM Sans", sans-serif' }}>Baskets</h1>

@@ -25,6 +25,7 @@ import { PublicKey } from '@solana/web3.js';
 import { useConnection, useWallet } from '@solana/wallet-adapter-react';
 import { WalletMultiButton } from '@solana/wallet-adapter-react-ui';
 import { useContraState } from '../_lib/state';
+import { GridBackground } from '../_components/GridBackground';
 
 // Devnet circle USDC. Hardcoded — the portfolio donut is a frontend-only
 // widget and the backend never needs to know the user's stable balance.
@@ -260,8 +261,32 @@ export default function PortfolioPage() {
   }
 
   return (
-    <div style={{ background: COLOR.bg, minHeight: 'calc(100vh - 56px)' }}>
-      <div className="max-w-[1200px] mx-auto px-6">
+    <div style={{ position: 'relative', background: COLOR.bg, minHeight: 'calc(100vh - 56px)', overflow: 'hidden' }}>
+      {/* Faint tiled grid texture pinned to the right half of the viewport.
+          Reads as paper grain rather than a discrete watermark. Tiny mark
+          size + low opacity keep it from competing with the holdings UI;
+          pointer-events:none + zIndex:0 keep it inert and below content. */}
+      <GridBackground
+        opacity={0.03}
+        variant="tile"
+        markSize={32}
+        gap={40}
+        fadeIn
+        duration={1200}
+        style={{
+          position: 'fixed',
+          inset: 0,
+          // Restrict the visible tile to the right half of the viewport
+          // via a soft horizontal mask so the texture fades in gradually
+          // rather than starting at a hard vertical edge.
+          WebkitMaskImage:
+            'linear-gradient(to right, rgba(0,0,0,0) 0%, rgba(0,0,0,0) 50%, rgba(0,0,0,1) 75%, rgba(0,0,0,1) 100%)',
+          maskImage:
+            'linear-gradient(to right, rgba(0,0,0,0) 0%, rgba(0,0,0,0) 50%, rgba(0,0,0,1) 75%, rgba(0,0,0,1) 100%)',
+          zIndex: 0,
+        }}
+      />
+      <div className="max-w-[1200px] mx-auto px-6" style={{ position: 'relative', zIndex: 1 }}>
         <Header walletAddress={walletAddress} />
 
         {error && <div style={{ color: COLOR.loss, fontSize: 14 }}>{error}</div>}

@@ -33,7 +33,7 @@ export default function RootLayout({ children }: { children: React.ReactNode }) 
             >
               <div className="max-w-[1400px] mx-auto h-full px-6 flex items-center justify-between">
                 <Link href="/" className="flex items-center">
-                  <Logo size={20} tagline />
+                  <Logo size={32} tagline />
                 </Link>
                 <NavTabs />
                 <div className="flex items-center gap-3">
