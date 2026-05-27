@@ -555,14 +555,20 @@ export async function getLatestNavSnapshot(basketId: string): Promise<NavSnapsho
 export async function listNavHistory(basketId: string, limit = 720): Promise<NavSnapshot[]> {
   const sb = getSupabase();
   if (sb) {
+    // Fetch the MOST RECENT `limit` rows, then reverse to chronological
+    // (ASC) order for the consumer. The card and chart both treat
+    // history[length - 1] as the latest snapshot; an ASC + limit query
+    // returns the OLDEST `limit` rows, which silently freezes the
+    // displayed "updated at" once a basket accumulates more than `limit`
+    // snapshots (720 rows = 24h of the 2-min NAV cron).
     const { data, error } = await sb
       .from('nav_snapshots')
       .select('*')
       .eq('basket_id', basketId)
-      .order('snapshotted_at', { ascending: true })
+      .order('snapshotted_at', { ascending: false })
       .limit(limit);
     if (error) throw error;
-    return (data ?? []) as NavSnapshot[];
+    return ((data ?? []) as NavSnapshot[]).reverse();
   }
   return [...mem.nav.values()]
     .filter((n) => n.basket_id === basketId)
